@@ -223,30 +223,35 @@ def _ensure_python_packages(ras: Path, *, require_sam3: bool) -> None:
     if require_sam3 and not sam_py.is_file():
         raise RuntimeError(f"sam3 tree missing pyproject at {sam_py}")
 
-    def _import_ok(mod: str) -> bool:
+    def _import_error(mod: str) -> str | None:
         try:
             __import__(mod)
-            return True
-        except Exception:
-            return False
+            return None
+        except Exception as exc:
+            return f"{type(exc).__name__}: {exc}"
 
-    if not _import_ok("vggt.models.vggt"):
-        print("[stage2] pip install -e vggt ...", flush=True)
-        _pip_install("-e", str(ras / "vggt"))
-    if require_sam3 and not _import_ok("sam3.model_builder"):
+    if _import_error("vggt.models.vggt"):
+        print("[stage2] pip install vggt ...", flush=True)
+        # A runtime editable install relies on a .pth file that Python only
+        # reads at process startup. Install a normal wheel so this same job can
+        # import VGGT immediately after first-time bootstrap.
+        _pip_install(str(ras / "vggt"))
+    if require_sam3 and _import_error("sam3.model_builder"):
         print("[stage2] pip install sam3 ...", flush=True)
         # non-editable install is more reliable on network volumes
         _pip_install(str(ras / "sam3"))
 
-    if not _import_ok("vggt.models.vggt"):
+    vggt_error = _import_error("vggt.models.vggt")
+    if vggt_error:
         raise RuntimeError(
-            "vggt package still not importable after pip install -e. "
-            f"Check {ras / 'vggt'} layout (expected package dir vggt/vggt)."
+            "vggt package still not importable after pip install. "
+            f"Check {ras / 'vggt'} layout (expected package dir vggt/vggt). Detail: {vggt_error}"
         )
-    if require_sam3 and not _import_ok("sam3.model_builder"):
+    sam3_error = _import_error("sam3.model_builder") if require_sam3 else None
+    if sam3_error:
         raise RuntimeError(
             "sam3 package still not importable after pip install. "
-            f"Check {ras / 'sam3'} layout."
+            f"Check {ras / 'sam3'} layout. Detail: {sam3_error}"
         )
     packages = "vggt + sam3" if require_sam3 else "vggt"
     print(f"[stage2] python packages importable ({packages})", flush=True)
