@@ -80,6 +80,8 @@ def _download_video(video_url: str, dest_dir: Path, timeout_s: int = 180) -> Pat
     if cid and csec:
         headers["CF-Access-Client-Id"] = cid
         headers["CF-Access-Client-Secret"] = csec
+    if not (video_url.startswith("http://") or video_url.startswith("https://")):
+        raise RuntimeError(f"refusing non-HTTP video_url: {video_url[:64]}")
     with requests.get(video_url, stream=True, timeout=timeout_s, headers=headers) as r:
         if r.status_code in (401, 403, 302) or "cloudflareaccess" in (r.headers.get("location") or "").lower():
             raise RuntimeError(
@@ -100,14 +102,29 @@ def _materialize_video(payload: dict[str, Any], work: Path) -> Path:
     import base64
 
     b64 = payload.get("video_b64")
+    video_url = str(payload.get("video_url") or "").strip()
+
+    # Prefer inline bytes. Never pass fake schemes (inline://) to requests.
     if isinstance(b64, str) and b64.strip():
         raw = base64.b64decode(b64)
-        dest = work / "input.mp4"
+        # sniff extension from media_type if provided
+        mt = str(payload.get("media_type") or "video/mp4").lower()
+        ext = ".webm" if "webm" in mt else ".mov" if "quicktime" in mt or "mov" in mt else ".mp4"
+        dest = work / f"input{ext}"
         dest.write_bytes(raw)
         return dest
-    video_url = str(payload.get("video_url") or "").strip()
+
     if not video_url:
         raise RuntimeError("video_url or video_b64 is required")
+    if video_url.startswith("inline:") or video_url.startswith("data:"):
+        raise RuntimeError(
+            "received inline video_url without video_b64 "
+            "(worker may be stale, or base64 was stripped as too large). "
+            "Redeploy/restart the endpoint worker and use a clip under ~6MB, "
+            "or configure STAGE2_PUBLIC_MEDIA_BASE / CF Access service tokens."
+        )
+    if not (video_url.startswith("http://") or video_url.startswith("https://")):
+        raise RuntimeError(f"unsupported video_url scheme: {video_url[:40]}")
     return _download_video(video_url, work)
 
 
