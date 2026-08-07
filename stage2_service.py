@@ -28,6 +28,30 @@ import requests
 RAS_ROOT = Path(os.environ.get("RAS_ROOT", Path(__file__).resolve().parent / "vendor" / "ReplicateAnyScene")).resolve()
 
 
+
+def _ensure_ras_installed() -> None:
+    """Install paper repo + submodules if missing (first full call only)."""
+    import subprocess
+    ras = Path(os.environ.get("RAS_ROOT", Path(__file__).resolve().parent / "vendor" / "ReplicateAnyScene"))
+    if not (ras / "main.py").is_file():
+        ras.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.check_call(["git", "clone", "--depth", "1", "https://github.com/xiac20/ReplicateAnyScene.git", str(ras)])
+    # public facebook clones if submodules empty
+    if not (ras / "vggt" / "setup.py").exists() and not (ras / "vggt" / "pyproject.toml").exists():
+        subprocess.check_call(["git", "clone", "--depth", "1", "https://github.com/facebookresearch/vggt.git", str(ras / "vggt")])
+    if not (ras / "sam3" / "pyproject.toml").exists() and not (ras / "sam3" / "setup.py").exists():
+        subprocess.check_call(["git", "clone", "--depth", "1", "https://github.com/facebookresearch/sam3.git", str(ras / "sam3")])
+    models_dir = Path(os.environ.get("STAGE2_MODELS_DIR", ras / "models")).resolve()
+    models_dir.mkdir(parents=True, exist_ok=True)
+    if not (models_dir / "VGGT" / ".stage2_ready").exists():
+        subprocess.check_call(["python", "-m", "pip", "install", "-q", "huggingface_hub[cli]>=0.23"])
+        # best-effort; may require HF_TOKEN
+        subprocess.call(["hf", "download", "facebook/VGGT-1B", "--local-dir", str(models_dir / "VGGT")])
+        subprocess.call(["hf", "download", "facebook/sam3", "--local-dir", str(models_dir / "SAM3")])
+        (models_dir / "VGGT" / ".stage2_ready").touch()
+        (models_dir / "SAM3" / ".stage2_ready").touch()
+
+
 def _ensure_ras_on_path() -> Path:
     if not RAS_ROOT.is_dir():
         raise RuntimeError(
@@ -185,6 +209,7 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
         video_path = _download_video(video_url, work)
         timings["download"] = int((time.time() - t0) * 1000)
 
+        _ensure_ras_installed()
         ras_root = _ensure_ras_on_path()
         # Models live under RAS_ROOT/models or STAGE2_MODELS_DIR symlinked as ./models
         models_dir = Path(os.environ.get("STAGE2_MODELS_DIR", ras_root / "models")).resolve()
