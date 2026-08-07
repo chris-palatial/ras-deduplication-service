@@ -2,6 +2,7 @@ import base64
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import stage2_service as stage2
 
@@ -34,6 +35,20 @@ class Stage2ServiceTest(unittest.TestCase):
             self.assertEqual(path.read_bytes(), b"video")
             with self.assertRaisesRegex(RuntimeError, "valid base64"):
                 stage2._materialize_video({"video_b64": "***"}, Path(tmp))
+
+    def test_ephemeral_geometry_skips_unusable_artifact_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            out_dir = work / "output"
+            out_dir.mkdir()
+            with patch.dict(
+                stage2.os.environ,
+                {"STAGE2_ARTIFACT_DIR": "", "STAGE2_KEEP_WORK": "0"},
+            ):
+                self.assertFalse(stage2._artifact_exports_enabled())
+                manifest = stage2._artifact_manifest(out_dir, work)
+        self.assertEqual(manifest["files"], [])
+        self.assertIn("export was skipped", manifest["note"])
 
 
 if __name__ == "__main__":
