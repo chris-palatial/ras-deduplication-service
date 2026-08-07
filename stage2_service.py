@@ -73,13 +73,42 @@ def _download_video(video_url: str, dest_dir: Path, timeout_s: int = 180) -> Pat
     if suffix not in {".mp4", ".mov", ".webm", ".mkv", ".avi"}:
         suffix = ".mp4"
     dest = dest_dir / f"input{suffix}"
-    with requests.get(video_url, stream=True, timeout=timeout_s) as r:
+    headers = {}
+    # Cloudflare Access service tokens (optional): allow RunPod to GET Access-protected media.
+    cid = os.environ.get("CF_ACCESS_CLIENT_ID") or os.environ.get("CF_Access_Client_Id")
+    csec = os.environ.get("CF_ACCESS_CLIENT_SECRET") or os.environ.get("CF_Access_Client_Secret")
+    if cid and csec:
+        headers["CF-Access-Client-Id"] = cid
+        headers["CF-Access-Client-Secret"] = csec
+    with requests.get(video_url, stream=True, timeout=timeout_s, headers=headers) as r:
+        if r.status_code in (401, 403, 302) or "cloudflareaccess" in (r.headers.get("location") or "").lower():
+            raise RuntimeError(
+                f"video URL blocked (HTTP {r.status_code}). "
+                "If the file is on agents.palatial.cloud, Cloudflare Access is rejecting the GPU worker. "
+                "Use a public HTTPS URL, STAGE2_PUBLIC_MEDIA_BASE, or set CF_ACCESS_CLIENT_ID/SECRET on the endpoint."
+            )
         r.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 20):
                 if chunk:
                     f.write(chunk)
     return dest
+
+
+def _materialize_video(payload: dict[str, Any], work: Path) -> Path:
+    """Accept video_url and/or video_b64 (Lab may inline small uploads)."""
+    import base64
+
+    b64 = payload.get("video_b64")
+    if isinstance(b64, str) and b64.strip():
+        raw = base64.b64decode(b64)
+        dest = work / "input.mp4"
+        dest.write_bytes(raw)
+        return dest
+    video_url = str(payload.get("video_url") or "").strip()
+    if not video_url:
+        raise RuntimeError("video_url or video_b64 is required")
+    return _download_video(video_url, work)
 
 
 def _masks_to_instances(all_masks: dict[str, list]) -> list[dict[str, Any]]:
@@ -107,12 +136,13 @@ def run_stage2_dry(payload: dict[str, Any]) -> dict[str, Any]:
         categories = [c.strip() for c in categories.split(",") if c.strip()]
     categories = [str(c).strip() for c in categories if str(c).strip()]
     max_frames = max(2, min(int(payload.get("max_frames") or 24), 160))
-    if not video_url or not categories:
-        return {"status": "error", "error": "video_url and categories are required", "mode": "dry_run"}
+    has_video = bool(video_url) or bool(payload.get("video_b64"))
+    if not has_video or not categories:
+        return {"status": "error", "error": "video_url/video_b64 and categories are required", "mode": "dry_run"}
 
     work = Path(tempfile.mkdtemp(prefix="ras-stage2-dry-"))
     try:
-        video_path = _download_video(video_url, work)
+        video_path = _materialize_video(payload, work)
         # Lightweight sample with OpenCV only (no RAS models).
         import cv2
         import numpy as np
@@ -196,8 +226,9 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
         "false",
         "no",
     }
-    if not video_url or not categories:
-        return {"status": "error", "error": "video_url and categories are required", "mode": "full"}
+    has_video = bool(video_url) or bool(payload.get("video_b64"))
+    if not has_video or not categories:
+        return {"status": "error", "error": "video_url/video_b64 and categories are required", "mode": "full"}
 
     work = Path(tempfile.mkdtemp(prefix="ras-stage2-full-"))
     out_dir = work / "output"
@@ -206,7 +237,7 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
 
     try:
         t0 = time.time()
-        video_path = _download_video(video_url, work)
+        video_path = _materialize_video(payload, work)
         timings["download"] = int((time.time() - t0) * 1000)
 
         _ensure_ras_installed()
