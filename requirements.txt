@@ -1,7 +1,7 @@
-# Thin host wrapper only. RAS / vggt / sam3 install from their own trees.
+# Thin host wrapper only. RAS / vggt / sam3 install from their trees on first full job.
 runpod>=1.7.0
 requests>=2.31
-numpy>=1.26
+numpy>=1.26,<2
 opencv-python-headless>=4.9
 Pillow>=10.0
 huggingface_hub>=0.23

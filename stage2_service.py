@@ -29,42 +29,245 @@ RAS_ROOT = Path(os.environ.get("RAS_ROOT", Path(__file__).resolve().parent / "ve
 
 
 
-def _ensure_ras_installed() -> None:
-    """Install paper repo + submodules if missing (first full call only)."""
+def _run(cmd: list[str], *, check: bool = True) -> int:
     import subprocess
-    ras = Path(os.environ.get("RAS_ROOT", Path(__file__).resolve().parent / "vendor" / "ReplicateAnyScene"))
-    if not (ras / "main.py").is_file():
-        ras.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.check_call(["git", "clone", "--depth", "1", "https://github.com/xiac20/ReplicateAnyScene.git", str(ras)])
-    # public facebook clones if submodules empty
-    if not (ras / "vggt" / "setup.py").exists() and not (ras / "vggt" / "pyproject.toml").exists():
-        subprocess.check_call(["git", "clone", "--depth", "1", "https://github.com/facebookresearch/vggt.git", str(ras / "vggt")])
-    if not (ras / "sam3" / "pyproject.toml").exists() and not (ras / "sam3" / "setup.py").exists():
-        subprocess.check_call(["git", "clone", "--depth", "1", "https://github.com/facebookresearch/sam3.git", str(ras / "sam3")])
-    models_dir = Path(os.environ.get("STAGE2_MODELS_DIR", ras / "models")).resolve()
+
+    print(f"[stage2] $ {' '.join(cmd)}", flush=True)
+    return subprocess.check_call(cmd) if check else subprocess.call(cmd)
+
+
+def _pip_install(*args: str) -> None:
+    _run([sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "--ignore-installed", *args])
+
+
+def _ras_root() -> Path:
+    return Path(os.environ.get("RAS_ROOT", Path(__file__).resolve().parent / "vendor" / "ReplicateAnyScene")).resolve()
+
+
+def _models_dir(ras: Path | None = None) -> Path:
+    ras = ras or _ras_root()
+    return Path(os.environ.get("STAGE2_MODELS_DIR", ras / "models")).resolve()
+
+
+def _clone_if_missing(url: str, dest: Path) -> None:
+    if dest.is_dir() and any(dest.iterdir()):
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    _run(["git", "clone", "--depth", "1", url, str(dest)])
+
+
+def _find_sam3_pt(sam_dir: Path) -> Path | None:
+    direct = sam_dir / "sam3.pt"
+    if direct.is_file() and direct.stat().st_size > 1_000_000:
+        return direct
+    if not sam_dir.is_dir():
+        return None
+    for p in sorted(sam_dir.rglob("sam3.pt")):
+        if p.is_file() and p.stat().st_size > 1_000_000:
+            return p
+    return None
+
+
+def _vggt_weights_ok(vggt_dir: Path) -> bool:
+    if not vggt_dir.is_dir():
+        return False
+    for name in ("model.safetensors", "model.pt", "config.json"):
+        if (vggt_dir / name).is_file():
+            # need at least one weight file + preferably config
+            if name.startswith("model"):
+                return True
+    # nested layout
+    for p in vggt_dir.rglob("model.safetensors"):
+        if p.is_file() and p.stat().st_size > 1_000_000:
+            return True
+    for p in vggt_dir.rglob("model.pt"):
+        if p.is_file() and p.stat().st_size > 1_000_000:
+            return True
+    return False
+
+
+def _weights_ready(models_dir: Path) -> bool:
+    vggt_ok = _vggt_weights_ok(models_dir / "VGGT")
+    sam_pt = _find_sam3_pt(models_dir / "SAM3")
+    return bool(vggt_ok and sam_pt)
+
+
+def _ensure_sam3_pt_layout(models_dir: Path) -> Path:
+    """RAS models.py expects ./models/SAM3/sam3.pt."""
+    sam_dir = models_dir / "SAM3"
+    sam_dir.mkdir(parents=True, exist_ok=True)
+    found = _find_sam3_pt(sam_dir)
+    if found is None:
+        raise RuntimeError(
+            "SAM3 weights missing: expected sam3.pt under STAGE2_MODELS_DIR/SAM3. "
+            "Accept the facebook/sam3 license on Hugging Face with the endpoint HF_TOKEN, "
+            "then re-run full mode so weights can download."
+        )
+    target = sam_dir / "sam3.pt"
+    if found.resolve() != target.resolve():
+        if target.is_symlink() or target.exists():
+            target.unlink()
+        try:
+            target.symlink_to(found.resolve())
+        except OSError:
+            shutil.copy2(found, target)
+    return target
+
+
+def _download_weights(models_dir: Path) -> None:
+    from huggingface_hub import snapshot_download
+
+    token = (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        or True
+    )
     models_dir.mkdir(parents=True, exist_ok=True)
-    if not (models_dir / "VGGT" / ".stage2_ready").exists():
-        subprocess.check_call(["python", "-m", "pip", "install", "-q", "huggingface_hub[cli]>=0.23"])
-        # best-effort; may require HF_TOKEN
-        subprocess.call(["hf", "download", "facebook/VGGT-1B", "--local-dir", str(models_dir / "VGGT")])
-        subprocess.call(["hf", "download", "facebook/sam3", "--local-dir", str(models_dir / "SAM3")])
-        (models_dir / "VGGT" / ".stage2_ready").touch()
-        (models_dir / "SAM3" / ".stage2_ready").touch()
+    vggt_dir = models_dir / "VGGT"
+    sam_dir = models_dir / "SAM3"
+
+    if not _vggt_weights_ok(vggt_dir):
+        print("[stage2] downloading facebook/VGGT-1B ...", flush=True)
+        snapshot_download(
+            repo_id="facebook/VGGT-1B",
+            local_dir=str(vggt_dir),
+            token=token,
+        )
+    if not _find_sam3_pt(sam_dir):
+        print("[stage2] downloading facebook/sam3 ...", flush=True)
+        try:
+            snapshot_download(
+                repo_id="facebook/sam3",
+                local_dir=str(sam_dir),
+                token=token,
+            )
+        except Exception as e:
+            # clear false ready markers from older builds
+            for marker in (vggt_dir / ".stage2_ready", sam_dir / ".stage2_ready"):
+                if marker.exists():
+                    marker.unlink()
+            raise RuntimeError(
+                "Failed to download facebook/sam3 (gated). "
+                "Log into Hugging Face with the same token as HF_TOKEN on the endpoint, "
+                f"accept the SAM3 license at https://huggingface.co/facebook/sam3, then retry. Detail: {e}"
+            ) from e
+
+    if not _weights_ready(models_dir):
+        for marker in (vggt_dir / ".stage2_ready", sam_dir / ".stage2_ready"):
+            if marker.exists():
+                marker.unlink()
+        raise RuntimeError(
+            f"Stage2 weights incomplete under {models_dir}. "
+            f"VGGT ok={_vggt_weights_ok(vggt_dir)} SAM3 pt={_find_sam3_pt(sam_dir)}"
+        )
+
+    _ensure_sam3_pt_layout(models_dir)
+    (vggt_dir / ".stage2_ready").touch()
+    (sam_dir / ".stage2_ready").touch()
+    print("[stage2] weights ready", flush=True)
+
+
+def _ensure_python_packages(ras: Path) -> None:
+    """Clone is not enough: RAS imports require pip-installed vggt + sam3 packages."""
+    # Host deps used by RAS Stage-2 modules (not Stage-3 sam-3d-objects).
+    _pip_install(
+        "numpy<2",
+        "einops",
+        "safetensors",
+        "scipy",
+        "trimesh",
+        "colorcet",
+        "matplotlib",
+        "omegaconf",
+        "hydra-core",
+        "transformers",
+        "timm>=1.0.17",
+        "ftfy==6.1.1",
+        "regex",
+        "iopath>=0.1.10",
+        "huggingface_hub>=0.23",
+        "open3d",
+        "Pillow",
+    )
+
+    # Editable installs so `import vggt` / `import sam3` resolve.
+    vggt_py = ras / "vggt" / "pyproject.toml"
+    sam_py = ras / "sam3" / "pyproject.toml"
+    if not vggt_py.is_file():
+        raise RuntimeError(f"vggt tree missing pyproject at {vggt_py}")
+    if not sam_py.is_file():
+        raise RuntimeError(f"sam3 tree missing pyproject at {sam_py}")
+
+    def _import_ok(mod: str) -> bool:
+        try:
+            __import__(mod)
+            return True
+        except Exception:
+            return False
+
+    if not _import_ok("vggt.models.vggt"):
+        print("[stage2] pip install -e vggt ...", flush=True)
+        _pip_install("-e", str(ras / "vggt"))
+    if not _import_ok("sam3.model_builder"):
+        print("[stage2] pip install sam3 ...", flush=True)
+        # non-editable install is more reliable on network volumes
+        _pip_install(str(ras / "sam3"))
+
+    if not _import_ok("vggt.models.vggt"):
+        raise RuntimeError(
+            "vggt package still not importable after pip install -e. "
+            f"Check {ras / 'vggt'} layout (expected package dir vggt/vggt)."
+        )
+    if not _import_ok("sam3.model_builder"):
+        raise RuntimeError(
+            "sam3 package still not importable after pip install. "
+            f"Check {ras / 'sam3'} layout."
+        )
+    print("[stage2] python packages importable (vggt, sam3)", flush=True)
+
+
+def _ensure_ras_installed() -> None:
+    """Install paper repo + packages + weights (first full call, then cached on volume)."""
+    ras = _ras_root()
+    models_dir = _models_dir(ras)
+
+    _clone_if_missing("https://github.com/xiac20/ReplicateAnyScene.git", ras)
+    # Paper uses git submodules; on a shallow clone they may be empty — fetch public trees.
+    if not (ras / "vggt" / "pyproject.toml").is_file() and not (ras / "vggt" / "setup.py").is_file():
+        _clone_if_missing("https://github.com/facebookresearch/vggt.git", ras / "vggt")
+    if not (ras / "sam3" / "pyproject.toml").is_file() and not (ras / "sam3" / "setup.py").is_file():
+        _clone_if_missing("https://github.com/facebookresearch/sam3.git", ras / "sam3")
+
+    # Older builds wrote .stage2_ready even when SAM3 download failed — ignore markers alone.
+    if not _weights_ready(models_dir):
+        for marker in (models_dir / "VGGT" / ".stage2_ready", models_dir / "SAM3" / ".stage2_ready"):
+            if marker.exists():
+                marker.unlink()
+        _download_weights(models_dir)
+    else:
+        _ensure_sam3_pt_layout(models_dir)
+
+    _ensure_python_packages(ras)
 
 
 def _ensure_ras_on_path() -> Path:
-    if not RAS_ROOT.is_dir():
+    ras = _ras_root()
+    if not ras.is_dir() or not (ras / "main.py").is_file():
         raise RuntimeError(
-            f"ReplicateAnyScene checkout not found at {RAS_ROOT}. "
-            "Clone https://github.com/xiac20/ReplicateAnyScene into vendor/ReplicateAnyScene "
-            "and init submodules sam3 + vggt (not sam-3d-objects)."
+            f"ReplicateAnyScene checkout not found at {ras}. "
+            "Clone https://github.com/xiac20/ReplicateAnyScene and install vggt+sam3 packages."
         )
-    root = str(RAS_ROOT)
-    if root not in sys.path:
-        sys.path.insert(0, root)
+    root = str(ras)
+    # Prefer RAS root for `import src.*`; keep vendor package installs for vggt/sam3.
+    if root in sys.path:
+        sys.path.remove(root)
+    sys.path.insert(0, root)
     # Models loader expects cwd-relative ./models and ./sam3 paths.
     os.chdir(root)
-    return RAS_ROOT
+    return ras
 
 
 def _download_video(video_url: str, dest_dir: Path, timeout_s: int = 180) -> Path:

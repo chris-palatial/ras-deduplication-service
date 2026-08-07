@@ -3,16 +3,32 @@
 # Not per job. Paths match ReplicateAnyScene README layout.
 set -euo pipefail
 ROOT="${STAGE2_MODELS_DIR:-./models}"
-mkdir -p "$ROOT"
-echo "Downloading into $ROOT"
-hf download facebook/VGGT-1B --local-dir "$ROOT/VGGT"
-hf download facebook/sam3 --local-dir "$ROOT/SAM3"
-# RAS models.py expects sam3.pt under models/SAM3/
-if [ -f "$ROOT/SAM3/sam3.pt" ]; then
-  echo "sam3.pt present"
-else
-  echo "NOTE: if sam3.pt is nested, symlink it to $ROOT/SAM3/sam3.pt"
-  find "$ROOT/SAM3" -name 'sam3.pt' 2>/dev/null | head -5
-fi
-touch "$ROOT/VGGT/.stage2_ready" "$ROOT/SAM3/.stage2_ready"
-echo "Done."
+mkdir -p "$ROOT/VGGT" "$ROOT/SAM3"
+echo "Downloading into $ROOT (HF_TOKEN required for gated facebook/sam3)"
+
+python - <<'PY'
+import os, sys
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+root = Path(os.environ.get("STAGE2_MODELS_DIR", "./models")).resolve()
+token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or True
+root.mkdir(parents=True, exist_ok=True)
+print("VGGT-1B ->", root / "VGGT")
+snapshot_download("facebook/VGGT-1B", local_dir=str(root / "VGGT"), token=token)
+print("sam3 ->", root / "SAM3")
+snapshot_download("facebook/sam3", local_dir=str(root / "SAM3"), token=token)
+sam = root / "SAM3" / "sam3.pt"
+if not sam.is_file():
+    found = list((root / "SAM3").rglob("sam3.pt"))
+    if not found:
+        sys.exit("sam3.pt missing after download")
+    sam.symlink_to(found[0].resolve()) if not sam.exists() else None
+    if not sam.is_file():
+        import shutil
+        shutil.copy2(found[0], sam)
+print("sam3.pt:", sam, "size", sam.stat().st_size)
+(root / "VGGT" / ".stage2_ready").touch()
+(root / "SAM3" / ".stage2_ready").touch()
+print("Done.")
+PY
