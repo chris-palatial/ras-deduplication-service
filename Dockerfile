@@ -44,7 +44,7 @@ RUN mkdir -p /app/vendor \
     && git -C /app/vendor/ReplicateAnyScene/sam3 fetch --depth 1 origin "$SAM3_REVISION" \
     && git -C /app/vendor/ReplicateAnyScene/sam3 checkout --detach FETCH_HEAD \
     && cd /app/vendor/ReplicateAnyScene \
-    && python -m pip install -q --no-cache-dir --ignore-installed -e vggt \
+    && python -m pip install -q --no-cache-dir --ignore-installed /app/vendor/ReplicateAnyScene/vggt \
     && python -m pip install -q --no-cache-dir --ignore-installed /app/vendor/ReplicateAnyScene/sam3 \
     && python -m pip install -q --no-cache-dir --ignore-installed open3d trimesh scipy matplotlib colorcet omegaconf hydra-core transformers
 
