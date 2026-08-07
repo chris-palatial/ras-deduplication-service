@@ -8,8 +8,6 @@ public ReplicateAnyScene Stage 2 sequence.
 from __future__ import annotations
 
 import os
-import traceback
-
 from stage2_service import run_stage2
 
 
@@ -25,7 +23,6 @@ def handler(job: dict):
         return {
             "status": "error",
             "error": str(e),
-            "trace": traceback.format_exc()[-2000:],
         }
 
 

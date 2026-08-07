@@ -10,11 +10,12 @@ Upstream: https://github.com/xiac20/ReplicateAnyScene
 from __future__ import annotations
 
 import os
+import base64
+import binascii
 import shutil
 import sys
 import tempfile
 import time
-import traceback
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -26,6 +27,10 @@ import requests
 #     stage2_service.py
 #     vendor/ReplicateAnyScene/   (paper repo)
 RAS_ROOT = Path(os.environ.get("RAS_ROOT", Path(__file__).resolve().parent / "vendor" / "ReplicateAnyScene")).resolve()
+RAS_REVISION = os.environ.get("RAS_REVISION", "671191457e7244d9337ef3faf558ee92bbf9bf73")
+VGGT_REVISION = os.environ.get("VGGT_REVISION", "44b3afbd1869d8bde4894dd8ea1e293112dd5eba")
+SAM3_REVISION = os.environ.get("SAM3_REVISION", "bfbed072a07a6a52c8d5fdc75a7a186251a835b1")
+MAX_INLINE_VIDEO_BYTES = 6 * 1024 * 1024
 
 
 
@@ -37,7 +42,7 @@ def _run(cmd: list[str], *, check: bool = True) -> int:
 
 
 def _pip_install(*args: str) -> None:
-    _run([sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "--ignore-installed", *args])
+    _run([sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", *args])
 
 
 def _ras_root() -> Path:
@@ -49,13 +54,22 @@ def _models_dir(ras: Path | None = None) -> Path:
     return Path(os.environ.get("STAGE2_MODELS_DIR", ras / "models")).resolve()
 
 
-def _clone_if_missing(url: str, dest: Path) -> None:
-    if dest.is_dir() and any(dest.iterdir()):
+def _clone_if_missing(url: str, dest: Path, revision: str) -> None:
+    if dest.is_dir() and (dest / ".git").exists():
+        import subprocess
+
+        head = subprocess.check_output(["git", "-C", str(dest), "rev-parse", "HEAD"], text=True).strip()
+        if head == revision:
+            return
+        _run(["git", "-C", str(dest), "fetch", "--depth", "1", "origin", revision])
+        _run(["git", "-C", str(dest), "checkout", "--detach", "FETCH_HEAD"])
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         shutil.rmtree(dest, ignore_errors=True)
-    _run(["git", "clone", "--depth", "1", url, str(dest)])
+    _run(["git", "clone", "--filter=blob:none", "--no-checkout", url, str(dest)])
+    _run(["git", "-C", str(dest), "fetch", "--depth", "1", "origin", revision])
+    _run(["git", "-C", str(dest), "checkout", "--detach", "FETCH_HEAD"])
 
 
 def _find_sam3_pt(sam_dir: Path) -> Path | None:
@@ -116,7 +130,7 @@ def _ensure_sam3_pt_layout(models_dir: Path) -> Path:
     return target
 
 
-def _download_weights(models_dir: Path) -> None:
+def _download_vggt_weights(models_dir: Path) -> None:
     from huggingface_hub import snapshot_download
 
     token = (
@@ -127,8 +141,6 @@ def _download_weights(models_dir: Path) -> None:
     )
     models_dir.mkdir(parents=True, exist_ok=True)
     vggt_dir = models_dir / "VGGT"
-    sam_dir = models_dir / "SAM3"
-
     if not _vggt_weights_ok(vggt_dir):
         print("[stage2] downloading facebook/VGGT-1B ...", flush=True)
         snapshot_download(
@@ -136,6 +148,19 @@ def _download_weights(models_dir: Path) -> None:
             local_dir=str(vggt_dir),
             token=token,
         )
+
+
+def _download_sam3_weights(models_dir: Path) -> None:
+    from huggingface_hub import snapshot_download
+
+    token = (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        or True
+    )
+    vggt_dir = models_dir / "VGGT"
+    sam_dir = models_dir / "SAM3"
     if not _find_sam3_pt(sam_dir):
         print("[stage2] downloading facebook/sam3 ...", flush=True)
         try:
@@ -170,35 +195,32 @@ def _download_weights(models_dir: Path) -> None:
     print("[stage2] weights ready", flush=True)
 
 
-def _ensure_python_packages(ras: Path) -> None:
+def _ensure_python_packages(ras: Path, *, require_sam3: bool) -> None:
     """Clone is not enough: RAS imports require pip-installed vggt + sam3 packages."""
     # Host deps used by RAS Stage-2 modules (not Stage-3 sam-3d-objects).
-    _pip_install(
-        "numpy<2",
-        "einops",
-        "safetensors",
-        "scipy",
-        "trimesh",
-        "colorcet",
-        "matplotlib",
-        "omegaconf",
-        "hydra-core",
-        "transformers",
-        "timm>=1.0.17",
-        "ftfy==6.1.1",
-        "regex",
-        "iopath>=0.1.10",
-        "huggingface_hub>=0.23",
-        "open3d",
-        "Pillow",
-    )
+    common_modules = ("einops", "safetensors", "scipy", "trimesh", "colorcet", "matplotlib", "omegaconf", "hydra", "transformers", "timm", "ftfy", "regex", "iopath", "huggingface_hub", "PIL")
+    if require_sam3:
+        common_modules += ("open3d",)
+    missing_common = []
+    for module in common_modules:
+        try:
+            __import__(module)
+        except Exception:
+            missing_common.append(module)
+    if missing_common:
+        _pip_install(
+            "numpy<2", "einops", "safetensors", "scipy", "trimesh", "colorcet",
+            "matplotlib", "omegaconf", "hydra-core", "transformers", "timm>=1.0.17",
+            "ftfy==6.1.1", "regex", "iopath>=0.1.10", "huggingface_hub>=0.23",
+            "Pillow", *(("open3d",) if require_sam3 else ()),
+        )
 
     # Editable installs so `import vggt` / `import sam3` resolve.
     vggt_py = ras / "vggt" / "pyproject.toml"
     sam_py = ras / "sam3" / "pyproject.toml"
     if not vggt_py.is_file():
         raise RuntimeError(f"vggt tree missing pyproject at {vggt_py}")
-    if not sam_py.is_file():
+    if require_sam3 and not sam_py.is_file():
         raise RuntimeError(f"sam3 tree missing pyproject at {sam_py}")
 
     def _import_ok(mod: str) -> bool:
@@ -211,7 +233,7 @@ def _ensure_python_packages(ras: Path) -> None:
     if not _import_ok("vggt.models.vggt"):
         print("[stage2] pip install -e vggt ...", flush=True)
         _pip_install("-e", str(ras / "vggt"))
-    if not _import_ok("sam3.model_builder"):
+    if require_sam3 and not _import_ok("sam3.model_builder"):
         print("[stage2] pip install sam3 ...", flush=True)
         # non-editable install is more reliable on network volumes
         _pip_install(str(ras / "sam3"))
@@ -221,36 +243,39 @@ def _ensure_python_packages(ras: Path) -> None:
             "vggt package still not importable after pip install -e. "
             f"Check {ras / 'vggt'} layout (expected package dir vggt/vggt)."
         )
-    if not _import_ok("sam3.model_builder"):
+    if require_sam3 and not _import_ok("sam3.model_builder"):
         raise RuntimeError(
             "sam3 package still not importable after pip install. "
             f"Check {ras / 'sam3'} layout."
         )
-    print("[stage2] python packages importable (vggt, sam3)", flush=True)
+    packages = "vggt + sam3" if require_sam3 else "vggt"
+    print(f"[stage2] python packages importable ({packages})", flush=True)
 
 
-def _ensure_ras_installed() -> None:
+def _ensure_ras_installed(*, require_sam3: bool = True) -> None:
     """Install paper repo + packages + weights (first full call, then cached on volume)."""
     ras = _ras_root()
     models_dir = _models_dir(ras)
 
-    _clone_if_missing("https://github.com/xiac20/ReplicateAnyScene.git", ras)
-    # Paper uses git submodules; on a shallow clone they may be empty — fetch public trees.
-    if not (ras / "vggt" / "pyproject.toml").is_file() and not (ras / "vggt" / "setup.py").is_file():
-        _clone_if_missing("https://github.com/facebookresearch/vggt.git", ras / "vggt")
-    if not (ras / "sam3" / "pyproject.toml").is_file() and not (ras / "sam3" / "setup.py").is_file():
-        _clone_if_missing("https://github.com/facebookresearch/sam3.git", ras / "sam3")
+    _clone_if_missing("https://github.com/xiac20/ReplicateAnyScene.git", ras, RAS_REVISION)
+    # Keep the exact upstream gitlinks used by the reviewed RAS revision.
+    _clone_if_missing("https://github.com/facebookresearch/vggt.git", ras / "vggt", VGGT_REVISION)
+    if require_sam3:
+        _clone_if_missing("https://github.com/facebookresearch/sam3.git", ras / "sam3", SAM3_REVISION)
+
+    if not _vggt_weights_ok(models_dir / "VGGT"):
+        _download_vggt_weights(models_dir)
 
     # Older builds wrote .stage2_ready even when SAM3 download failed — ignore markers alone.
-    if not _weights_ready(models_dir):
+    if require_sam3 and not _weights_ready(models_dir):
         for marker in (models_dir / "VGGT" / ".stage2_ready", models_dir / "SAM3" / ".stage2_ready"):
             if marker.exists():
                 marker.unlink()
-        _download_weights(models_dir)
-    else:
+        _download_sam3_weights(models_dir)
+    elif require_sam3:
         _ensure_sam3_pt_layout(models_dir)
 
-    _ensure_python_packages(ras)
+    _ensure_python_packages(ras, require_sam3=require_sam3)
 
 
 def _ensure_ras_on_path() -> Path:
@@ -302,14 +327,19 @@ def _download_video(video_url: str, dest_dir: Path, timeout_s: int = 180) -> Pat
 
 def _materialize_video(payload: dict[str, Any], work: Path) -> Path:
     """Accept video_url and/or video_b64 (Lab may inline small uploads)."""
-    import base64
-
     b64 = payload.get("video_b64")
     video_url = str(payload.get("video_url") or "").strip()
 
     # Prefer inline bytes. Never pass fake schemes (inline://) to requests.
     if isinstance(b64, str) and b64.strip():
-        raw = base64.b64decode(b64)
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise RuntimeError("video_b64 is not valid base64") from exc
+        if not raw:
+            raise RuntimeError("video_b64 decoded to an empty file")
+        if len(raw) > MAX_INLINE_VIDEO_BYTES:
+            raise RuntimeError("inline video exceeds the 6 MB service limit")
         # sniff extension from media_type if provided
         mt = str(payload.get("media_type") or "video/mp4").lower()
         ext = ".webm" if "webm" in mt else ".mov" if "quicktime" in mt or "mov" in mt else ".mp4"
@@ -383,18 +413,6 @@ def run_stage2_dry(payload: dict[str, Any]) -> dict[str, Any]:
             if ok:
                 frames_ok += 1
         cap.release()
-        # Contract-shaped fake instances for Lab wiring (not real detections).
-        instances = []
-        for cat in categories:
-            instances.append(
-                {
-                    "category": cat,
-                    "instance_id": f"{cat}_0",
-                    "frame_ids": idxs[:2],
-                    "frame_count": min(2, len(idxs)),
-                    "note": "dry_run synthetic instance — not RAS model output",
-                }
-            )
         return {
             "status": "ok",
             "mode": "dry_run",
@@ -404,9 +422,9 @@ def run_stage2_dry(payload: dict[str, Any]) -> dict[str, Any]:
             "source_frame_indices": idxs,
             "video_meta": {"total_frames": total, "fps": fps, "width": w, "height": h, "sampled": frames_ok},
             "categories": categories,
-            "raw_track_count": len(instances),
-            "instance_count": len(instances),
-            "instances": instances,
+            "raw_track_count": 0,
+            "instance_count": 0,
+            "instances": [],
             "pipeline": [
                 {"id": "intake", "name": "Video intake", "status": "ok"},
                 {"id": "sample_frames", "name": "Frame sampling", "status": "ok", "detail": {"frames_used": frames_ok}},
@@ -421,10 +439,139 @@ def run_stage2_dry(payload: dict[str, Any]) -> dict[str, Any]:
             "status": "error",
             "mode": "dry_run",
             "error": str(e),
-            "trace": traceback.format_exc()[-2000:],
         }
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def _link_models_dir(ras_root: Path) -> None:
+    models_dir = _models_dir(ras_root)
+    models_link = ras_root / "models"
+    if models_dir == models_link:
+        return
+    if models_link.is_symlink():
+        if models_link.resolve() == models_dir:
+            return
+        models_link.unlink()
+    elif models_link.exists():
+        if models_link.is_dir() and not any(models_link.iterdir()):
+            models_link.rmdir()
+        else:
+            raise RuntimeError(f"cannot link models: non-empty path exists at {models_link}")
+    models_link.symlink_to(models_dir, target_is_directory=True)
+
+
+def _artifact_manifest(out_dir: Path, work: Path) -> dict[str, Any]:
+    """Return only durable artifact claims; temporary worker paths are never API URLs."""
+    artifact_root = os.environ.get("STAGE2_ARTIFACT_DIR", "").strip()
+    files = [p.name for p in out_dir.iterdir() if p.is_file()] if out_dir.is_dir() else []
+    if not artifact_root:
+        return {
+            "durable": False,
+            "files": files,
+            "note": "Artifacts were generated for this job but no durable download store is configured.",
+        }
+    dest = Path(artifact_root) / work.name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    shutil.copytree(out_dir, dest)
+    return {
+        "durable": True,
+        "files": files,
+        "storage_key": work.name,
+        "note": "Artifacts were copied to the worker's configured persistent store.",
+    }
+
+
+def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
+    """Real VGGT geometry path that intentionally does not import or load SAM3."""
+    t_all = time.time()
+    work = Path(tempfile.mkdtemp(prefix="ras-stage2-geometry-"))
+    out_dir = work / "output"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timings: dict[str, int] = {}
+    try:
+        t0 = time.time()
+        video_path = _materialize_video(payload, work)
+        timings["download"] = int((time.time() - t0) * 1000)
+
+        _ensure_ras_installed(require_sam3=False)
+        ras_root = _ensure_ras_on_path()
+        _link_models_dir(ras_root)
+
+        import gc
+        import numpy as np
+        import torch
+        from vggt.models.vggt import VGGT
+        from src.utils import load_video_frames
+        from src.vggt_predict import vggt_predict
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("geometry mode requires a CUDA GPU")
+        device = "cuda"
+        max_frames = int(payload["max_frames"])
+
+        t0 = time.time()
+        frames = load_video_frames(str(video_path), max_frames).to(device)
+        n_frames = int(frames.shape[0])
+        timings["sample"] = int((time.time() - t0) * 1000)
+
+        t0 = time.time()
+        model = VGGT.from_pretrained("./models/VGGT").to(device)
+        pred = vggt_predict(frames, model)
+        model.to("cpu")
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+        timings["vggt"] = int((time.time() - t0) * 1000)
+
+        try:
+            if pred.get("point_cloud_data") is not None:
+                pred["point_cloud_data"].export(str(out_dir / "point_cloud.ply"))
+            np.savetxt(str(out_dir / "intrinsic.txt"), pred["intrinsic"])
+        except Exception as exc:
+            pred["export_warning"] = str(exc)
+
+        timings["total"] = int((time.time() - t_all) * 1000)
+        return {
+            "status": "ok",
+            "mode": "geometry",
+            "implementation": "ReplicateAnyScene Stage 2 VGGT geometry preflight",
+            "upstream_revision": RAS_REVISION,
+            "frames_used": n_frames,
+            "source_frame_indices": list(range(n_frames)),
+            "categories": payload["categories"],
+            "raw_track_count": 0,
+            "instance_count": 0,
+            "instances": [],
+            "geometry": {
+                "backend": "vggt",
+                "device": device,
+                "world_points_shape": list(pred["world_points"].shape),
+                "sam3_required": False,
+            },
+            "sam": {"backend": "not_run", "reason": "geometry mode intentionally skips SAM3"},
+            "artifacts": _artifact_manifest(out_dir, work),
+            "timings_ms": timings,
+            "pipeline": [
+                {"id": "intake", "name": "Video intake", "status": "ok", "ms": timings.get("download")},
+                {"id": "sample_frames", "name": "Frame sampling", "status": "ok", "ms": timings.get("sample")},
+                {"id": "vggt", "name": "VGGT geometry", "status": "ok", "ms": timings.get("vggt")},
+                {"id": "sam", "name": "SAM3", "status": "skipped_geometry_mode"},
+                {"id": "dedup", "name": "Spatial dedup", "status": "skipped_geometry_mode"},
+            ],
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "mode": "geometry",
+            "error": str(exc),
+            "timings_ms": timings,
+        }
+    finally:
+        if os.environ.get("STAGE2_KEEP_WORK") != "1":
+            shutil.rmtree(work, ignore_errors=True)
 
 
 def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
@@ -462,17 +609,7 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
 
         _ensure_ras_installed()
         ras_root = _ensure_ras_on_path()
-        # Models live under RAS_ROOT/models or STAGE2_MODELS_DIR symlinked as ./models
-        models_dir = Path(os.environ.get("STAGE2_MODELS_DIR", ras_root / "models")).resolve()
-        models_link = ras_root / "models"
-        if models_dir != models_link:
-            if models_link.is_symlink() or models_link.exists():
-                if models_link.is_symlink():
-                    models_link.unlink()
-                elif models_link.is_dir() and not any(models_link.iterdir()):
-                    models_link.rmdir()
-            if not models_link.exists():
-                models_link.symlink_to(models_dir, target_is_directory=True)
+        _link_models_dir(ras_root)
 
         import torch
         import cv2
@@ -555,26 +692,14 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
         raw_count = sum(len(v) for v in all_masks.values())
         timings["total"] = int((time.time() - t_all) * 1000)
 
-        artifact_root = os.environ.get("STAGE2_ARTIFACT_DIR", "").strip()
-        artifacts: dict[str, Any] = {
-            "work_dir": str(out_dir),
-            "mask_video": str(mask_video) if mask_video.exists() else None,
-            "point_cloud_ply": str(out_dir / "point_cloud.ply") if (out_dir / "point_cloud.ply").exists() else None,
-        }
-        if artifact_root:
-            dest = Path(artifact_root) / work.name
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.exists():
-                shutil.rmtree(dest, ignore_errors=True)
-            shutil.copytree(out_dir, dest)
-            artifacts["persisted_dir"] = str(dest)
+        artifacts = _artifact_manifest(out_dir, work)
 
         return {
             "status": "ok",
             "mode": "full",
             "implementation": "ReplicateAnyScene main.py Stage 2 (vendor)",
             "upstream": "https://github.com/xiac20/ReplicateAnyScene",
-            "ras_root": str(ras_root),
+            "upstream_revision": RAS_REVISION,
             "frames_used": n_frames,
             "source_frame_indices": list(range(n_frames)),
             "categories": categories,
@@ -610,7 +735,6 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
             "status": "error",
             "mode": "full",
             "error": str(e),
-            "trace": traceback.format_exc()[-3000:],
             "timings_ms": timings,
             "hint": (
                 "Ensure vendor/ReplicateAnyScene is present with sam3+vggt installed, "
@@ -618,12 +742,29 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
             ),
         }
     finally:
-        if os.environ.get("STAGE2_KEEP_WORK") != "1" and not os.environ.get("STAGE2_ARTIFACT_DIR", "").strip():
+        if os.environ.get("STAGE2_KEEP_WORK") != "1":
             shutil.rmtree(work, ignore_errors=True)
 
 
 def run_stage2(payload: dict[str, Any]) -> dict[str, Any]:
     mode = str(payload.get("mode") or os.environ.get("STAGE2_MODE_DEFAULT") or "full").lower()
+    if mode not in {"dry_run", "geometry", "full"}:
+        return {"status": "error", "mode": mode, "error": "mode must be dry_run, geometry, or full"}
+    try:
+        max_frames = int(payload.get("max_frames") or (24 if mode == "dry_run" else 48))
+    except (TypeError, ValueError):
+        return {"status": "error", "mode": mode, "error": "max_frames must be an integer from 2 to 160"}
+    categories = payload.get("categories") or []
+    if isinstance(categories, str):
+        categories = [c.strip() for c in categories.split(",") if c.strip()]
+    categories = list(dict.fromkeys(str(c).strip() for c in categories if str(c).strip()))
+    if not categories or len(categories) > 8 or any(len(c) > 64 for c in categories):
+        return {"status": "error", "mode": mode, "error": "use 1-8 categories, each at most 64 characters"}
+    if max_frames < 2 or max_frames > 160:
+        return {"status": "error", "mode": mode, "error": "max_frames must be an integer from 2 to 160"}
+    payload = {**payload, "mode": mode, "max_frames": max_frames, "categories": categories}
     if mode == "dry_run":
         return run_stage2_dry(payload)
+    if mode == "geometry":
+        return run_stage2_geometry(payload)
     return run_stage2_full(payload)
