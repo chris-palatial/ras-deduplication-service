@@ -197,16 +197,16 @@ def _download_sam3_weights(models_dir: Path) -> None:
 
 def _ensure_python_packages(ras: Path, *, require_sam3: bool) -> None:
     """Clone is not enough: RAS imports require pip-installed vggt + sam3 packages."""
+    import importlib.util
+
     # Host deps used by RAS Stage-2 modules (not Stage-3 sam-3d-objects).
     common_modules = ("einops", "safetensors", "scipy", "trimesh", "colorcet", "matplotlib", "omegaconf", "hydra", "transformers", "timm", "ftfy", "regex", "iopath", "huggingface_hub", "PIL")
     if require_sam3:
         common_modules += ("open3d",)
-    missing_common = []
-    for module in common_modules:
-        try:
-            __import__(module)
-        except Exception:
-            missing_common.append(module)
+    # Use find_spec instead of importing optional packages before installation.
+    # huggingface_hub caches optional dependency availability when imported;
+    # importing it before safetensors exists makes first-job from_pretrained fail.
+    missing_common = [module for module in common_modules if importlib.util.find_spec(module) is None]
     if missing_common:
         _pip_install(
             "numpy<2", "einops", "safetensors", "scipy", "trimesh", "colorcet",
@@ -215,7 +215,7 @@ def _ensure_python_packages(ras: Path, *, require_sam3: bool) -> None:
             "Pillow", *(("open3d",) if require_sam3 else ()),
         )
 
-    # Editable installs so `import vggt` / `import sam3` resolve.
+    # Install source packages so `import vggt` / `import sam3` resolve.
     vggt_py = ras / "vggt" / "pyproject.toml"
     sam_py = ras / "sam3" / "pyproject.toml"
     if not vggt_py.is_file():
@@ -268,6 +268,9 @@ def _ensure_ras_installed(*, require_sam3: bool = True) -> None:
     if require_sam3:
         _clone_if_missing("https://github.com/facebookresearch/sam3.git", ras / "sam3", SAM3_REVISION)
 
+    # Install dependencies before importing huggingface_hub to download weights.
+    _ensure_python_packages(ras, require_sam3=require_sam3)
+
     if not _vggt_weights_ok(models_dir / "VGGT"):
         _download_vggt_weights(models_dir)
 
@@ -279,8 +282,6 @@ def _ensure_ras_installed(*, require_sam3: bool = True) -> None:
         _download_sam3_weights(models_dir)
     elif require_sam3:
         _ensure_sam3_pt_layout(models_dir)
-
-    _ensure_python_packages(ras, require_sam3=require_sam3)
 
 
 def _ensure_ras_on_path() -> Path:
