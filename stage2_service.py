@@ -20,8 +20,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-import requests
-
 # Resolve vendor checkout. Layout:
 #   services/replicate-any-scene-stage2/
 #     stage2_service.py
@@ -302,6 +300,8 @@ def _ensure_ras_on_path() -> Path:
 
 
 def _download_video(video_url: str, dest_dir: Path, timeout_s: int = 180) -> Path:
+    import requests
+
     dest_dir.mkdir(parents=True, exist_ok=True)
     suffix = Path(urlparse(video_url).path).suffix.lower()
     if suffix not in {".mp4", ".mov", ".webm", ".mkv", ".avi"}:
