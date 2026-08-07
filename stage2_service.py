@@ -475,7 +475,11 @@ def _artifact_manifest(out_dir: Path, work: Path) -> dict[str, Any]:
         return {
             "durable": False,
             "files": files,
-            "note": "Artifacts were generated for this job but no durable download store is configured.",
+            "note": (
+                "Artifacts were generated for this job but no durable download store is configured."
+                if files
+                else "Artifact export was skipped because no durable download store is configured."
+            ),
         }
     dest = Path(artifact_root) / work.name
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -488,6 +492,11 @@ def _artifact_manifest(out_dir: Path, work: Path) -> dict[str, Any]:
         "storage_key": work.name,
         "note": "Artifacts were copied to the worker's configured persistent store.",
     }
+
+
+def _artifact_exports_enabled() -> bool:
+    """Only spend time exporting geometry when the files will remain inspectable."""
+    return bool(os.environ.get("STAGE2_ARTIFACT_DIR", "").strip()) or os.environ.get("STAGE2_KEEP_WORK") == "1"
 
 
 def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
@@ -507,7 +516,6 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
         _link_models_dir(ras_root)
 
         import gc
-        import numpy as np
         import torch
         from vggt.models.vggt import VGGT
         from src.utils import load_video_frames
@@ -532,12 +540,17 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
         torch.cuda.empty_cache()
         timings["vggt"] = int((time.time() - t0) * 1000)
 
-        try:
-            if pred.get("point_cloud_data") is not None:
-                pred["point_cloud_data"].export(str(out_dir / "point_cloud.ply"))
-            np.savetxt(str(out_dir / "intrinsic.txt"), pred["intrinsic"])
-        except Exception as exc:
-            pred["export_warning"] = str(exc)
+        t0 = time.time()
+        if _artifact_exports_enabled():
+            try:
+                import numpy as np
+
+                if pred.get("point_cloud_data") is not None:
+                    pred["point_cloud_data"].export(str(out_dir / "point_cloud.ply"))
+                np.savetxt(str(out_dir / "intrinsic.txt"), pred["intrinsic"])
+            except Exception as exc:
+                pred["export_warning"] = str(exc)
+        timings["artifact_export"] = int((time.time() - t0) * 1000)
 
         timings["total"] = int((time.time() - t_all) * 1000)
         return {
