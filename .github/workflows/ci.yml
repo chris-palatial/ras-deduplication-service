@@ -48,8 +48,12 @@ jobs:
         with:
           python-version: "3.12"
       - name: Atomically pin the live RunPod template to this commit
-        timeout-minutes: 20
+        timeout-minutes: 60
         env:
           GITHUB_TOKEN: ${{ github.token }}
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
-        run: python scripts/deploy_revision.py --revision "$GITHUB_SHA"
+        run: >-
+          python scripts/deploy_revision.py
+          --revision "$GITHUB_SHA"
+          --rollout-timeout-seconds 2700
+          --smoke-timeout-seconds 900

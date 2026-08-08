@@ -1,8 +1,10 @@
+# syntax=docker/dockerfile:1.7
 # Stage 2 service: official ReplicateAnyScene + thin RunPod handler.
 # Build on linux/amd64. Prefer baking weights once or mounting STAGE2_MODELS_DIR.
 #
 #   docker build -t ras-stage2:full \
-#     --build-arg HF_TOKEN=$HF_TOKEN \
+#     --build-arg STAGE2_BUILD_REVISION="$(git rev-parse HEAD)" \
+#     --secret id=hf_token,env=HF_TOKEN \
 #     --build-arg DOWNLOAD_WEIGHTS=1 .
 
 FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
@@ -10,6 +12,7 @@ FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 ARG RAS_REVISION=671191457e7244d9337ef3faf558ee92bbf9bf73
 ARG VGGT_REVISION=44b3afbd1869d8bde4894dd8ea1e293112dd5eba
 ARG SAM3_REVISION=bfbed072a07a6a52c8d5fdc75a7a186251a835b1
+ARG STAGE2_BUILD_REVISION=""
 
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
@@ -50,12 +53,23 @@ RUN mkdir -p /app/vendor \
 
 COPY stage2_service.py handler.py artifact_upload.py point_cloud_glb.py /app/
 COPY scripts /app/scripts
-RUN chmod +x /app/scripts/*.sh || true
+RUN chmod +x /app/scripts/*.sh || true \
+    && if [ -n "$STAGE2_BUILD_REVISION" ]; then \
+         printf '%s' "$STAGE2_BUILD_REVISION" | grep -Eq '^[0-9a-f]{40}$' \
+           || { echo "STAGE2_BUILD_REVISION must be a full lowercase commit SHA" >&2; exit 64; }; \
+         printf '%s\n' "$STAGE2_BUILD_REVISION" > /app/.stage2_build_revision; \
+       else \
+         printf '%s\n' unknown > /app/.stage2_build_revision; \
+       fi
+ENV STAGE2_BUILD_REVISION_FILE=/app/.stage2_build_revision
 
-ARG HF_TOKEN=""
 ARG DOWNLOAD_WEIGHTS=0
-RUN if [ "$DOWNLOAD_WEIGHTS" = "1" ]; then \
-      if [ -n "$HF_TOKEN" ]; then export HF_TOKEN HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"; fi; \
+RUN --mount=type=secret,id=hf_token,required=false \
+    if [ "$DOWNLOAD_WEIGHTS" = "1" ]; then \
+      if [ -s /run/secrets/hf_token ]; then \
+        HF_TOKEN="$(cat /run/secrets/hf_token)"; \
+        export HF_TOKEN HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"; \
+      fi; \
       bash /app/scripts/download_weights.sh; \
     else \
       mkdir -p /models; \

@@ -75,6 +75,12 @@ if [[ "$ready" != true ]]; then
     echo "[start] refusing unsafe runtime cleanup target" >&2
     exit 64
   fi
+  mkdir -p "$runtime_dir"
+  exec 7>"$runtime_dir/.active_lease"
+  if ! flock -n 7; then
+    echo "[start] runtime $STAGE2_CODE_REV is active; refusing to rebuild it in place" >&2
+    exit 75
+  fi
   rm -rf -- "$runtime_dir"
   mkdir -p "$runtime_dir"
   git clone --filter=blob:none --no-checkout https://github.com/chris-palatial/ras-stage2-service.git "$app_dir"
@@ -83,6 +89,7 @@ if [[ "$ready" != true ]]; then
   python -m venv --system-site-packages "$STAGE2_VENV"
   "$STAGE2_VENV/bin/python" -m pip install -q --no-cache-dir -r "$app_dir/requirements.txt"
   printf '%s\n' "$STAGE2_CODE_REV" >"$marker"
+  flock -u 7
 fi
 
 # Hold a shared lease for the worker's entire process lifetime. Cleanup takes an
@@ -90,6 +97,7 @@ fi
 touch "$runtime_dir/.last_used"
 exec 8>"$runtime_dir/.active_lease"
 flock -s 8
+export STAGE2_BUILD_REVISION_FILE="$marker"
 
 # Count retention is only a first filter. A directory must also be older than
 # the maximum job window and have no active worker lease before removal.

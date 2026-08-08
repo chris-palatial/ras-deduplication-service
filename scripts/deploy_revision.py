@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import email.utils
 import json
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 from typing import Any
 
@@ -19,7 +21,6 @@ GITHUB_BRANCH = "main"
 DEFAULT_TEMPLATE_ID = "inapyg0va0"
 DEFAULT_ENDPOINT_ID = "sp2oyuum48vk0j"
 INVOKE_API_ROOT = "https://api.runpod.ai/v2"
-SMOKE_MAX_ATTEMPTS = 6
 SMOKE_VIDEO_B64 = (
     "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAMrbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAA+gAAQAA"
     "AQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAlV0"
@@ -72,7 +73,14 @@ def bootstrap_command(revision: str) -> str:
     )
 
 
-def request_json(method: str, url: str, api_key: str, payload: dict | None = None) -> dict:
+def _request_json_once(
+    method: str,
+    url: str,
+    api_key: str,
+    payload: dict | None = None,
+    *,
+    timeout: float = 30,
+) -> dict:
     data = json.dumps(payload, separators=(",", ":")).encode() if payload is not None else None
     req = urllib.request.Request(
         url,
@@ -84,14 +92,14 @@ def request_json(method: str, url: str, api_key: str, payload: dict | None = Non
             "accept": "application/json",
         },
     )
-    with urllib.request.urlopen(req, timeout=30) as response:
+    with urllib.request.urlopen(req, timeout=timeout) as response:
         result = json.load(response)
     if not isinstance(result, dict):
         raise RuntimeError("RunPod template API returned a non-object response")
     return result
 
 
-def invoke_json(
+def _invoke_json_once(
     method: str,
     url: str,
     api_key: str,
@@ -115,6 +123,112 @@ def invoke_json(
     if not isinstance(result, dict):
         raise RuntimeError("RunPod invoke API returned a non-object response")
     return result
+
+
+def _retry_after_seconds(error: BaseException, attempt: int) -> float:
+    if isinstance(error, urllib.error.HTTPError):
+        raw = error.headers.get("Retry-After") if error.headers else None
+        if raw:
+            try:
+                return max(0.0, min(float(raw), 30.0))
+            except ValueError:
+                try:
+                    retry_at = email.utils.parsedate_to_datetime(raw).timestamp()
+                    return max(0.0, min(retry_at - time.time(), 30.0))
+                except (TypeError, ValueError, OverflowError):
+                    pass
+    return min(0.5 * (2 ** max(0, attempt - 1)), 10.0)
+
+
+def _is_retryable_read_error(error: BaseException) -> bool:
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in {408, 425, 429} or 500 <= error.code <= 599
+    return isinstance(error, (urllib.error.URLError, TimeoutError, ConnectionError))
+
+
+def _remaining_network_timeout(*, deadline: float, cap: float, description: str) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"{description} exceeded its bounded deadline")
+    return min(cap, remaining)
+
+
+def _retry_safe_get(fetch, *, deadline: float, description: str) -> dict:
+    attempt = 0
+    while True:
+        if deadline - time.monotonic() <= 0:
+            raise TimeoutError(f"{description} did not recover before the deployment deadline")
+        attempt += 1
+        try:
+            return fetch()
+        except Exception as error:
+            if not _is_retryable_read_error(error):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"{description} did not recover before the deployment deadline"
+                ) from error
+            time.sleep(min(_retry_after_seconds(error, attempt), remaining))
+
+
+def request_json(
+    method: str,
+    url: str,
+    api_key: str,
+    payload: dict | None = None,
+    *,
+    deadline: float | None = None,
+) -> dict:
+    if method != "GET":
+        # Template updates are ambiguous writes and must never be replayed.
+        return _request_json_once(method, url, api_key, payload)
+    read_deadline = deadline if deadline is not None else time.monotonic() + 120
+    return _retry_safe_get(
+        lambda: _request_json_once(
+            method,
+            url,
+            api_key,
+            payload,
+            timeout=_remaining_network_timeout(
+                deadline=read_deadline,
+                cap=30,
+                description="RunPod control-plane read",
+            ),
+        ),
+        deadline=read_deadline,
+        description="RunPod control-plane read",
+    )
+
+
+def invoke_json(
+    method: str,
+    url: str,
+    api_key: str,
+    payload: dict | None = None,
+    *,
+    timeout: int = 30,
+    deadline: float | None = None,
+) -> dict:
+    if method != "GET":
+        # Paid /run and cancellation POSTs are never retried implicitly.
+        return _invoke_json_once(method, url, api_key, payload, timeout=timeout)
+    read_deadline = deadline if deadline is not None else time.monotonic() + 120
+    return _retry_safe_get(
+        lambda: _invoke_json_once(
+            method,
+            url,
+            api_key,
+            payload,
+            timeout=_remaining_network_timeout(
+                deadline=read_deadline,
+                cap=timeout,
+                description="RunPod job-status read",
+            ),
+        ),
+        deadline=read_deadline,
+        description="RunPod job-status read",
+    )
 
 
 def invoke_api_root() -> str:
@@ -142,6 +256,7 @@ def run_post_deploy_smoke(
     api_key: str,
     *,
     timeout_seconds: int,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """Run bounded async dry jobs until the rolling endpoint serves revision."""
     if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", endpoint_id):
@@ -149,10 +264,18 @@ def run_post_deploy_smoke(
     if timeout_seconds < 30 or timeout_seconds > 1200:
         raise RuntimeError("smoke timeout must be from 30 through 1200 seconds")
 
-    deadline = time.monotonic() + timeout_seconds
+    now = time.monotonic()
+    deadline = deadline if deadline is not None else now + timeout_seconds
+    if deadline <= now:
+        raise TimeoutError("RunPod rollout exhausted the bounded deployment timeout before smoke")
     invoke_root = invoke_api_root()
     last_observation = "no_completed_job"
-    for attempt in range(1, SMOKE_MAX_ATTEMPTS + 1):
+    attempt = 0
+    # The wall-clock deadline is the cost/reliability boundary. Do not exhaust
+    # an arbitrary attempt count while the rolling endpoint can still have old
+    # warm workers and most of the configured smoke budget remains.
+    while attempt == 0 or time.monotonic() < deadline:
+        attempt += 1
         started = invoke_json(
             "POST",
             f"{invoke_root}/{endpoint_id}/run",
@@ -181,13 +304,16 @@ def run_post_deploy_smoke(
                 f"{invoke_root}/{endpoint_id}/status/{job_id}",
                 api_key,
                 timeout=max(1, min(30, int(remaining))),
+                deadline=deadline,
             )
             state = str(status_result.get("status") or "").upper()
             if state == "COMPLETED":
                 break
             if state in {"FAILED", "TIMED_OUT", "CANCELLED"}:
                 raise RuntimeError(f"RunPod post-deploy smoke ended with state {state}")
-            time.sleep(min(5.0, remaining))
+            poll_remaining = deadline - time.monotonic()
+            if poll_remaining > 0:
+                time.sleep(min(5.0, poll_remaining))
 
         output = status_result.get("output")
         if not isinstance(output, dict):
@@ -206,7 +332,7 @@ def run_post_deploy_smoke(
             }
 
         remaining = deadline - time.monotonic()
-        if attempt < SMOKE_MAX_ATTEMPTS and remaining > 0:
+        if remaining > 0:
             time.sleep(min(10.0, remaining))
 
     raise RuntimeError(
@@ -214,7 +340,82 @@ def run_post_deploy_smoke(
     )
 
 
-def github_branch_head(token: str = "") -> str:
+def _endpoint_version(snapshot: dict[str, Any]) -> str:
+    version = snapshot.get("version")
+    if isinstance(version, (str, int)) and str(version).strip():
+        return str(version).strip()
+    raise RuntimeError("RunPod endpoint API did not return a version")
+
+
+def _active_worker_versions(snapshot: dict[str, Any]) -> list[str | None]:
+    workers = snapshot.get("workers")
+    if workers is None:
+        return []
+    if not isinstance(workers, list):
+        raise RuntimeError("RunPod endpoint API returned malformed workers")
+
+    versions: list[str | None] = []
+    terminal = {"EXITED", "STOPPED", "TERMINATED"}
+    for worker in workers:
+        if not isinstance(worker, dict):
+            raise RuntimeError("RunPod endpoint API returned a malformed worker")
+        status = str(worker.get("status") or "").upper()
+        # RunPod marks a draining worker's desired state EXITED before the
+        # process has actually stopped. It remains part of the live fleet until
+        # its observed status becomes terminal.
+        if status in terminal:
+            continue
+        version = worker.get("slsVersion")
+        versions.append(str(version).strip() if isinstance(version, (str, int)) else None)
+    return versions
+
+
+def wait_for_endpoint_rollout(
+    endpoint_id: str,
+    previous_version: str,
+    api_key: str,
+    *,
+    deadline: float,
+) -> dict[str, Any]:
+    """Wait until the endpoint advances and every live worker is on that version."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", endpoint_id):
+        raise RuntimeError("RunPod endpoint id is malformed")
+
+    polls = 0
+    last_observation = "endpoint_version_not_advanced"
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"RunPod endpoint fleet did not converge before the bounded timeout ({last_observation})"
+            )
+        polls += 1
+        snapshot = request_json(
+            "GET",
+            f"{API_ROOT}/endpoints/{endpoint_id}?includeWorkers=true",
+            api_key,
+            deadline=deadline,
+        )
+        version = _endpoint_version(snapshot)
+        worker_versions = _active_worker_versions(snapshot)
+        if version == previous_version:
+            last_observation = "endpoint_version_not_advanced"
+        elif all(worker_version == version for worker_version in worker_versions):
+            return {
+                "status": "converged",
+                "previous_version": previous_version,
+                "version": version,
+                "active_workers": len(worker_versions),
+                "polls": polls,
+            }
+        else:
+            last_observation = "mixed_worker_versions"
+        poll_remaining = deadline - time.monotonic()
+        if poll_remaining > 0:
+            time.sleep(min(5.0, poll_remaining))
+
+
+def github_branch_head(token: str = "", *, deadline: float | None = None) -> str:
     headers = {
         "accept": "application/vnd.github+json",
         "user-agent": "ras-stage2-deployer",
@@ -222,13 +423,32 @@ def github_branch_head(token: str = "") -> str:
     }
     if token:
         headers["authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(
-        f"{GITHUB_API_ROOT}/repos/{GITHUB_REPOSITORY}/git/ref/heads/{GITHUB_BRANCH}",
-        headers=headers,
-        method="GET",
+    read_deadline = deadline if deadline is not None else time.monotonic() + 120
+
+    def fetch() -> dict:
+        req = urllib.request.Request(
+            f"{GITHUB_API_ROOT}/repos/{GITHUB_REPOSITORY}/git/ref/heads/{GITHUB_BRANCH}",
+            headers=headers,
+            method="GET",
+        )
+        with urllib.request.urlopen(
+            req,
+            timeout=_remaining_network_timeout(
+                deadline=read_deadline,
+                cap=30,
+                description="GitHub branch read",
+            ),
+        ) as response:
+            result = json.load(response)
+        if not isinstance(result, dict):
+            raise RuntimeError("GitHub branch API returned a non-object response")
+        return result
+
+    result = _retry_safe_get(
+        fetch,
+        deadline=read_deadline,
+        description="GitHub branch read",
     )
-    with urllib.request.urlopen(req, timeout=30) as response:
-        result = json.load(response)
     revision = ((result.get("object") or {}).get("sha")) if isinstance(result, dict) else None
     if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise RuntimeError("GitHub branch API returned an invalid revision")
@@ -305,6 +525,11 @@ def main() -> None:
         type=int,
         default=int(os.environ.get("STAGE2_DEPLOY_SMOKE_TIMEOUT_SECONDS", "900")),
     )
+    parser.add_argument(
+        "--rollout-timeout-seconds",
+        type=int,
+        default=int(os.environ.get("STAGE2_DEPLOY_ROLLOUT_TIMEOUT_SECONDS", "2700")),
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if not re.fullmatch(r"[0-9a-f]{40}", args.revision):
@@ -319,15 +544,26 @@ def main() -> None:
         raise SystemExit("--endpoint-id is malformed")
     if args.smoke_timeout_seconds < 30 or args.smoke_timeout_seconds > 1200:
         raise SystemExit("--smoke-timeout-seconds must be from 30 through 1200")
+    if args.rollout_timeout_seconds < 300 or args.rollout_timeout_seconds > 3600:
+        raise SystemExit("--rollout-timeout-seconds must be from 300 through 3600")
 
     api_key = os.environ.get("RUNPOD_API_KEY", "").strip()
     if not api_key:
         raise SystemExit("RUNPOD_API_KEY is required")
     base = f"{API_ROOT}/templates/{args.template_id}"
     current = request_json("GET", base + "?includeEndpointBoundTemplates=true", api_key)
+    endpoint_before = request_json(
+        "GET",
+        f"{API_ROOT}/endpoints/{args.endpoint_id}?includeWorkers=true",
+        api_key,
+    )
+    previous_endpoint_version = _endpoint_version(endpoint_before)
     # This authoritative branch read is intentionally the final network action
     # before the RunPod mutation. An out-of-order older workflow exits cleanly.
-    branch_head = github_branch_head(os.environ.get("GITHUB_TOKEN", "").strip())
+    branch_head = github_branch_head(
+        os.environ.get("GITHUB_TOKEN", "").strip(),
+        deadline=time.monotonic() + 120,
+    )
     if branch_head != args.revision:
         print(json.dumps({
             "status": "skipped_stale_revision",
@@ -338,17 +574,26 @@ def main() -> None:
         return
     updated = request_json("POST", base + "/update", api_key, build_payload(current, args.revision))
     validate_payload(updated, args.revision)
+    deadline = time.monotonic() + args.rollout_timeout_seconds
+    rollout = wait_for_endpoint_rollout(
+        args.endpoint_id,
+        previous_endpoint_version,
+        api_key,
+        deadline=deadline,
+    )
     smoke = run_post_deploy_smoke(
         args.endpoint_id,
         args.revision,
         api_key,
         timeout_seconds=args.smoke_timeout_seconds,
+        deadline=min(deadline, time.monotonic() + args.smoke_timeout_seconds),
     )
     print(json.dumps({
         "status": "deployed",
         "template_id": args.template_id,
         "revision": args.revision,
         "pins_match": True,
+        "rollout": rollout,
         "smoke": smoke,
     }, sort_keys=True))
 
