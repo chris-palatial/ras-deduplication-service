@@ -729,6 +729,55 @@ class Stage2ServiceTest(unittest.TestCase):
             self.assertEqual(stage2._vggt_model_id(), "facebook/VGGT-1B-Commercial")
             self.assertEqual(stage2._vggt_license_scope(), "commercial")
 
+    def test_public_vggt_cache_miss_downloads_anonymously_without_hf_token(self):
+        calls = []
+
+        def snapshot_download(**kwargs):
+            calls.append(kwargs)
+            destination = Path(kwargs["local_dir"])
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / "model.safetensors").write_bytes(b"weights")
+
+        fake_hub = types.SimpleNamespace(snapshot_download=snapshot_download)
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            stage2.os.environ,
+            {},
+            clear=True,
+        ), patch.dict(sys.modules, {"huggingface_hub": fake_hub}):
+            models = Path(tmp)
+            stage2._download_vggt_weights(models)
+
+            self.assertEqual(calls[0]["repo_id"], "facebook/VGGT-1B")
+            self.assertIsNone(calls[0]["token"])
+            self.assertEqual(
+                (models / "VGGT" / stage2.VGGT_MODEL_MARKER).read_text().strip(),
+                "facebook/VGGT-1B",
+            )
+
+    def test_gated_model_downloads_require_an_explicit_hf_token(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            stage2.os.environ,
+            {"VGGT_MODEL_ID": "facebook/VGGT-1B-Commercial"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "requires an approved Hugging Face token"):
+                stage2._download_vggt_weights(Path(tmp))
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            stage2.os.environ,
+            {},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "SAM3 weights are gated"):
+                stage2._download_sam3_weights(Path(tmp))
+
+    def test_weight_download_script_never_converts_a_missing_token_to_true(self):
+        script = (
+            Path(__file__).resolve().parents[1] / "scripts" / "download_weights.sh"
+        ).read_text()
+        self.assertNotRegex(script, r"HUGGING_FACE_HUB_TOKEN\"\) or True")
+        self.assertIn('token=None if vggt_model_id == "facebook/VGGT-1B" else token', script)
+
     def test_glb_contains_bounded_colored_points_and_camera_lines(self):
         points = np.arange(36, dtype=np.float32).reshape(2, 2, 3, 3)
         colors = np.linspace(0.0, 1.0, 36, dtype=np.float32).reshape(2, 2, 3, 3)

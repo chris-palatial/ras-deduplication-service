@@ -191,6 +191,14 @@ def _vggt_license_scope(model_id: str | None = None) -> str:
     return "commercial" if (model_id or _vggt_model_id()) == COMMERCIAL_VGGT_MODEL_ID else "research_noncommercial"
 
 
+def _hugging_face_token() -> str | None:
+    for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return None
+
+
 def _vggt_weights_ok(vggt_dir: Path, expected_model_id: str | None = None) -> bool:
     if not vggt_dir.is_dir():
         return False
@@ -247,18 +255,21 @@ def _ensure_sam3_pt_layout(models_dir: Path) -> Path:
 
 
 def _download_vggt_weights(models_dir: Path) -> None:
-    from huggingface_hub import snapshot_download
-
-    token = (
-        os.environ.get("HF_TOKEN")
-        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-        or True
-    )
     models_dir.mkdir(parents=True, exist_ok=True)
     vggt_dir = models_dir / "VGGT"
     model_id = _vggt_model_id()
     if not _vggt_weights_ok(vggt_dir, model_id):
+        # The default research checkpoint is public. Keep geometry independent
+        # from SAM3 approval and from any stale/revoked endpoint credential by
+        # always downloading it anonymously. Explicit alternate checkpoints
+        # (including the gated Commercial model) require real credentials.
+        token = None if model_id == DEFAULT_VGGT_MODEL_ID else _hugging_face_token()
+        if model_id != DEFAULT_VGGT_MODEL_ID and token is None:
+            raise RuntimeError(
+                f"{model_id} requires an approved Hugging Face token in HF_TOKEN"
+            )
+        from huggingface_hub import snapshot_download
+
         print(f"[stage2] downloading {model_id} ...", flush=True)
         snapshot_download(
             repo_id=model_id,
@@ -269,17 +280,16 @@ def _download_vggt_weights(models_dir: Path) -> None:
 
 
 def _download_sam3_weights(models_dir: Path) -> None:
-    from huggingface_hub import snapshot_download
-
-    token = (
-        os.environ.get("HF_TOKEN")
-        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-        or True
-    )
     vggt_dir = models_dir / "VGGT"
     sam_dir = models_dir / "SAM3"
     if not _find_sam3_pt(sam_dir):
+        token = _hugging_face_token()
+        if token is None:
+            raise RuntimeError(
+                "SAM3 weights are gated and require an approved Hugging Face token in HF_TOKEN"
+            )
+        from huggingface_hub import snapshot_download
+
         print("[stage2] downloading facebook/sam3 ...", flush=True)
         try:
             snapshot_download(
