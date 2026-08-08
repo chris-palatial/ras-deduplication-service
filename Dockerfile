@@ -48,7 +48,7 @@ RUN mkdir -p /app/vendor \
     && python -m pip install -q --no-cache-dir --ignore-installed /app/vendor/ReplicateAnyScene/sam3 \
     && python -m pip install -q --no-cache-dir --ignore-installed open3d trimesh scipy matplotlib colorcet omegaconf hydra-core transformers
 
-COPY stage2_service.py handler.py /app/
+COPY stage2_service.py handler.py artifact_upload.py point_cloud_glb.py /app/
 COPY scripts /app/scripts
 RUN chmod +x /app/scripts/*.sh || true
 

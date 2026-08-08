@@ -14,9 +14,11 @@ from huggingface_hub import snapshot_download
 root = Path(os.environ.get("STAGE2_MODELS_DIR", "./models")).resolve()
 token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or True
 download_sam3 = os.environ.get("STAGE2_DOWNLOAD_SAM3", "1").lower() not in {"0", "false", "no"}
+vggt_model_id = os.environ.get("VGGT_MODEL_ID", "facebook/VGGT-1B").strip() or "facebook/VGGT-1B"
 root.mkdir(parents=True, exist_ok=True)
-print("VGGT-1B ->", root / "VGGT")
-snapshot_download("facebook/VGGT-1B", local_dir=str(root / "VGGT"), token=token)
+print(vggt_model_id, "->", root / "VGGT")
+snapshot_download(vggt_model_id, local_dir=str(root / "VGGT"), token=token)
+(root / "VGGT" / ".stage2_model_id").write_text(vggt_model_id + "\n")
 if not download_sam3:
     print("SAM3 skipped (STAGE2_DOWNLOAD_SAM3=0); geometry mode is ready.")
     sys.exit(0)
