@@ -807,6 +807,24 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertEqual(document["meshes"][1]["primitives"][0]["mode"], 1)
         self.assertFalse(document["extras"]["isSurfaceMesh"])
 
+        bin_header_offset = 20 + json_length
+        bin_length, bin_type = struct.unpack_from("<II", data, bin_header_offset)
+        self.assertEqual(bin_type, 0x004E4942)
+        binary = data[bin_header_offset + 8 : bin_header_offset + 8 + bin_length]
+        for mesh in document["meshes"]:
+            color_index = mesh["primitives"][0]["attributes"]["COLOR_0"]
+            accessor = document["accessors"][color_index]
+            view = document["bufferViews"][accessor["bufferView"]]
+            self.assertEqual(accessor["componentType"], 5121)
+            self.assertEqual(accessor["type"], "VEC4")
+            self.assertTrue(accessor["normalized"])
+            self.assertEqual(view["byteOffset"] % 4, 0)
+            self.assertEqual(view["byteLength"], accessor["count"] * 4)
+            color_data = binary[
+                view["byteOffset"] : view["byteOffset"] + view["byteLength"]
+            ]
+            self.assertEqual(color_data[3::4], b"\xff" * accessor["count"])
+
     def test_glb_hard_cap_stays_within_signed_16_mib_contract(self):
         count = GLB_HARD_MAX_POINTS + 101
         axis = np.linspace(-1.0, 1.0, count, dtype=np.float32)
