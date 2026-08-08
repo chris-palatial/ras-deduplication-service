@@ -76,6 +76,13 @@ cross-worker file lock under `STAGE2_MODELS_DIR`. Both the wrapper checkout and
 the upstream source checkouts verify their commit and tracked-file cleanliness
 before reuse; a dirty runtime-owned checkout is rebuilt.
 
+Prebuilt images must pass
+`--build-arg STAGE2_BUILD_REVISION="$(git rev-parse HEAD)"`. The handler reports
+only that baked marker or the actual runtime Git checkout; it never treats an
+environment variable alone as revision proof. If weights are baked, pass the
+Hugging Face credential as a BuildKit secret (`--secret
+id=hf_token,env=HF_TOKEN`), never as a build argument.
+
 `scripts/deploy_revision.py` performs that two-field pin in one RunPod template
 update. CI runs it after a green push to `main`; the repository
 `RUNPOD_API_KEY` secret must be configured. The script verifies the returned
@@ -83,12 +90,16 @@ template without printing any environment values or credentials. The complete
 test→deploy workflow is serialized per Git ref, and immediately before the
 RunPod mutation the deploy script checks the authoritative GitHub `main` head.
 An out-of-order stale workflow exits without changing the endpoint.
-After a successful template update, deployment submits a bounded real `dry_run`
-to endpoint `sp2oyuum48vk0j` (override with `STAGE2_ENDPOINT_ID`), polls its async
-status, and requires the response's `stage2_code_revision` to equal the deployed
-commit. Stale warm workers are retried within the bounded smoke budget, and CI
-fails without printing request credentials or endpoint output when verification
-does not pass.
+After a successful template update, deployment waits for the endpoint version to
+advance and for every live worker reported by RunPod to carry that version. It
+then submits a bounded real `dry_run` to endpoint `sp2oyuum48vk0j` (override with
+`STAGE2_ENDPOINT_ID`), polls its async status, and requires the response's
+`stage2_code_revision` to equal the deployed commit. Fleet convergence has a
+2,700-second release budget (longer than the 2,100-second worker execution
+window), while dry smoke is independently capped at 900 seconds and must also
+fit inside the remaining release budget. Transient safe reads are retried, but
+template updates and paid job submissions are never replayed. CI fails without
+printing request credentials or endpoint output when verification does not pass.
 
 ```json
 {
@@ -124,9 +135,10 @@ needed, obtains a fresh short-lived upload grant instead of replaying its old
 presigned URL.
 
 Before upload, the full-mode mask visualization is normalized to browser-safe
-H.264/yuv420p MP4 with fast-start metadata. Its sampled frames are retimed over
-the source clip duration so Agent Lab's original/mask linked playback remains
-aligned instead of finishing after ffmpeg's short default image-sequence rate.
+H.264/yuv420p MP4 with fast-start metadata. Each sampled mask frame keeps the
+presentation timestamp of its corresponding source frame, including
+variable-frame-rate clips, so Agent Lab's original/mask linked playback remains
+aligned instead of merely sharing the same total duration.
 
 The GLB is a visualization-friendly colored **point cloud**, not a watertight or
 textured surface mesh. It defaults to at most 300,000 points and enforces a
