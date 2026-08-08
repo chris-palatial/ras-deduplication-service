@@ -50,22 +50,54 @@ REQUIRED_ARTIFACTS = {
 _PROCESS_INITIALIZATION_LOCK = threading.Lock()
 
 
-def _sampled_source_frame_indices(video_path: Path, sampled_count: int) -> list[int] | None:
-    """Mirror the pinned upstream loader's uniform np.linspace sampling."""
-    import cv2
+def _source_frame_plan(
+    video_path: Path,
+    sampled_count: int,
+) -> tuple[list[int], list[float] | None] | None:
+    """Build indices and presentation times from one decoded-frame listing."""
     import numpy as np
 
-    cap = cv2.VideoCapture(str(video_path))
-    try:
-        if not cap.isOpened():
-            return None
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    finally:
-        cap.release()
-    if total <= 0 or sampled_count <= 0:
+    frames = _ffprobe_json(
+        video_path,
+        "-select_streams",
+        "v:0",
+        "-show_frames",
+        "-show_entries",
+        "frame=best_effort_timestamp_time,pts_time,pkt_dts_time",
+    ) or {}
+    entries = frames.get("frames") or []
+    if not isinstance(entries, list) or not entries or sampled_count <= 0:
         return None
-    count = min(sampled_count, total)
-    return np.linspace(0, total - 1, count).astype(int).tolist()
+    count = min(sampled_count, len(entries))
+    indices = np.linspace(0, len(entries) - 1, count).astype(int).tolist()
+
+    sampled_timestamps: list[float] = []
+    for index in indices:
+        entry = entries[index]
+        if not isinstance(entry, dict):
+            return indices, None
+        timestamp = next(
+            (
+                parsed
+                for field in ("best_effort_timestamp_time", "pts_time", "pkt_dts_time")
+                if (parsed := _finite_number(entry.get(field))) is not None
+            ),
+            None,
+        )
+        if timestamp is None:
+            return indices, None
+        sampled_timestamps.append(float(timestamp))
+    origin = sampled_timestamps[0]
+    normalized = [max(0.0, timestamp - origin) for timestamp in sampled_timestamps]
+    if any(right <= left for left, right in zip(normalized, normalized[1:])):
+        return indices, None
+    return indices, normalized
+
+
+def _sampled_source_frame_indices(video_path: Path, sampled_count: int) -> list[int] | None:
+    """Mirror upstream np.linspace sampling over FFmpeg-decoded frames."""
+    plan = _source_frame_plan(video_path, sampled_count)
+    return plan[0] if plan else None
 
 
 
@@ -634,7 +666,34 @@ def _probe_video_frame_count(path: Path) -> int | None:
     return None
 
 
-def _normalize_mask_video(mask_video: Path, source_video: Path) -> dict[str, Any]:
+def _sampled_source_frame_timestamps(
+    video_path: Path,
+    source_frame_indices: list[int],
+) -> list[float] | None:
+    """Resolve decoded source-frame indices to their real presentation times."""
+    plan = _source_frame_plan(video_path, max(source_frame_indices, default=-1) + 1)
+    if not plan:
+        return None
+    all_indices, all_timestamps = plan
+    if not all_timestamps or all_indices != list(range(len(all_indices))):
+        # Asking for every decoded frame above produces a direct index -> PTS map.
+        return None
+    if max(source_frame_indices, default=-1) >= len(all_timestamps):
+        return None
+    sampled = [all_timestamps[index] for index in source_frame_indices]
+    origin = sampled[0]
+    normalized = [max(0.0, timestamp - origin) for timestamp in sampled]
+    if any(right <= left for left, right in zip(normalized, normalized[1:])):
+        return None
+    return normalized
+
+
+def _normalize_mask_video(
+    mask_video: Path,
+    source_video: Path,
+    source_frame_indices: list[int] | None = None,
+    source_frame_timestamps: list[float] | None = None,
+) -> dict[str, Any]:
     """Produce browser-safe H.264 and preserve the source playback timeline."""
     import subprocess
 
@@ -645,29 +704,11 @@ def _normalize_mask_video(mask_video: Path, source_video: Path) -> dict[str, Any
         raise RuntimeError(
             "source video timeline could not be established; refusing to publish an unsynchronized mask video"
         )
-    generated_duration = _probe_video_duration(mask_video)
-    if generated_duration is None:
-        raise RuntimeError("SAM3 mask visualization has no readable duration")
-
-    target_duration = source_duration
-    stretch = target_duration / generated_duration
-    generated_frames = _probe_video_frame_count(mask_video) or max(
-        1, round(generated_duration * 25)
-    )
-    output_frames = min(generated_frames, max(1, round(target_duration * 60)))
-    output_fps = output_frames / target_duration
-    # The pinned upstream helper encodes uniformly sampled frames at ffmpeg's
-    # default image-sequence rate. Stretch those timestamps across the source
-    # clip, preserving samples up to a browser-safe 60 fps. A sparse timeline
-    # is far smaller than duplicating frames at 30 fps for a long source clip.
-    video_filter = (
-        f"setpts={stretch:.12g}*PTS,"
-        "pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p"
-    )
     normalized = mask_video.with_name(mask_video.stem + ".browser.mp4")
     normalized.unlink(missing_ok=True)
+    timeline_dir = Path(tempfile.mkdtemp(prefix="stage2-mask-timeline-", dir=str(mask_video.parent)))
     try:
-        completed = subprocess.run(
+        extracted = subprocess.run(
             [
                 "ffmpeg",
                 "-y",
@@ -678,20 +719,76 @@ def _normalize_mask_video(mask_video: Path, source_video: Path) -> dict[str, Any
                 "-map",
                 "0:v:0",
                 "-an",
+                "-vsync",
+                "0",
+                str(timeline_dir / "frame-%06d.png"),
+            ],
+            check=False,
+            capture_output=True,
+            timeout=300,
+        )
+        frame_files = sorted(timeline_dir.glob("frame-*.png"))
+        if extracted.returncode != 0 or not frame_files:
+            raise RuntimeError("SAM3 mask visualization frames could not be decoded")
+        generated_frames = len(frame_files)
+        plan = None if source_frame_indices and source_frame_timestamps else _source_frame_plan(
+            source_video,
+            generated_frames,
+        )
+        indices = source_frame_indices or (plan[0] if plan else None)
+        if not indices or len(indices) != generated_frames:
+            raise RuntimeError("SAM3 mask frames do not match the source sampling plan")
+        timestamps = source_frame_timestamps or (plan[1] if plan else None)
+        if not timestamps or len(timestamps) != generated_frames:
+            raise RuntimeError("sampled source frame timestamps could not be established")
+        tail_duration = source_duration - timestamps[-1]
+        if tail_duration <= 0:
+            raise RuntimeError("sampled source timestamps exceed the source duration")
+        durations = [
+            right - left
+            for left, right in zip(timestamps, timestamps[1:])
+        ] + [tail_duration]
+
+        concat_file = timeline_dir / "timeline.ffconcat"
+        concat_lines = ["ffconcat version 1.0"]
+        for frame, duration in zip(frame_files, durations):
+            concat_lines.extend([f"file '{frame.name}'", f"duration {duration:.12g}"])
+        # ffconcat only applies the last duration when another file follows it.
+        # The output `-t` boundary removes this duplicate at source_duration.
+        concat_lines.append(f"file '{frame_files[-1].name}'")
+        concat_file.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+
+        completed = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_file),
+                "-map",
+                "0:v:0",
+                "-an",
                 "-vf",
-                video_filter,
+                "pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p",
                 "-c:v",
                 "libx264",
                 "-preset",
                 "veryfast",
                 "-crf",
                 "22",
+                "-bf",
+                "0",
                 "-pix_fmt",
                 "yuv420p",
-                "-r",
-                f"{output_fps:.12g}",
-                "-frames:v",
-                str(output_frames),
+                "-fps_mode",
+                "vfr",
+                "-t",
+                f"{source_duration:.12g}",
                 "-movflags",
                 "+faststart",
                 "-video_track_timescale",
@@ -705,13 +802,15 @@ def _normalize_mask_video(mask_video: Path, source_video: Path) -> dict[str, Any
     except (OSError, subprocess.SubprocessError) as exc:
         normalized.unlink(missing_ok=True)
         raise RuntimeError("failed to normalize SAM3 mask video for browser playback") from exc
+    finally:
+        shutil.rmtree(timeline_dir, ignore_errors=True)
     if completed.returncode != 0 or not normalized.is_file() or normalized.stat().st_size <= 0:
         normalized.unlink(missing_ok=True)
         raise RuntimeError("failed to normalize SAM3 mask video for browser playback")
     normalized.replace(mask_video)
 
     output_duration = _probe_video_duration(mask_video)
-    tolerance = max(0.15, min(1.0, target_duration * 0.005))
+    tolerance = max(0.15, min(1.0, source_duration * 0.005))
     aligned = bool(
         output_duration is not None
         and abs(output_duration - source_duration) <= tolerance
@@ -722,8 +821,9 @@ def _normalize_mask_video(mask_video: Path, source_video: Path) -> dict[str, Any
         "codec": "h264",
         "pixel_format": "yuv420p",
         "faststart": True,
-        "frame_rate": output_fps,
-        "frame_count": output_frames,
+        "frame_rate": generated_frames / source_duration,
+        "frame_count": generated_frames,
+        "timeline_mode": "source_frame_pts",
         "source_duration_seconds": source_duration,
         "output_duration_seconds": output_duration,
         "duration_aligned": aligned,
@@ -802,16 +902,20 @@ def _link_models_dir(ras_root: Path) -> None:
     models_link = ras_root / "models"
     if models_dir == models_link:
         return
-    if models_link.is_symlink():
-        if models_link.resolve() == models_dir:
-            return
-        models_link.unlink()
-    elif models_link.exists():
-        if models_link.is_dir() and not any(models_link.iterdir()):
-            models_link.rmdir()
-        else:
-            raise RuntimeError(f"cannot link models: non-empty path exists at {models_link}")
-    models_link.symlink_to(models_dir, target_is_directory=True)
+    # First jobs can reach this boundary concurrently after lazy bootstrap.
+    # Use the same cross-worker lock as source/weight initialization so two
+    # workers never race between the existence check and symlink creation.
+    with _stage2_initialization_lock(models_dir):
+        if models_link.is_symlink():
+            if models_link.resolve() == models_dir:
+                return
+            models_link.unlink()
+        elif models_link.exists():
+            if models_link.is_dir() and not any(models_link.iterdir()):
+                models_link.rmdir()
+            else:
+                raise RuntimeError(f"cannot link models: non-empty path exists at {models_link}")
+        models_link.symlink_to(models_dir, target_is_directory=True)
 
 
 def _upload_ticket(payload: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1040,6 +1144,8 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
         t0 = time.time()
         frames = load_video_frames(str(video_path), max_frames).to(device)
         n_frames = int(frames.shape[0])
+        source_frame_plan = _source_frame_plan(video_path, n_frames)
+        source_frame_indices = source_frame_plan[0] if source_frame_plan else None
         timings["sample"] = int((time.time() - t0) * 1000)
 
         t0 = time.time()
@@ -1066,7 +1172,7 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
             "implementation": "ReplicateAnyScene Stage 2 VGGT geometry preflight",
             "upstream_revision": RAS_REVISION,
             "frames_used": n_frames,
-            "source_frame_indices": _sampled_source_frame_indices(video_path, n_frames),
+            "source_frame_indices": source_frame_indices,
             "categories": payload["categories"],
             "raw_track_count": 0,
             "instance_count": 0,
@@ -1169,6 +1275,9 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
         t0 = time.time()
         frames = load_video_frames(str(video_path), max_frames).to(device)
         n_frames = int(frames.shape[0])
+        source_frame_plan = _source_frame_plan(video_path, n_frames)
+        source_frame_indices = source_frame_plan[0] if source_frame_plan else None
+        source_frame_timestamps = source_frame_plan[1] if source_frame_plan else None
         timings["sample"] = int((time.time() - t0) * 1000)
 
         t0 = time.time()
@@ -1221,7 +1330,12 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
         timings["sam_dedup_vis"] = int((time.time() - t0) * 1000)
 
         t0 = time.time()
-        mask_video_meta = _normalize_mask_video(mask_video, video_path)
+        mask_video_meta = _normalize_mask_video(
+            mask_video,
+            video_path,
+            source_frame_indices,
+            source_frame_timestamps,
+        )
         timings["mask_video_normalize"] = int((time.time() - t0) * 1000)
 
         instances = _masks_to_instances(deduped)
@@ -1239,7 +1353,7 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
             "upstream": "https://github.com/xiac20/ReplicateAnyScene",
             "upstream_revision": RAS_REVISION,
             "frames_used": n_frames,
-            "source_frame_indices": _sampled_source_frame_indices(video_path, n_frames),
+            "source_frame_indices": source_frame_indices,
             "categories": categories,
             "raw_track_count": raw_count,
             "instance_count": len(instances),

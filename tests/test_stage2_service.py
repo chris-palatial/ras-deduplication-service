@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
@@ -24,14 +25,52 @@ from artifact_upload import upload_artifact_file
 class Stage2ServiceTest(unittest.TestCase):
     def test_endpoint_response_reports_exact_code_revision(self):
         revision = "0123456789abcdef0123456789abcdef01234567"
-        with patch.dict(endpoint_handler.os.environ, {"STAGE2_CODE_REV": revision}), patch.object(
-            endpoint_handler,
-            "run_stage2",
-            return_value={"status": "ok", "mode": "dry_run"},
-        ):
-            result = endpoint_handler.handler({"input": {}})
+        with tempfile.TemporaryDirectory() as tmp:
+            revision_file = Path(tmp) / "revision"
+            revision_file.write_text(revision)
+            with patch.dict(endpoint_handler.os.environ, {
+                "STAGE2_BUILD_REVISION_FILE": str(revision_file),
+                "STAGE2_CODE_REV": "f" * 40,
+            }), patch.object(
+                endpoint_handler,
+                "run_stage2",
+                return_value={"status": "ok", "mode": "dry_run"},
+            ):
+                result = endpoint_handler.handler({"input": {}})
 
         self.assertEqual(result["stage2_code_revision"], revision)
+
+    def test_endpoint_never_treats_an_environment_revision_as_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            endpoint_handler.os.environ,
+            {
+                "STAGE2_BUILD_REVISION_FILE": str(Path(tmp) / "missing"),
+                "STAGE2_CODE_REV": "f" * 40,
+            },
+            clear=True,
+        ), patch.object(
+            endpoint_handler.subprocess,
+            "check_output",
+            side_effect=OSError("git unavailable"),
+        ):
+            self.assertEqual(endpoint_handler._runtime_code_revision(), "")
+
+    def test_endpoint_git_fallback_requires_a_clean_tracked_checkout(self):
+        revision = "0123456789abcdef0123456789abcdef01234567"
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            endpoint_handler.os.environ,
+            {"STAGE2_BUILD_REVISION_FILE": str(Path(tmp) / "missing")},
+            clear=True,
+        ), patch.object(
+            endpoint_handler.subprocess,
+            "check_output",
+            return_value=revision,
+        ), patch.object(
+            endpoint_handler.subprocess,
+            "run",
+            return_value=types.SimpleNamespace(returncode=1),
+        ):
+            self.assertEqual(endpoint_handler._runtime_code_revision(), "")
 
     def test_lazy_model_initialization_holds_cross_worker_lock(self):
         events = []
@@ -58,6 +97,19 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertEqual(events[-1], "lock_exit")
         self.assertEqual(events[1:-1], ["clone:ras", "clone:vggt", "packages"])
 
+    def test_concurrent_first_jobs_create_one_models_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ras = root / "ras"
+            models = root / "shared-models"
+            ras.mkdir()
+            with patch.dict(stage2.os.environ, {"STAGE2_MODELS_DIR": str(models)}):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    list(pool.map(lambda _index: stage2._link_models_dir(ras), range(2)))
+
+            self.assertTrue((ras / "models").is_symlink())
+            self.assertEqual((ras / "models").resolve(), models.resolve())
+
     def test_dirty_pinned_checkout_is_recreated_instead_of_trusted(self):
         with tempfile.TemporaryDirectory() as tmp:
             checkout = Path(tmp) / "checkout"
@@ -82,20 +134,28 @@ class Stage2ServiceTest(unittest.TestCase):
             self.assertEqual(commands[0][:2], ["git", "clone"])
 
     def test_source_indices_match_upstream_uniform_sampling(self):
-        class Capture:
-            def isOpened(self):
-                return True
-
-            def get(self, _field):
-                return 327
-
-            def release(self):
-                pass
-
-        fake_cv2 = types.SimpleNamespace(VideoCapture=lambda _path: Capture(), CAP_PROP_FRAME_COUNT=7)
-        with patch.dict(sys.modules, {"cv2": fake_cv2}):
+        frames = {
+            "frames": [
+                {"best_effort_timestamp_time": f"{index / 30:.9f}"}
+                for index in range(327)
+            ]
+        }
+        with patch.object(stage2, "_ffprobe_json", return_value=frames):
             indices = stage2._sampled_source_frame_indices(Path("clip.mp4"), 8)
         self.assertEqual(indices, [0, 46, 93, 139, 186, 232, 279, 326])
+
+    def test_source_frame_plan_uses_one_decoded_list_for_indices_and_pts(self):
+        frames = {
+            "frames": [
+                {"best_effort_timestamp_time": value}
+                for value in ("0.000", "0.100", "0.900", "1.200", "2.400")
+            ]
+        }
+        with patch.object(stage2, "_ffprobe_json", return_value=frames) as probe:
+            plan = stage2._source_frame_plan(Path("variable-frame-rate.mp4"), 4)
+
+        self.assertEqual(plan, ([0, 1, 2, 4], [0.0, 0.1, 0.9, 2.4]))
+        probe.assert_called_once()
 
     def test_rejects_unknown_mode_before_model_bootstrap(self):
         result = stage2.run_stage2(
@@ -503,7 +563,75 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertGreaterEqual(payload.find(b"mdat"), 0)
         self.assertLess(payload.find(b"moov"), payload.find(b"mdat"))
         self.assertTrue(metadata["duration_aligned"])
+        self.assertEqual(metadata["timeline_mode"], "source_frame_pts")
         self.assertAlmostEqual(float(media["format"]["duration"]), 2.4, delta=0.15)
+
+    def test_sampled_mask_timeline_preserves_nonuniform_source_pts(self):
+        probed = {
+            "frames": [
+                {"best_effort_timestamp_time": value}
+                for value in ("0.000", "0.100", "0.900", "1.200", "2.400")
+            ]
+        }
+        with patch.object(stage2, "_ffprobe_json", return_value=probed):
+            timestamps = stage2._sampled_source_frame_timestamps(
+                Path("variable-frame-rate.mp4"),
+                [0, 1, 3, 4],
+            )
+
+        self.assertEqual(timestamps, [0.0, 0.1, 1.2, 2.4])
+        self.assertNotEqual(
+            [right - left for left, right in zip(timestamps, timestamps[1:])],
+            [0.8, 0.8, 0.8],
+        )
+
+    def test_vfr_mask_encoding_preserves_sparse_pts_and_container_duration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.mp4"
+            mask = root / "instance_masks.mp4"
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                    "color=c=blue:s=96x64:r=25:d=2.56",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+                ],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                    "color=c=red:s=96x64:r=25:d=0.16",
+                    "-frames:v", "4", "-c:v", "mpeg4", str(mask),
+                ],
+                check=True,
+            )
+
+            metadata = stage2._normalize_mask_video(
+                mask,
+                source,
+                [0, 1, 2, 3],
+                [0.0, 0.12, 1.2, 2.52],
+            )
+            probe = subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-select_streams", "v:0",
+                    "-show_frames", "-show_entries",
+                    "frame=best_effort_timestamp_time", "-show_entries", "format=duration",
+                    "-of", "json", str(mask),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            media = json.loads(probe.stdout)
+
+        frame_pts = [float(frame["best_effort_timestamp_time"]) for frame in media["frames"]]
+        self.assertEqual(len(frame_pts), 4)
+        for actual, expected in zip(frame_pts, [0.0, 0.12, 1.2, 2.52]):
+            self.assertAlmostEqual(actual, expected, delta=0.001)
+        self.assertAlmostEqual(float(media["format"]["duration"]), 2.56, delta=0.01)
+        self.assertTrue(metadata["duration_aligned"])
 
     def test_video_duration_falls_back_through_stream_packets_and_frames(self):
         responses = [
