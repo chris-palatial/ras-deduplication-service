@@ -13,6 +13,7 @@ import numpy as np
 
 
 import stage2_service as stage2
+import artifact_upload as artifact_uploader
 
 from point_cloud_glb import GLB_HARD_MAX_POINTS, GLB_MAX_BYTES, build_point_cloud_glb
 from artifact_upload import upload_artifact_file
@@ -282,6 +283,75 @@ class Stage2ServiceTest(unittest.TestCase):
         )
         self.assertEqual(receipt["key"], "runs/stage2-a/hash-point_cloud.glb")
 
+    def test_artifact_uploader_retries_unavailable_verification_without_replaying_put(self):
+        grant = {
+            "v": "2",
+            "key": "runs/stage2-a/hash-point_cloud.glb",
+            "url": "https://signed.example/attempt-1",
+            "headers": {"content-length": "3"},
+        }
+        upload = {
+            "base": "https://edge.example",
+            "runId": "stage2-a",
+            "token": "secret-ticket",
+            "exp": 9_999_999_999_999,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "point_cloud.glb"
+            path.write_bytes(b"glb")
+            with patch("artifact_upload._post_json", return_value=grant) as post_json, patch(
+                "artifact_upload._stored_already", side_effect=[None, True]
+            ) as verify, patch(
+                "artifact_upload.urllib.request.urlopen", side_effect=OSError("response lost")
+            ) as put, patch("artifact_upload.time.sleep"):
+                receipt = upload_artifact_file(upload, path, "model/gltf-binary")
+
+        self.assertEqual(receipt["key"], grant["key"])
+        self.assertEqual(post_json.call_count, 1)
+        self.assertEqual(put.call_count, 1)
+        self.assertEqual(verify.call_count, 2)
+
+    def test_artifact_uploader_never_replays_put_when_verification_stays_unavailable(self):
+        grant = {
+            "v": "2",
+            "key": "runs/stage2-a/hash-point_cloud.glb",
+            "url": "https://signed.example/attempt-1",
+            "headers": {"content-length": "3"},
+        }
+        upload = {
+            "base": "https://edge.example",
+            "runId": "stage2-a",
+            "token": "secret-ticket",
+            "exp": 9_999_999_999_999,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "point_cloud.glb"
+            path.write_bytes(b"glb")
+            with patch("artifact_upload._post_json", return_value=grant) as post_json, patch(
+                "artifact_upload._stored_already", return_value=None
+            ) as verify, patch(
+                "artifact_upload.urllib.request.urlopen", side_effect=OSError("response lost")
+            ) as put, patch("artifact_upload.time.sleep"):
+                with self.assertRaisesRegex(RuntimeError, "refusing to replay"):
+                    upload_artifact_file(upload, path, "model/gltf-binary")
+
+        self.assertEqual(post_json.call_count, 1)
+        self.assertEqual(put.call_count, 1)
+        self.assertEqual(verify.call_count, 5)
+
+    def test_ambiguous_put_verification_stops_at_ticket_expiry(self):
+        payload = {"exp": 100_000}
+        with patch("artifact_upload.time.time", return_value=100.0), patch(
+            "artifact_upload._stored_already"
+        ) as verify, patch("artifact_upload.time.sleep") as sleep:
+            verdict = artifact_uploader._resolve_ambiguous_put(
+                {"base": "https://edge.example"}, payload, {}, 300
+            )
+
+        self.assertIsNone(verdict)
+        verify.assert_not_called()
+        sleep.assert_not_called()
+
     def test_debug_artifacts_are_opt_in_and_default_glb_cap_is_300k(self):
         class PointCloud:
             def export(self, path):
@@ -373,6 +443,77 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertLess(payload.find(b"moov"), payload.find(b"mdat"))
         self.assertTrue(metadata["duration_aligned"])
         self.assertAlmostEqual(float(media["format"]["duration"]), 2.4, delta=0.15)
+
+    def test_video_duration_falls_back_through_stream_packets_and_frames(self):
+        responses = [
+            types.SimpleNamespace(returncode=0, stdout=json.dumps({"format": {"duration": "N/A"}})),
+            types.SimpleNamespace(returncode=0, stdout=json.dumps({"streams": [{"duration": "N/A"}]})),
+            types.SimpleNamespace(returncode=0, stdout=json.dumps({"packets": []})),
+            types.SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "frames": [
+                            {"best_effort_timestamp_time": "0.1", "pkt_duration_time": "0.1"},
+                            {"best_effort_timestamp_time": "2.4", "pkt_duration_time": "0.1"},
+                        ]
+                    }
+                ),
+            ),
+        ]
+        with patch("subprocess.run", side_effect=responses) as probe:
+            duration = stage2._probe_video_duration(Path("source.mp4"))
+
+        self.assertAlmostEqual(duration, 2.4)
+        self.assertEqual(probe.call_count, 4)
+        self.assertIn("format=duration", probe.call_args_list[0].args[0])
+        self.assertIn("stream=duration", probe.call_args_list[1].args[0])
+        self.assertIn("-show_packets", probe.call_args_list[2].args[0])
+        self.assertIn("-show_frames", probe.call_args_list[3].args[0])
+
+    def test_video_duration_uses_stream_or_packet_timeline_before_decoding_frames(self):
+        stream_responses = [
+            types.SimpleNamespace(returncode=0, stdout=json.dumps({"format": {}})),
+            types.SimpleNamespace(returncode=0, stdout=json.dumps({"streams": [{"duration": "3.25"}]})),
+        ]
+        with patch("subprocess.run", side_effect=stream_responses) as stream_probe:
+            self.assertEqual(stage2._probe_video_duration(Path("stream.mp4")), 3.25)
+        self.assertEqual(stream_probe.call_count, 2)
+
+        packet_responses = [
+            types.SimpleNamespace(returncode=0, stdout=json.dumps({"format": {}})),
+            types.SimpleNamespace(returncode=0, stdout=json.dumps({"streams": [{}]})),
+            types.SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "packets": [
+                            {"dts_time": "-0.1", "duration_time": "0.1"},
+                            {"pts_time": "2.2", "duration_time": "0.1"},
+                        ]
+                    }
+                ),
+            ),
+        ]
+        with patch("subprocess.run", side_effect=packet_responses) as packet_probe:
+            self.assertAlmostEqual(stage2._probe_video_duration(Path("packets.mp4")), 2.4)
+        self.assertEqual(packet_probe.call_count, 3)
+        self.assertIn("-show_packets", packet_probe.call_args_list[-1].args[0])
+
+    def test_mask_normalization_fails_when_source_timeline_cannot_be_proved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.mp4"
+            mask = root / "instance_masks.mp4"
+            source.write_bytes(b"source")
+            mask.write_bytes(b"mask")
+            with patch.object(stage2, "_probe_video_duration", return_value=None), patch(
+                "subprocess.run"
+            ) as transcode:
+                with self.assertRaisesRegex(RuntimeError, "refusing to publish an unsynchronized"):
+                    stage2._normalize_mask_video(mask, source)
+
+        transcode.assert_not_called()
 
     def test_main_deploy_chain_is_serialized_to_prevent_revision_rollback(self):
         workflow = (

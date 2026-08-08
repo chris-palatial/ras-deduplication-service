@@ -18,6 +18,8 @@ from typing import Any, Callable
 
 
 ATTEMPTS = 3
+LOST_PUT_VERIFY_ATTEMPTS = 5
+LOST_PUT_VERIFY_WINDOW_SECONDS = 15
 
 
 def _safe_error(exc: Exception | None) -> str:
@@ -35,7 +37,7 @@ def digests(data: bytes) -> tuple[str, str]:
     return hashlib.sha256(data).hexdigest(), hashlib.md5(data, usedforsecurity=False).hexdigest()
 
 
-def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeout: int) -> dict[str, Any]:
+def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeout: float) -> dict[str, Any]:
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
@@ -102,9 +104,9 @@ def _stored_already(
     upload: dict[str, Any],
     payload: dict[str, Any],
     headers: dict[str, str],
-    timeout: int,
-) -> bool:
-    """Recover a PUT whose bytes landed but whose response was lost."""
+    timeout: float,
+) -> bool | None:
+    """Return stored/absent, or None when verification itself is unavailable."""
     try:
         verdict = _post_json(
             str(upload["base"]).rstrip("/") + "/api/jobs/upload-verify",
@@ -112,9 +114,36 @@ def _stored_already(
             headers,
             timeout,
         )
-        return bool(verdict.get("stored"))
+        stored = verdict.get("stored")
+        return stored if isinstance(stored, bool) else None
     except Exception:
-        return False
+        return None
+
+
+def _resolve_ambiguous_put(
+    upload: dict[str, Any],
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout: int,
+) -> bool | None:
+    """Retry an unavailable verifier without replaying a possibly successful PUT."""
+    now = time.time()
+    ticket_deadline = int(payload["exp"]) / 1000
+    deadline = min(ticket_deadline, now + LOST_PUT_VERIFY_WINDOW_SECONDS)
+    for index in range(LOST_PUT_VERIFY_ATTEMPTS):
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        verify_timeout = max(0.1, min(float(timeout), remaining))
+        verdict = _stored_already(upload, payload, headers, verify_timeout)
+        if verdict is not None:
+            return verdict
+        if index + 1 < LOST_PUT_VERIFY_ATTEMPTS:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(2**index, 5, remaining))
+    return None
 
 
 def upload_artifact_file(
@@ -149,6 +178,8 @@ def upload_artifact_file(
     expected_key: str | None = None
 
     def fresh_grant() -> tuple[str, str, dict[str, str]]:
+        if int(payload["exp"]) <= time.time() * 1000:
+            raise RuntimeError("artifact upload ticket expired during upload")
         grant = _retrying(
             "upload grant",
             lambda: _post_json(base + "/api/jobs/upload-grant", payload, extra_headers, timeout),
@@ -191,8 +222,13 @@ def upload_artifact_file(
             return receipt
         except Exception as exc:
             last = exc
-            if _stored_already(upload, payload, extra_headers, timeout):
+            stored = _resolve_ambiguous_put(upload, payload, extra_headers, timeout)
+            if stored is True:
                 return receipt
+            if stored is None:
+                raise RuntimeError(
+                    "artifact PUT outcome remained unverifiable; refusing to replay a possibly successful upload"
+                ) from exc
             if index + 1 < ATTEMPTS:
                 time.sleep(min(2**index, 5))
     raise RuntimeError(f"artifact PUT failed after {ATTEMPTS} attempts: {_safe_error(last)}")

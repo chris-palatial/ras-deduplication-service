@@ -13,6 +13,7 @@ import os
 import base64
 import binascii
 import json
+import math
 import shutil
 import sys
 import tempfile
@@ -436,8 +437,64 @@ def _masks_to_instances(all_masks: dict[str, list]) -> list[dict[str, Any]]:
     return instances
 
 
-def _probe_video_duration(path: Path) -> float | None:
-    """Return container duration through ffprobe, or None when unavailable."""
+def _positive_duration(value: Any) -> float | None:
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return None
+    return duration if math.isfinite(duration) and duration > 0 else None
+
+
+def _finite_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _timestamp_span(entries: list[dict[str, Any]], timestamp_fields: tuple[str, ...]) -> float | None:
+    """Return the decoded timeline span represented by packets or frames."""
+    samples: list[tuple[float, float | None]] = []
+    for entry in entries:
+        timestamp = next(
+            (
+                parsed
+                for field in timestamp_fields
+                if (parsed := _finite_number(entry.get(field))) is not None
+            ),
+            None,
+        )
+        if timestamp is None:
+            continue
+        packet_duration = next(
+            (
+                parsed
+                for field in ("duration_time", "pkt_duration_time")
+                if (parsed := _positive_duration(entry.get(field))) is not None
+            ),
+            None,
+        )
+        samples.append((timestamp, packet_duration))
+    if not samples:
+        return None
+
+    ordered_starts = sorted({timestamp for timestamp, _duration in samples})
+    deltas = [
+        right - left
+        for left, right in zip(ordered_starts, ordered_starts[1:])
+        if right > left
+    ]
+    inferred_duration = sorted(deltas)[len(deltas) // 2] if deltas else None
+    ends = [
+        timestamp + (duration or inferred_duration or 0.0)
+        for timestamp, duration in samples
+    ]
+    span = max(ends) - min(timestamp for timestamp, _duration in samples)
+    return _positive_duration(span)
+
+
+def _ffprobe_json(path: Path, *args: str) -> dict[str, Any] | None:
     import subprocess
 
     try:
@@ -446,10 +503,9 @@ def _probe_video_duration(path: Path) -> float | None:
                 "ffprobe",
                 "-v",
                 "error",
-                "-show_entries",
-                "format=duration",
+                *args,
                 "-of",
-                "default=noprint_wrappers=1:nokey=1",
+                "json",
                 str(path),
             ],
             check=False,
@@ -457,10 +513,55 @@ def _probe_video_duration(path: Path) -> float | None:
             text=True,
             timeout=30,
         )
-        duration = float(completed.stdout.strip()) if completed.returncode == 0 else 0.0
-        return duration if 0 < duration < float("inf") else None
-    except (OSError, ValueError, subprocess.SubprocessError):
+        value = json.loads(completed.stdout) if completed.returncode == 0 else None
+        return value if isinstance(value, dict) else None
+    except (OSError, json.JSONDecodeError, subprocess.SubprocessError):
         return None
+
+
+def _probe_video_duration(path: Path) -> float | None:
+    """Determine the video timeline through progressively deeper ffprobe data."""
+    container = _ffprobe_json(path, "-show_entries", "format=duration") or {}
+    duration = _positive_duration((container.get("format") or {}).get("duration"))
+    if duration is not None:
+        return duration
+
+    streams = _ffprobe_json(
+        path,
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=duration",
+    ) or {}
+    for stream in streams.get("streams") or []:
+        duration = _positive_duration(stream.get("duration"))
+        if duration is not None:
+            return duration
+
+    packets = _ffprobe_json(
+        path,
+        "-select_streams",
+        "v:0",
+        "-show_packets",
+        "-show_entries",
+        "packet=pts_time,dts_time,duration_time",
+    ) or {}
+    duration = _timestamp_span(packets.get("packets") or [], ("pts_time", "dts_time"))
+    if duration is not None:
+        return duration
+
+    frames = _ffprobe_json(
+        path,
+        "-select_streams",
+        "v:0",
+        "-show_frames",
+        "-show_entries",
+        "frame=best_effort_timestamp_time,pts_time,pkt_dts_time,pkt_duration_time,duration_time",
+    ) or {}
+    return _timestamp_span(
+        frames.get("frames") or [],
+        ("best_effort_timestamp_time", "pts_time", "pkt_dts_time"),
+    )
 
 
 def _probe_video_frame_count(path: Path) -> int | None:
@@ -503,12 +604,16 @@ def _normalize_mask_video(mask_video: Path, source_video: Path) -> dict[str, Any
 
     if not mask_video.is_file() or mask_video.stat().st_size <= 0:
         raise RuntimeError("SAM3 mask visualization did not produce a video")
-    generated_duration = _probe_video_duration(mask_video)
     source_duration = _probe_video_duration(source_video)
+    if source_duration is None:
+        raise RuntimeError(
+            "source video timeline could not be established; refusing to publish an unsynchronized mask video"
+        )
+    generated_duration = _probe_video_duration(mask_video)
     if generated_duration is None:
         raise RuntimeError("SAM3 mask visualization has no readable duration")
 
-    target_duration = source_duration or generated_duration
+    target_duration = source_duration
     stretch = target_duration / generated_duration
     generated_frames = _probe_video_frame_count(mask_video) or max(
         1, round(generated_duration * 25)
@@ -572,11 +677,10 @@ def _normalize_mask_video(mask_video: Path, source_video: Path) -> dict[str, Any
     output_duration = _probe_video_duration(mask_video)
     tolerance = max(0.15, min(1.0, target_duration * 0.005))
     aligned = bool(
-        source_duration is not None
-        and output_duration is not None
+        output_duration is not None
         and abs(output_duration - source_duration) <= tolerance
     )
-    if source_duration is not None and not aligned:
+    if not aligned:
         raise RuntimeError("normalized SAM3 mask video duration does not match the source clip")
     return {
         "codec": "h264",
