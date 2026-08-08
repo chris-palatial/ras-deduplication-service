@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,12 +15,72 @@ import numpy as np
 
 import stage2_service as stage2
 import artifact_upload as artifact_uploader
+import handler as endpoint_handler
 
 from point_cloud_glb import GLB_HARD_MAX_POINTS, GLB_MAX_BYTES, build_point_cloud_glb
 from artifact_upload import upload_artifact_file
 
 
 class Stage2ServiceTest(unittest.TestCase):
+    def test_endpoint_response_reports_exact_code_revision(self):
+        revision = "0123456789abcdef0123456789abcdef01234567"
+        with patch.dict(endpoint_handler.os.environ, {"STAGE2_CODE_REV": revision}), patch.object(
+            endpoint_handler,
+            "run_stage2",
+            return_value={"status": "ok", "mode": "dry_run"},
+        ):
+            result = endpoint_handler.handler({"input": {}})
+
+        self.assertEqual(result["stage2_code_revision"], revision)
+
+    def test_lazy_model_initialization_holds_cross_worker_lock(self):
+        events = []
+
+        @contextmanager
+        def locked(_models_dir):
+            events.append("lock_enter")
+            yield
+            events.append("lock_exit")
+
+        def cloned(_url, dest, _revision):
+            events.append(f"clone:{Path(dest).name}")
+
+        with patch.object(stage2, "_ras_root", return_value=Path("/tmp/ras")), patch.object(
+            stage2, "_models_dir", return_value=Path("/tmp/models")
+        ), patch.object(stage2, "_stage2_initialization_lock", side_effect=locked), patch.object(
+            stage2, "_clone_if_missing", side_effect=cloned
+        ), patch.object(
+            stage2, "_ensure_python_packages", side_effect=lambda *_args, **_kwargs: events.append("packages")
+        ), patch.object(stage2, "_vggt_weights_ok", return_value=True):
+            stage2._ensure_ras_installed(require_sam3=False)
+
+        self.assertEqual(events[0], "lock_enter")
+        self.assertEqual(events[-1], "lock_exit")
+        self.assertEqual(events[1:-1], ["clone:ras", "clone:vggt", "packages"])
+
+    def test_dirty_pinned_checkout_is_recreated_instead_of_trusted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = Path(tmp) / "checkout"
+            checkout.mkdir()
+            subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+            subprocess.run(["git", "-C", str(checkout), "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "-C", str(checkout), "config", "user.name", "Test"], check=True)
+            tracked = checkout / "tracked.txt"
+            tracked.write_text("clean\n")
+            subprocess.run(["git", "-C", str(checkout), "add", "tracked.txt"], check=True)
+            subprocess.run(["git", "-C", str(checkout), "commit", "-q", "-m", "fixture"], check=True)
+            revision = subprocess.check_output(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True
+            ).strip()
+            tracked.write_text("dirty\n")
+
+            commands = []
+            with patch.object(stage2, "_run", side_effect=lambda command, **_kwargs: commands.append(command)):
+                stage2._clone_if_missing("https://example.test/repo.git", checkout, revision)
+
+            self.assertFalse(checkout.exists())
+            self.assertEqual(commands[0][:2], ["git", "clone"])
+
     def test_source_indices_match_upstream_uniform_sampling(self):
         class Capture:
             def isOpened(self):

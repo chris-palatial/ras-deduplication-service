@@ -5,9 +5,12 @@ on:
     branches: [main]
   pull_request:
 
-# Serialize each branch's complete test→deploy chain. Without workflow-level
-# ordering, an older slow test can deploy after a newer revision and roll the
-# endpoint backward even if the deploy job itself is mutually exclusive.
+permissions:
+  contents: read
+
+# Avoid simultaneous template mutations. The deploy script separately checks
+# GitHub's authoritative main head immediately before writing to RunPod because
+# concurrency groups do not guarantee workflow dispatch ordering.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -45,6 +48,8 @@ jobs:
         with:
           python-version: "3.12"
       - name: Atomically pin the live RunPod template to this commit
+        timeout-minutes: 20
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
         run: python scripts/deploy_revision.py --revision "$GITHUB_SHA"

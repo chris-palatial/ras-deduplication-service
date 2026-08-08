@@ -62,17 +62,33 @@ Do not reinstall the world on every cold start.
 
 The thin stock-image bootstrap is fail-closed: `STAGE2_CODE_REV` must be an
 explicit 40-character commit SHA and every package/clone/install step must
-succeed. It never falls back to a moving branch. When rolling out a revision,
-update both the template environment and its bootstrap command to the same SHA
-before recycling workers, then verify `dry_run` and `geometry` through the
-endpoint boundary.
+succeed. It never falls back to a moving branch. Each commit uses a separate,
+marked runtime checkout and virtual environment, and its pinned VGGT/SAM3 source
+paths take precedence over base-image packages. A bounded number of recent
+runtimes is retained so rolling workers do not share mutable Python code. Every
+worker holds a shared runtime lease until it exits; cleanup requires an exclusive
+lease and a minimum age greater than `STAGE2_MAX_EXECUTION_SECONDS` (2100 seconds
+by default), so active or recently used runtimes are never removed. Legacy
+runtimes without lease metadata are left for manual inspection.
+
+Lazy RAS/VGGT/SAM3 source installation and shared checkpoint downloads use one
+cross-worker file lock under `STAGE2_MODELS_DIR`. Both the wrapper checkout and
+the upstream source checkouts verify their commit and tracked-file cleanliness
+before reuse; a dirty runtime-owned checkout is rebuilt.
 
 `scripts/deploy_revision.py` performs that two-field pin in one RunPod template
 update. CI runs it after a green push to `main`; the repository
 `RUNPOD_API_KEY` secret must be configured. The script verifies the returned
 template without printing any environment values or credentials. The complete
-test→deploy workflow is serialized per Git ref, so an older slow run cannot
-finish after a newer run and roll the endpoint revision backward.
+test→deploy workflow is serialized per Git ref, and immediately before the
+RunPod mutation the deploy script checks the authoritative GitHub `main` head.
+An out-of-order stale workflow exits without changing the endpoint.
+After a successful template update, deployment submits a bounded real `dry_run`
+to endpoint `sp2oyuum48vk0j` (override with `STAGE2_ENDPOINT_ID`), polls its async
+status, and requires the response's `stage2_code_revision` to equal the deployed
+commit. Stale warm workers are retried within the bounded smoke budget, and CI
+fails without printing request credentials or endpoint output when verification
+does not pass.
 
 ```json
 {

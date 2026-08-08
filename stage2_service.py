@@ -12,12 +12,15 @@ from __future__ import annotations
 import os
 import base64
 import binascii
+import fcntl
 import json
 import math
 import shutil
 import sys
 import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -44,6 +47,7 @@ REQUIRED_ARTIFACTS = {
     "geometry": ("point_cloud.glb",),
     "full": ("point_cloud.glb", "instance_masks.mp4"),
 }
+_PROCESS_INITIALIZATION_LOCK = threading.Lock()
 
 
 def _sampled_source_frame_indices(video_path: Path, sampled_count: int) -> list[int] | None:
@@ -89,18 +93,49 @@ def _clone_if_missing(url: str, dest: Path, revision: str) -> None:
     if dest.is_dir() and (dest / ".git").exists():
         import subprocess
 
-        head = subprocess.check_output(["git", "-C", str(dest), "rev-parse", "HEAD"], text=True).strip()
-        if head == revision:
+        try:
+            head = subprocess.check_output(
+                ["git", "-C", str(dest), "rev-parse", "HEAD"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            clean = subprocess.call(
+                ["git", "-C", str(dest), "diff-index", "--quiet", "HEAD", "--"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ) == 0
+        except (OSError, subprocess.SubprocessError):
+            head = ""
+            clean = False
+        if head == revision and clean:
             return
-        _run(["git", "-C", str(dest), "fetch", "--depth", "1", "origin", revision])
-        _run(["git", "-C", str(dest), "checkout", "--detach", "FETCH_HEAD"])
-        return
+        if clean:
+            _run(["git", "-C", str(dest), "fetch", "--depth", "1", "origin", revision])
+            _run(["git", "-C", str(dest), "checkout", "--detach", "FETCH_HEAD"])
+            return
+        # The revision alone is insufficient when tracked files changed in
+        # place. This checkout is runtime-owned, so recreate it fail-closed.
+        shutil.rmtree(dest, ignore_errors=True)
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         shutil.rmtree(dest, ignore_errors=True)
     _run(["git", "clone", "--filter=blob:none", "--no-checkout", url, str(dest)])
     _run(["git", "-C", str(dest), "fetch", "--depth", "1", "origin", revision])
     _run(["git", "-C", str(dest), "checkout", "--detach", "FETCH_HEAD"])
+
+
+@contextmanager
+def _stage2_initialization_lock(models_dir: Path):
+    """Serialize source/package/weight initialization across worker processes."""
+    models_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = models_dir / ".stage2_initialization.lock"
+    with _PROCESS_INITIALIZATION_LOCK:
+        with lock_path.open("a+b") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _find_sam3_pt(sam_dir: Path) -> Path | None:
@@ -314,26 +349,27 @@ def _ensure_ras_installed(*, require_sam3: bool = True) -> None:
     ras = _ras_root()
     models_dir = _models_dir(ras)
 
-    _clone_if_missing("https://github.com/xiac20/ReplicateAnyScene.git", ras, RAS_REVISION)
-    # Keep the exact upstream gitlinks used by the reviewed RAS revision.
-    _clone_if_missing("https://github.com/facebookresearch/vggt.git", ras / "vggt", VGGT_REVISION)
-    if require_sam3:
-        _clone_if_missing("https://github.com/facebookresearch/sam3.git", ras / "sam3", SAM3_REVISION)
+    with _stage2_initialization_lock(models_dir):
+        _clone_if_missing("https://github.com/xiac20/ReplicateAnyScene.git", ras, RAS_REVISION)
+        # Keep the exact upstream gitlinks used by the reviewed RAS revision.
+        _clone_if_missing("https://github.com/facebookresearch/vggt.git", ras / "vggt", VGGT_REVISION)
+        if require_sam3:
+            _clone_if_missing("https://github.com/facebookresearch/sam3.git", ras / "sam3", SAM3_REVISION)
 
-    # Install dependencies before importing huggingface_hub to download weights.
-    _ensure_python_packages(ras, require_sam3=require_sam3)
+        # Install dependencies before importing huggingface_hub to download weights.
+        _ensure_python_packages(ras, require_sam3=require_sam3)
 
-    if not _vggt_weights_ok(models_dir / "VGGT", _vggt_model_id()):
-        _download_vggt_weights(models_dir)
+        if not _vggt_weights_ok(models_dir / "VGGT", _vggt_model_id()):
+            _download_vggt_weights(models_dir)
 
-    # Older builds wrote .stage2_ready even when SAM3 download failed — ignore markers alone.
-    if require_sam3 and not _weights_ready(models_dir):
-        for marker in (models_dir / "VGGT" / ".stage2_ready", models_dir / "SAM3" / ".stage2_ready"):
-            if marker.exists():
-                marker.unlink()
-        _download_sam3_weights(models_dir)
-    elif require_sam3:
-        _ensure_sam3_pt_layout(models_dir)
+        # Older builds wrote .stage2_ready even when SAM3 download failed — ignore markers alone.
+        if require_sam3 and not _weights_ready(models_dir):
+            for marker in (models_dir / "VGGT" / ".stage2_ready", models_dir / "SAM3" / ".stage2_ready"):
+                if marker.exists():
+                    marker.unlink()
+            _download_sam3_weights(models_dir)
+        elif require_sam3:
+            _ensure_sam3_pt_layout(models_dir)
 
 
 def _ensure_ras_on_path() -> Path:

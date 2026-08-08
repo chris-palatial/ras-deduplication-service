@@ -11,19 +11,27 @@ import os
 from stage2_service import run_stage2
 
 
+def _with_code_revision(result: dict) -> dict:
+    """Attach non-secret deployment provenance to every endpoint response."""
+    return {
+        **result,
+        "stage2_code_revision": os.environ.get("STAGE2_CODE_REV", ""),
+    }
+
+
 def handler(job: dict):
     try:
         job_input = job.get("input", job) if isinstance(job, dict) else {}
         if isinstance(job_input, dict) and "input" in job_input and "video_url" not in job_input:
             job_input = job_input["input"]
         if not isinstance(job_input, dict):
-            return {"status": "error", "error": "input must be an object"}
-        return run_stage2(job_input)
+            return _with_code_revision({"status": "error", "error": "input must be an object"})
+        return _with_code_revision(run_stage2(job_input))
     except Exception as e:
-        return {
+        return _with_code_revision({
             "status": "error",
             "error": str(e),
-        }
+        })
 
 
 if __name__ == "__main__":
