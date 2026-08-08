@@ -22,7 +22,7 @@ _GLB_VERSION = 2
 _JSON_CHUNK = 0x4E4F534A
 _BIN_CHUNK = 0x004E4942
 # Agent Lab's signed upload policy allows a 16 MiB GLB. Each point occupies
-# 15 bytes (float32 XYZ + normalized uint8 RGB); 900k leaves over 3 MiB for
+# 16 bytes (float32 XYZ + normalized uint8 RGBA); 900k leaves over 2 MiB for
 # camera lines, buffer alignment, and JSON container metadata.
 GLB_MAX_BYTES = 16 * 1024 * 1024
 GLB_HARD_MAX_POINTS = 900_000
@@ -33,6 +33,14 @@ _OUTLIER_MAX_REMOVAL_FRACTION = 0.05
 
 def _pad4(data: bytes, fill: bytes) -> bytes:
     return data + fill * ((-len(data)) % 4)
+
+
+def _rgb_to_rgba(rgb: np.ndarray) -> np.ndarray:
+    """Return tightly packed, four-byte-aligned vertex colors for glTF."""
+    rgba = np.empty((len(rgb), 4), dtype=np.uint8)
+    rgba[:, :3] = rgb
+    rgba[:, 3] = 255
+    return rgba
 
 
 def _bounded_true_indices(mask: np.ndarray, limit: int) -> tuple[np.ndarray, int]:
@@ -299,10 +307,10 @@ def build_point_cloud_glb(
         bounds=np.stack([points.min(axis=0), points.max(axis=0)]),
     )
     point_color = add_accessor(
-        rgb.tobytes(),
+        _rgb_to_rgba(rgb).tobytes(),
         component_type=5121,
         count=len(rgb),
-        kind="VEC3",
+        kind="VEC4",
         normalized=True,
     )
     meshes: list[dict[str, Any]] = [
@@ -322,10 +330,10 @@ def build_point_cloud_glb(
             bounds=np.stack([camera_points.min(axis=0), camera_points.max(axis=0)]),
         )
         camera_color = add_accessor(
-            camera_colors.tobytes(),
+            _rgb_to_rgba(camera_colors).tobytes(),
             component_type=5121,
             count=len(camera_colors),
-            kind="VEC3",
+            kind="VEC4",
             normalized=True,
         )
         meshes.append(
