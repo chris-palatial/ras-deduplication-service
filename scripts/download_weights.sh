@@ -26,7 +26,7 @@ if vggt_model_id != "facebook/VGGT-1B" and not token:
 snapshot_download(
     vggt_model_id,
     local_dir=str(root / "VGGT"),
-    token=None if vggt_model_id == "facebook/VGGT-1B" else token,
+    token=False if vggt_model_id == "facebook/VGGT-1B" else token,
 )
 (root / "VGGT" / ".stage2_model_id").write_text(vggt_model_id + "\n")
 if not download_sam3:
