@@ -37,7 +37,10 @@ bash scripts/download_weights.sh
 The internal demo currently defaults to `facebook/VGGT-1B`, whose license is
 research/non-commercial. Every result reports the exact `geometry.model_id`
 and `geometry.license_scope`; do not represent this default as a commercially
-licensed output.
+licensed output. Cache misses for this public checkpoint download anonymously,
+so pending SAM3 approval or a missing/revoked Hugging Face token cannot block
+geometry mode. SAM3 and the Commercial VGGT checkpoint still require an
+explicit approved `HF_TOKEN`.
 
 **Before any production/commercial release**, obtain checkpoint access and set
 `VGGT_MODEL_ID=facebook/VGGT-1B-Commercial` on the endpoint, then run the real
