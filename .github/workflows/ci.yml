@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Avoid simultaneous template mutations. The deploy script separately checks
+# GitHub's authoritative main head immediately before writing to RunPod because
+# concurrency groups do not guarantee workflow dispatch ordering.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install lightweight test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python -m pip install "numpy>=1.26,<2" "opencv-python-headless>=4.10,<5"
+      - name: Compile and test
+        run: |
+          python -m py_compile handler.py stage2_service.py artifact_upload.py point_cloud_glb.py
+          python -m unittest discover -s tests -p 'test_*.py'
+      - name: Validate bootstrap shell
+        run: bash -n scripts/start_serverless.sh scripts/download_weights.sh
+      - name: Validate atomic RunPod deployment payload
+        run: python scripts/deploy_revision.py --revision 0123456789abcdef0123456789abcdef01234567 --dry-run
+
+  deploy-runpod:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Atomically pin the live RunPod template to this commit
+        timeout-minutes: 60
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+        run: >-
+          python scripts/deploy_revision.py
+          --revision "$GITHUB_SHA"
+          --rollout-timeout-seconds 2700
+          --smoke-timeout-seconds 900

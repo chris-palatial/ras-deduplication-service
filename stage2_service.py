@@ -12,10 +12,15 @@ from __future__ import annotations
 import os
 import base64
 import binascii
+import fcntl
+import json
+import math
 import shutil
 import sys
 import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -29,6 +34,70 @@ RAS_REVISION = os.environ.get("RAS_REVISION", "671191457e7244d9337ef3faf558ee92b
 VGGT_REVISION = os.environ.get("VGGT_REVISION", "44b3afbd1869d8bde4894dd8ea1e293112dd5eba")
 SAM3_REVISION = os.environ.get("SAM3_REVISION", "bfbed072a07a6a52c8d5fdc75a7a186251a835b1")
 MAX_INLINE_VIDEO_BYTES = 6 * 1024 * 1024
+DEFAULT_VGGT_MODEL_ID = "facebook/VGGT-1B"
+COMMERCIAL_VGGT_MODEL_ID = "facebook/VGGT-1B-Commercial"
+VGGT_MODEL_MARKER = ".stage2_model_id"
+ARTIFACT_MEDIA_TYPES = {
+    "point_cloud.glb": "model/gltf-binary",
+    "point_cloud.ply": "application/octet-stream",
+    "instance_masks.mp4": "video/mp4",
+    "camera_intrinsics.json": "application/json",
+}
+REQUIRED_ARTIFACTS = {
+    "geometry": ("point_cloud.glb",),
+    "full": ("point_cloud.glb", "instance_masks.mp4"),
+}
+_PROCESS_INITIALIZATION_LOCK = threading.Lock()
+
+
+def _source_frame_plan(
+    video_path: Path,
+    sampled_count: int,
+) -> tuple[list[int], list[float] | None] | None:
+    """Build indices and presentation times from one decoded-frame listing."""
+    import numpy as np
+
+    frames = _ffprobe_json(
+        video_path,
+        "-select_streams",
+        "v:0",
+        "-show_frames",
+        "-show_entries",
+        "frame=best_effort_timestamp_time,pts_time,pkt_dts_time",
+    ) or {}
+    entries = frames.get("frames") or []
+    if not isinstance(entries, list) or not entries or sampled_count <= 0:
+        return None
+    count = min(sampled_count, len(entries))
+    indices = np.linspace(0, len(entries) - 1, count).astype(int).tolist()
+
+    sampled_timestamps: list[float] = []
+    for index in indices:
+        entry = entries[index]
+        if not isinstance(entry, dict):
+            return indices, None
+        timestamp = next(
+            (
+                parsed
+                for field in ("best_effort_timestamp_time", "pts_time", "pkt_dts_time")
+                if (parsed := _finite_number(entry.get(field))) is not None
+            ),
+            None,
+        )
+        if timestamp is None:
+            return indices, None
+        sampled_timestamps.append(float(timestamp))
+    origin = sampled_timestamps[0]
+    normalized = [max(0.0, timestamp - origin) for timestamp in sampled_timestamps]
+    if any(right <= left for left, right in zip(normalized, normalized[1:])):
+        return indices, None
+    return indices, normalized
+
+
+def _sampled_source_frame_indices(video_path: Path, sampled_count: int) -> list[int] | None:
+    """Mirror upstream np.linspace sampling over FFmpeg-decoded frames."""
+    plan = _source_frame_plan(video_path, sampled_count)
+    return plan[0] if plan else None
 
 
 
@@ -56,18 +125,49 @@ def _clone_if_missing(url: str, dest: Path, revision: str) -> None:
     if dest.is_dir() and (dest / ".git").exists():
         import subprocess
 
-        head = subprocess.check_output(["git", "-C", str(dest), "rev-parse", "HEAD"], text=True).strip()
-        if head == revision:
+        try:
+            head = subprocess.check_output(
+                ["git", "-C", str(dest), "rev-parse", "HEAD"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            clean = subprocess.call(
+                ["git", "-C", str(dest), "diff-index", "--quiet", "HEAD", "--"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ) == 0
+        except (OSError, subprocess.SubprocessError):
+            head = ""
+            clean = False
+        if head == revision and clean:
             return
-        _run(["git", "-C", str(dest), "fetch", "--depth", "1", "origin", revision])
-        _run(["git", "-C", str(dest), "checkout", "--detach", "FETCH_HEAD"])
-        return
+        if clean:
+            _run(["git", "-C", str(dest), "fetch", "--depth", "1", "origin", revision])
+            _run(["git", "-C", str(dest), "checkout", "--detach", "FETCH_HEAD"])
+            return
+        # The revision alone is insufficient when tracked files changed in
+        # place. This checkout is runtime-owned, so recreate it fail-closed.
+        shutil.rmtree(dest, ignore_errors=True)
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         shutil.rmtree(dest, ignore_errors=True)
     _run(["git", "clone", "--filter=blob:none", "--no-checkout", url, str(dest)])
     _run(["git", "-C", str(dest), "fetch", "--depth", "1", "origin", revision])
     _run(["git", "-C", str(dest), "checkout", "--detach", "FETCH_HEAD"])
+
+
+@contextmanager
+def _stage2_initialization_lock(models_dir: Path):
+    """Serialize source/package/weight initialization across worker processes."""
+    models_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = models_dir / ".stage2_initialization.lock"
+    with _PROCESS_INITIALIZATION_LOCK:
+        with lock_path.open("a+b") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _find_sam3_pt(sam_dir: Path) -> Path | None:
@@ -82,9 +182,27 @@ def _find_sam3_pt(sam_dir: Path) -> Path | None:
     return None
 
 
-def _vggt_weights_ok(vggt_dir: Path) -> bool:
+def _vggt_model_id() -> str:
+    """Research checkpoint by default; production must explicitly select Commercial."""
+    return os.environ.get("VGGT_MODEL_ID", DEFAULT_VGGT_MODEL_ID).strip() or DEFAULT_VGGT_MODEL_ID
+
+
+def _vggt_license_scope(model_id: str | None = None) -> str:
+    return "commercial" if (model_id or _vggt_model_id()) == COMMERCIAL_VGGT_MODEL_ID else "research_noncommercial"
+
+
+def _vggt_weights_ok(vggt_dir: Path, expected_model_id: str | None = None) -> bool:
     if not vggt_dir.is_dir():
         return False
+    if expected_model_id:
+        marker = vggt_dir / VGGT_MODEL_MARKER
+        # Existing endpoint volumes predate the marker and contain the original
+        # VGGT-1B checkpoint. Reuse those for the internal demo; an explicit
+        # switch to Commercial still requires a matching marker/download.
+        if marker.is_file() and marker.read_text().strip() != expected_model_id:
+            return False
+        if not marker.is_file() and expected_model_id != DEFAULT_VGGT_MODEL_ID:
+            return False
     for name in ("model.safetensors", "model.pt", "config.json"):
         if (vggt_dir / name).is_file():
             # need at least one weight file + preferably config
@@ -101,7 +219,7 @@ def _vggt_weights_ok(vggt_dir: Path) -> bool:
 
 
 def _weights_ready(models_dir: Path) -> bool:
-    vggt_ok = _vggt_weights_ok(models_dir / "VGGT")
+    vggt_ok = _vggt_weights_ok(models_dir / "VGGT", _vggt_model_id())
     sam_pt = _find_sam3_pt(models_dir / "SAM3")
     return bool(vggt_ok and sam_pt)
 
@@ -139,13 +257,15 @@ def _download_vggt_weights(models_dir: Path) -> None:
     )
     models_dir.mkdir(parents=True, exist_ok=True)
     vggt_dir = models_dir / "VGGT"
-    if not _vggt_weights_ok(vggt_dir):
-        print("[stage2] downloading facebook/VGGT-1B ...", flush=True)
+    model_id = _vggt_model_id()
+    if not _vggt_weights_ok(vggt_dir, model_id):
+        print(f"[stage2] downloading {model_id} ...", flush=True)
         snapshot_download(
-            repo_id="facebook/VGGT-1B",
+            repo_id=model_id,
             local_dir=str(vggt_dir),
             token=token,
         )
+        (vggt_dir / VGGT_MODEL_MARKER).write_text(model_id + "\n")
 
 
 def _download_sam3_weights(models_dir: Path) -> None:
@@ -184,7 +304,8 @@ def _download_sam3_weights(models_dir: Path) -> None:
                 marker.unlink()
         raise RuntimeError(
             f"Stage2 weights incomplete under {models_dir}. "
-            f"VGGT ok={_vggt_weights_ok(vggt_dir)} SAM3 pt={_find_sam3_pt(sam_dir)}"
+            f"VGGT ok={_vggt_weights_ok(vggt_dir, _vggt_model_id())} "
+            f"model={_vggt_model_id()} SAM3 pt={_find_sam3_pt(sam_dir)}"
         )
 
     _ensure_sam3_pt_layout(models_dir)
@@ -260,26 +381,27 @@ def _ensure_ras_installed(*, require_sam3: bool = True) -> None:
     ras = _ras_root()
     models_dir = _models_dir(ras)
 
-    _clone_if_missing("https://github.com/xiac20/ReplicateAnyScene.git", ras, RAS_REVISION)
-    # Keep the exact upstream gitlinks used by the reviewed RAS revision.
-    _clone_if_missing("https://github.com/facebookresearch/vggt.git", ras / "vggt", VGGT_REVISION)
-    if require_sam3:
-        _clone_if_missing("https://github.com/facebookresearch/sam3.git", ras / "sam3", SAM3_REVISION)
+    with _stage2_initialization_lock(models_dir):
+        _clone_if_missing("https://github.com/xiac20/ReplicateAnyScene.git", ras, RAS_REVISION)
+        # Keep the exact upstream gitlinks used by the reviewed RAS revision.
+        _clone_if_missing("https://github.com/facebookresearch/vggt.git", ras / "vggt", VGGT_REVISION)
+        if require_sam3:
+            _clone_if_missing("https://github.com/facebookresearch/sam3.git", ras / "sam3", SAM3_REVISION)
 
-    # Install dependencies before importing huggingface_hub to download weights.
-    _ensure_python_packages(ras, require_sam3=require_sam3)
+        # Install dependencies before importing huggingface_hub to download weights.
+        _ensure_python_packages(ras, require_sam3=require_sam3)
 
-    if not _vggt_weights_ok(models_dir / "VGGT"):
-        _download_vggt_weights(models_dir)
+        if not _vggt_weights_ok(models_dir / "VGGT", _vggt_model_id()):
+            _download_vggt_weights(models_dir)
 
-    # Older builds wrote .stage2_ready even when SAM3 download failed — ignore markers alone.
-    if require_sam3 and not _weights_ready(models_dir):
-        for marker in (models_dir / "VGGT" / ".stage2_ready", models_dir / "SAM3" / ".stage2_ready"):
-            if marker.exists():
-                marker.unlink()
-        _download_sam3_weights(models_dir)
-    elif require_sam3:
-        _ensure_sam3_pt_layout(models_dir)
+        # Older builds wrote .stage2_ready even when SAM3 download failed — ignore markers alone.
+        if require_sam3 and not _weights_ready(models_dir):
+            for marker in (models_dir / "VGGT" / ".stage2_ready", models_dir / "SAM3" / ".stage2_ready"):
+                if marker.exists():
+                    marker.unlink()
+            _download_sam3_weights(models_dir)
+        elif require_sam3:
+            _ensure_sam3_pt_layout(models_dir)
 
 
 def _ensure_ras_on_path() -> Path:
@@ -383,6 +505,331 @@ def _masks_to_instances(all_masks: dict[str, list]) -> list[dict[str, Any]]:
     return instances
 
 
+def _positive_duration(value: Any) -> float | None:
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return None
+    return duration if math.isfinite(duration) and duration > 0 else None
+
+
+def _finite_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _timestamp_span(entries: list[dict[str, Any]], timestamp_fields: tuple[str, ...]) -> float | None:
+    """Return the decoded timeline span represented by packets or frames."""
+    samples: list[tuple[float, float | None]] = []
+    for entry in entries:
+        timestamp = next(
+            (
+                parsed
+                for field in timestamp_fields
+                if (parsed := _finite_number(entry.get(field))) is not None
+            ),
+            None,
+        )
+        if timestamp is None:
+            continue
+        packet_duration = next(
+            (
+                parsed
+                for field in ("duration_time", "pkt_duration_time")
+                if (parsed := _positive_duration(entry.get(field))) is not None
+            ),
+            None,
+        )
+        samples.append((timestamp, packet_duration))
+    if not samples:
+        return None
+
+    ordered_starts = sorted({timestamp for timestamp, _duration in samples})
+    deltas = [
+        right - left
+        for left, right in zip(ordered_starts, ordered_starts[1:])
+        if right > left
+    ]
+    inferred_duration = sorted(deltas)[len(deltas) // 2] if deltas else None
+    ends = [
+        timestamp + (duration or inferred_duration or 0.0)
+        for timestamp, duration in samples
+    ]
+    span = max(ends) - min(timestamp for timestamp, _duration in samples)
+    return _positive_duration(span)
+
+
+def _ffprobe_json(path: Path, *args: str) -> dict[str, Any] | None:
+    import subprocess
+
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                *args,
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        value = json.loads(completed.stdout) if completed.returncode == 0 else None
+        return value if isinstance(value, dict) else None
+    except (OSError, json.JSONDecodeError, subprocess.SubprocessError):
+        return None
+
+
+def _probe_video_duration(path: Path) -> float | None:
+    """Determine the video timeline through progressively deeper ffprobe data."""
+    container = _ffprobe_json(path, "-show_entries", "format=duration") or {}
+    duration = _positive_duration((container.get("format") or {}).get("duration"))
+    if duration is not None:
+        return duration
+
+    streams = _ffprobe_json(
+        path,
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=duration",
+    ) or {}
+    for stream in streams.get("streams") or []:
+        duration = _positive_duration(stream.get("duration"))
+        if duration is not None:
+            return duration
+
+    packets = _ffprobe_json(
+        path,
+        "-select_streams",
+        "v:0",
+        "-show_packets",
+        "-show_entries",
+        "packet=pts_time,dts_time,duration_time",
+    ) or {}
+    duration = _timestamp_span(packets.get("packets") or [], ("pts_time", "dts_time"))
+    if duration is not None:
+        return duration
+
+    frames = _ffprobe_json(
+        path,
+        "-select_streams",
+        "v:0",
+        "-show_frames",
+        "-show_entries",
+        "frame=best_effort_timestamp_time,pts_time,pkt_dts_time,pkt_duration_time,duration_time",
+    ) or {}
+    return _timestamp_span(
+        frames.get("frames") or [],
+        ("best_effort_timestamp_time", "pts_time", "pkt_dts_time"),
+    )
+
+
+def _probe_video_frame_count(path: Path) -> int | None:
+    import subprocess
+
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-count_frames",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=nb_frames,nb_read_frames",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        streams = json.loads(completed.stdout).get("streams", []) if completed.returncode == 0 else []
+        stream = streams[0] if streams else {}
+        for field in ("nb_frames", "nb_read_frames"):
+            count = int(stream.get(field) or 0)
+            if count > 0:
+                return count
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _sampled_source_frame_timestamps(
+    video_path: Path,
+    source_frame_indices: list[int],
+) -> list[float] | None:
+    """Resolve decoded source-frame indices to their real presentation times."""
+    plan = _source_frame_plan(video_path, max(source_frame_indices, default=-1) + 1)
+    if not plan:
+        return None
+    all_indices, all_timestamps = plan
+    if not all_timestamps or all_indices != list(range(len(all_indices))):
+        # Asking for every decoded frame above produces a direct index -> PTS map.
+        return None
+    if max(source_frame_indices, default=-1) >= len(all_timestamps):
+        return None
+    sampled = [all_timestamps[index] for index in source_frame_indices]
+    origin = sampled[0]
+    normalized = [max(0.0, timestamp - origin) for timestamp in sampled]
+    if any(right <= left for left, right in zip(normalized, normalized[1:])):
+        return None
+    return normalized
+
+
+def _normalize_mask_video(
+    mask_video: Path,
+    source_video: Path,
+    source_frame_indices: list[int] | None = None,
+    source_frame_timestamps: list[float] | None = None,
+) -> dict[str, Any]:
+    """Produce browser-safe H.264 and preserve the source playback timeline."""
+    import subprocess
+
+    if not mask_video.is_file() or mask_video.stat().st_size <= 0:
+        raise RuntimeError("SAM3 mask visualization did not produce a video")
+    source_duration = _probe_video_duration(source_video)
+    if source_duration is None:
+        raise RuntimeError(
+            "source video timeline could not be established; refusing to publish an unsynchronized mask video"
+        )
+    normalized = mask_video.with_name(mask_video.stem + ".browser.mp4")
+    normalized.unlink(missing_ok=True)
+    timeline_dir = Path(tempfile.mkdtemp(prefix="stage2-mask-timeline-", dir=str(mask_video.parent)))
+    try:
+        extracted = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                str(mask_video),
+                "-map",
+                "0:v:0",
+                "-an",
+                "-vsync",
+                "0",
+                str(timeline_dir / "frame-%06d.png"),
+            ],
+            check=False,
+            capture_output=True,
+            timeout=300,
+        )
+        frame_files = sorted(timeline_dir.glob("frame-*.png"))
+        if extracted.returncode != 0 or not frame_files:
+            raise RuntimeError("SAM3 mask visualization frames could not be decoded")
+        generated_frames = len(frame_files)
+        plan = None if source_frame_indices and source_frame_timestamps else _source_frame_plan(
+            source_video,
+            generated_frames,
+        )
+        indices = source_frame_indices or (plan[0] if plan else None)
+        if not indices or len(indices) != generated_frames:
+            raise RuntimeError("SAM3 mask frames do not match the source sampling plan")
+        timestamps = source_frame_timestamps or (plan[1] if plan else None)
+        if not timestamps or len(timestamps) != generated_frames:
+            raise RuntimeError("sampled source frame timestamps could not be established")
+        tail_duration = source_duration - timestamps[-1]
+        if tail_duration <= 0:
+            raise RuntimeError("sampled source timestamps exceed the source duration")
+        durations = [
+            right - left
+            for left, right in zip(timestamps, timestamps[1:])
+        ] + [tail_duration]
+
+        concat_file = timeline_dir / "timeline.ffconcat"
+        concat_lines = ["ffconcat version 1.0"]
+        for frame, duration in zip(frame_files, durations):
+            concat_lines.extend([f"file '{frame.name}'", f"duration {duration:.12g}"])
+        # ffconcat only applies the last duration when another file follows it.
+        # The output `-t` boundary removes this duplicate at source_duration.
+        concat_lines.append(f"file '{frame_files[-1].name}'")
+        concat_file.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+
+        completed = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_file),
+                "-map",
+                "0:v:0",
+                "-an",
+                "-vf",
+                "pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "22",
+                "-bf",
+                "0",
+                "-pix_fmt",
+                "yuv420p",
+                "-fps_mode",
+                "vfr",
+                "-t",
+                f"{source_duration:.12g}",
+                "-movflags",
+                "+faststart",
+                "-video_track_timescale",
+                "90000",
+                str(normalized),
+            ],
+            check=False,
+            capture_output=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        normalized.unlink(missing_ok=True)
+        raise RuntimeError("failed to normalize SAM3 mask video for browser playback") from exc
+    finally:
+        shutil.rmtree(timeline_dir, ignore_errors=True)
+    if completed.returncode != 0 or not normalized.is_file() or normalized.stat().st_size <= 0:
+        normalized.unlink(missing_ok=True)
+        raise RuntimeError("failed to normalize SAM3 mask video for browser playback")
+    normalized.replace(mask_video)
+
+    output_duration = _probe_video_duration(mask_video)
+    tolerance = max(0.15, min(1.0, source_duration * 0.005))
+    aligned = bool(
+        output_duration is not None
+        and abs(output_duration - source_duration) <= tolerance
+    )
+    if not aligned:
+        raise RuntimeError("normalized SAM3 mask video duration does not match the source clip")
+    return {
+        "codec": "h264",
+        "pixel_format": "yuv420p",
+        "faststart": True,
+        "frame_rate": generated_frames / source_duration,
+        "frame_count": generated_frames,
+        "timeline_mode": "source_frame_pts",
+        "source_duration_seconds": source_duration,
+        "output_duration_seconds": output_duration,
+        "duration_aligned": aligned,
+    }
+
+
 def run_stage2_dry(payload: dict[str, Any]) -> dict[str, Any]:
     """Wire-test path: download + frame sample only, no VGGT/SAM weights."""
     t0 = time.time()
@@ -455,22 +902,95 @@ def _link_models_dir(ras_root: Path) -> None:
     models_link = ras_root / "models"
     if models_dir == models_link:
         return
-    if models_link.is_symlink():
-        if models_link.resolve() == models_dir:
-            return
-        models_link.unlink()
-    elif models_link.exists():
-        if models_link.is_dir() and not any(models_link.iterdir()):
-            models_link.rmdir()
-        else:
-            raise RuntimeError(f"cannot link models: non-empty path exists at {models_link}")
-    models_link.symlink_to(models_dir, target_is_directory=True)
+    # First jobs can reach this boundary concurrently after lazy bootstrap.
+    # Use the same cross-worker lock as source/weight initialization so two
+    # workers never race between the existence check and symlink creation.
+    with _stage2_initialization_lock(models_dir):
+        if models_link.is_symlink():
+            if models_link.resolve() == models_dir:
+                return
+            models_link.unlink()
+        elif models_link.exists():
+            if models_link.is_dir() and not any(models_link.iterdir()):
+                models_link.rmdir()
+            else:
+                raise RuntimeError(f"cannot link models: non-empty path exists at {models_link}")
+        models_link.symlink_to(models_dir, target_is_directory=True)
 
 
-def _artifact_manifest(out_dir: Path, work: Path) -> dict[str, Any]:
-    """Return only durable artifact claims; temporary worker paths are never API URLs."""
+def _upload_ticket(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    upload = payload.get("upload") if isinstance(payload, dict) else None
+    return upload if isinstance(upload, dict) else None
+
+
+def _artifact_manifest(out_dir: Path, work: Path, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Deliver artifacts durably and return receipts, never temporary paths."""
     artifact_root = os.environ.get("STAGE2_ARTIFACT_DIR", "").strip()
-    files = [p.name for p in out_dir.iterdir() if p.is_file()] if out_dir.is_dir() else []
+    files = sorted(
+        p.name
+        for p in out_dir.iterdir()
+        if p.is_file() and p.name in ARTIFACT_MEDIA_TYPES
+    ) if out_dir.is_dir() else []
+    upload = _upload_ticket(payload)
+    if upload:
+        from artifact_upload import upload_artifact_file
+
+        mode = str((payload or {}).get("mode") or "")
+        required_files = list(REQUIRED_ARTIFACTS.get(mode, ()))
+        required_set = set(required_files)
+        # Deliver the product contract before optional debug artifacts. This
+        # matters when a short-lived ticket or proxy upload fails partway.
+        upload_order = [name for name in required_files if name in files]
+        upload_order.extend(name for name in files if name not in required_set)
+        receipts: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        for name in required_files:
+            if name not in files:
+                errors.append(
+                    {
+                        "name": name,
+                        "code": "artifact_generation_missing",
+                        "detail": "required artifact was not generated",
+                    }
+                )
+        for name in upload_order:
+            try:
+                receipts.append(
+                    upload_artifact_file(upload, out_dir / name, ARTIFACT_MEDIA_TYPES[name])
+                )
+            except Exception as exc:
+                # Signed PUT URLs are credentials.  Never copy arbitrary
+                # transport exception strings into the public result.
+                errors.append(
+                    {
+                        "name": name,
+                        "code": "artifact_upload_failed",
+                        "detail": f"{type(exc).__name__}; inspect worker logs for transport detail",
+                    }
+                )
+        receipt_names = {str(receipt.get("name") or "") for receipt in receipts}
+        missing_required = [name for name in required_files if name not in receipt_names]
+        complete = not missing_required
+        durable = bool(receipts)
+        return {
+            "durable": durable,
+            "complete": complete,
+            "delivery": "agent-lab-r2",
+            "files": files,
+            "required_files": required_files,
+            "missing_required": missing_required,
+            "receipts": receipts,
+            "errors": errors,
+            "note": (
+                "Artifacts uploaded directly to Agent Lab storage; receipts require edge verification."
+                if complete and not errors
+                else "Required artifacts could not all be delivered; the Stage 2 job must be treated as failed."
+                if not complete
+                else "Some artifacts could not be uploaded; only verified receipts are usable."
+                if durable
+                else "Artifact upload failed; no worker-local path is exposed."
+            ),
+        }
     if not artifact_root:
         return {
             "durable": False,
@@ -494,9 +1014,104 @@ def _artifact_manifest(out_dir: Path, work: Path) -> dict[str, Any]:
     }
 
 
-def _artifact_exports_enabled() -> bool:
+def _artifact_delivery_error(
+    payload: dict[str, Any] | None,
+    artifacts: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Fail closed when an upload-ticket job misses its required deliverables."""
+    if not _upload_ticket(payload) or artifacts.get("complete") is True:
+        return None
+    missing = artifacts.get("missing_required")
+    if not isinstance(missing, list):
+        missing = list(REQUIRED_ARTIFACTS.get(str((payload or {}).get("mode") or ""), ()))
+    return {
+        "error_code": "artifact_delivery_failed",
+        "error": "Required Stage 2 artifacts could not be delivered to durable storage.",
+        "artifact_delivery": {
+            "required_files": artifacts.get("required_files", []),
+            "missing_required": missing,
+            "errors": artifacts.get("errors", []),
+        },
+    }
+
+
+def _artifact_exports_enabled(payload: dict[str, Any] | None = None) -> bool:
     """Only spend time exporting geometry when the files will remain inspectable."""
-    return bool(os.environ.get("STAGE2_ARTIFACT_DIR", "").strip()) or os.environ.get("STAGE2_KEEP_WORK") == "1"
+    return bool(_upload_ticket(payload)) or bool(os.environ.get("STAGE2_ARTIFACT_DIR", "").strip()) or os.environ.get("STAGE2_KEEP_WORK") == "1"
+
+
+def _env_int(name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(value, high))
+
+
+def _env_float(name: str, default: float, low: float, high: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(value, high))
+
+
+def _debug_artifacts_enabled() -> bool:
+    return os.environ.get("STAGE2_EXPORT_DEBUG_ARTIFACTS", "").strip() == "1"
+
+
+def _export_vggt_artifacts(pred: dict[str, Any], out_dir: Path) -> dict[str, Any]:
+    """Export the compact viewer GLB; large compatibility files are opt-in."""
+    from point_cloud_glb import GLB_HARD_MAX_POINTS, write_point_cloud_glb
+
+    exported: dict[str, Any] = {}
+    warnings: list[dict[str, str]] = []
+    try:
+        exported["point_cloud_glb"] = write_point_cloud_glb(
+            out_dir / "point_cloud.glb",
+            pred["world_points"],
+            pred["colors"],
+            confidence=pred.get("world_points_conf"),
+            extrinsics=pred.get("extrinsics"),
+            max_points=_env_int(
+                "STAGE2_POINT_CLOUD_MAX_POINTS",
+                300_000,
+                10_000,
+                GLB_HARD_MAX_POINTS,
+            ),
+            confidence_percentile=_env_float(
+                "STAGE2_POINT_CLOUD_CONFIDENCE_PERCENTILE", 25.0, 0.0, 100.0
+            ),
+        )
+    except Exception as exc:
+        warnings.append({"name": "point_cloud.glb", "error": f"{type(exc).__name__}: {exc}"})
+
+    if _debug_artifacts_enabled():
+        try:
+            if pred.get("point_cloud_data") is not None:
+                pred["point_cloud_data"].export(str(out_dir / "point_cloud.ply"))
+                exported["point_cloud_ply"] = True
+        except Exception as exc:
+            warnings.append({"name": "point_cloud.ply", "error": f"{type(exc).__name__}: {exc}"})
+
+        try:
+            intrinsic = pred["intrinsic"]
+            values = intrinsic.tolist() if hasattr(intrinsic, "tolist") else intrinsic
+            with (out_dir / "camera_intrinsics.json").open("w", encoding="utf-8") as handle:
+                json.dump(
+                    {"schema": "vggt-camera-intrinsics-v1", "intrinsics": values},
+                    handle,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            exported["camera_intrinsics"] = True
+        except Exception as exc:
+            warnings.append(
+                {"name": "camera_intrinsics.json", "error": f"{type(exc).__name__}: {exc}"}
+            )
+    if warnings:
+        exported["warnings"] = warnings
+    return exported
 
 
 def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
@@ -529,6 +1144,8 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
         t0 = time.time()
         frames = load_video_frames(str(video_path), max_frames).to(device)
         n_frames = int(frames.shape[0])
+        source_frame_plan = _source_frame_plan(video_path, n_frames)
+        source_frame_indices = source_frame_plan[0] if source_frame_plan else None
         timings["sample"] = int((time.time() - t0) * 1000)
 
         t0 = time.time()
@@ -541,25 +1158,21 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
         timings["vggt"] = int((time.time() - t0) * 1000)
 
         t0 = time.time()
-        if _artifact_exports_enabled():
-            try:
-                import numpy as np
-
-                if pred.get("point_cloud_data") is not None:
-                    pred["point_cloud_data"].export(str(out_dir / "point_cloud.ply"))
-                np.savetxt(str(out_dir / "intrinsic.txt"), pred["intrinsic"])
-            except Exception as exc:
-                pred["export_warning"] = str(exc)
+        export_meta = _export_vggt_artifacts(pred, out_dir) if _artifact_exports_enabled(payload) else {}
         timings["artifact_export"] = int((time.time() - t0) * 1000)
 
+        t0 = time.time()
+        artifacts = _artifact_manifest(out_dir, work, payload)
+        timings["artifact_delivery"] = int((time.time() - t0) * 1000)
         timings["total"] = int((time.time() - t_all) * 1000)
-        return {
+        delivery_error = _artifact_delivery_error(payload, artifacts)
+        response = {
             "status": "ok",
             "mode": "geometry",
             "implementation": "ReplicateAnyScene Stage 2 VGGT geometry preflight",
             "upstream_revision": RAS_REVISION,
             "frames_used": n_frames,
-            "source_frame_indices": list(range(n_frames)),
+            "source_frame_indices": source_frame_indices,
             "categories": payload["categories"],
             "raw_track_count": 0,
             "instance_count": 0,
@@ -567,11 +1180,14 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
             "geometry": {
                 "backend": "vggt",
                 "device": device,
+                "model_id": _vggt_model_id(),
+                "license_scope": _vggt_license_scope(),
                 "world_points_shape": list(pred["world_points"].shape),
                 "sam3_required": False,
+                "artifact_export": export_meta,
             },
             "sam": {"backend": "not_run", "reason": "geometry mode intentionally skips SAM3"},
-            "artifacts": _artifact_manifest(out_dir, work),
+            "artifacts": artifacts,
             "timings_ms": timings,
             "pipeline": [
                 {"id": "intake", "name": "Video intake", "status": "ok", "ms": timings.get("download")},
@@ -579,8 +1195,17 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
                 {"id": "vggt", "name": "VGGT geometry", "status": "ok", "ms": timings.get("vggt")},
                 {"id": "sam", "name": "SAM3", "status": "skipped_geometry_mode"},
                 {"id": "dedup", "name": "Spatial dedup", "status": "skipped_geometry_mode"},
+                {
+                    "id": "artifact_delivery",
+                    "name": "Artifact delivery",
+                    "status": "error" if delivery_error else "ok",
+                    "ms": timings.get("artifact_delivery"),
+                },
             ],
         }
+        if delivery_error:
+            response.update({"status": "error", **delivery_error})
+        return response
     except Exception as exc:
         return {
             "status": "error",
@@ -632,7 +1257,6 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
 
         import torch
         import cv2
-        import numpy as np
 
         from src.models import (
             load_sam3_image_model,
@@ -651,6 +1275,9 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
         t0 = time.time()
         frames = load_video_frames(str(video_path), max_frames).to(device)
         n_frames = int(frames.shape[0])
+        source_frame_plan = _source_frame_plan(video_path, n_frames)
+        source_frame_indices = source_frame_plan[0] if source_frame_plan else None
+        source_frame_timestamps = source_frame_plan[1] if source_frame_plan else None
         timings["sample"] = int((time.time() - t0) * 1000)
 
         t0 = time.time()
@@ -676,12 +1303,7 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
         color_dir.mkdir(parents=True, exist_ok=True)
         for i, image in enumerate(pred["colors"]):
             cv2.imwrite(str(color_dir / f"{i}.jpg"), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-        try:
-            if pred.get("point_cloud_data") is not None:
-                pred["point_cloud_data"].export(str(out_dir / "point_cloud.ply"))
-            np.savetxt(str(out_dir / "intrinsic.txt"), pred["intrinsic"])
-        except Exception as e:
-            pred["export_warning"] = str(e)
+        export_meta = _export_vggt_artifacts(pred, out_dir) if _artifact_exports_enabled(payload) else {}
 
         t0 = time.time()
         sam3_video = load_sam3_video_model()
@@ -707,20 +1329,31 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
         unload_model(sam3_video)
         timings["sam_dedup_vis"] = int((time.time() - t0) * 1000)
 
+        t0 = time.time()
+        mask_video_meta = _normalize_mask_video(
+            mask_video,
+            video_path,
+            source_frame_indices,
+            source_frame_timestamps,
+        )
+        timings["mask_video_normalize"] = int((time.time() - t0) * 1000)
+
         instances = _masks_to_instances(deduped)
         raw_count = sum(len(v) for v in all_masks.values())
+        t0 = time.time()
+        artifacts = _artifact_manifest(out_dir, work, payload)
+        timings["artifact_delivery"] = int((time.time() - t0) * 1000)
         timings["total"] = int((time.time() - t_all) * 1000)
+        delivery_error = _artifact_delivery_error(payload, artifacts)
 
-        artifacts = _artifact_manifest(out_dir, work)
-
-        return {
+        response = {
             "status": "ok",
             "mode": "full",
             "implementation": "ReplicateAnyScene main.py Stage 2 (vendor)",
             "upstream": "https://github.com/xiac20/ReplicateAnyScene",
             "upstream_revision": RAS_REVISION,
             "frames_used": n_frames,
-            "source_frame_indices": list(range(n_frames)),
+            "source_frame_indices": source_frame_indices,
             "categories": categories,
             "raw_track_count": raw_count,
             "instance_count": len(instances),
@@ -728,11 +1361,18 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
             "geometry": {
                 "backend": "vggt",
                 "device": device,
+                "model_id": _vggt_model_id(),
+                "license_scope": _vggt_license_scope(),
                 "room_align": room_align,
                 "wall_mask_frames": len(wall_masks),
                 "floor_mask_frames": len(floor_masks),
+                "artifact_export": export_meta,
             },
-            "sam": {"backend": "sam3_video", "raw_tracks": raw_count},
+            "sam": {
+                "backend": "sam3_video",
+                "raw_tracks": raw_count,
+                "mask_video": mask_video_meta,
+            },
             "artifacts": artifacts,
             "timings_ms": timings,
             "pipeline": [
@@ -741,6 +1381,12 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
                 {"id": "vggt", "status": "ok", "ms": timings.get("vggt")},
                 {"id": "room_align", "status": "ok" if room_align else "skipped", "ms": timings.get("room_align")},
                 {"id": "sam_dedup", "status": "ok", "ms": timings.get("sam_dedup_vis")},
+                {"id": "mask_video", "status": "ok", "ms": timings.get("mask_video_normalize")},
+                {
+                    "id": "artifact_delivery",
+                    "status": "error" if delivery_error else "ok",
+                    "ms": timings.get("artifact_delivery"),
+                },
                 {"id": "emit", "status": "ok", "detail": {"instance_ids": [x["instance_id"] for x in instances]}},
             ],
             "paper_mapping": {
@@ -749,6 +1395,9 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
                 "title": "Spatial-Guided Visual Deduplication",
             },
         }
+        if delivery_error:
+            response.update({"status": "error", **delivery_error})
+        return response
     except Exception as e:
         return {
             "status": "error",
