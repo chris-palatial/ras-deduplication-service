@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fast Serverless start: thin wrapper only. dry_run works immediately.
 # Full installs ReplicateAnyScene on first full job (or pre-seed volume).
-set -uo pipefail
+set -euo pipefail
 export PYTHONUNBUFFERED=1
 export RAS_ROOT="${RAS_ROOT:-/workspace/ReplicateAnyScene}"
 export STAGE2_MODELS_DIR="${STAGE2_MODELS_DIR:-/workspace/models}"
@@ -14,17 +14,15 @@ export STAGE2_VENV="${STAGE2_VENV:-/workspace/stage2-venv}"
 mkdir -p /workspace/models /workspace/hf-cache /workspace/app
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq git ffmpeg libgl1 libglib2.0-0 curl >/dev/null || true
+apt-get install -y -qq git ffmpeg libgl1 libglib2.0-0 curl >/dev/null
+if [[ ! "${STAGE2_CODE_REV:-}" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "[start] STAGE2_CODE_REV must be an explicit 40-character commit SHA" >&2
+  exit 64
+fi
 rm -rf /workspace/app
 git clone --filter=blob:none --no-checkout https://github.com/chris-palatial/ras-stage2-service.git /workspace/app
-if [[ "${STAGE2_CODE_REV:-}" =~ ^[0-9a-f]{40}$ ]]; then
-  git -C /workspace/app fetch --depth 1 origin "$STAGE2_CODE_REV"
-  git -C /workspace/app checkout --detach FETCH_HEAD
-else
-  echo "[start] STAGE2_CODE_REV is not a commit SHA; using origin/main"
-  git -C /workspace/app fetch --depth 1 origin main
-  git -C /workspace/app checkout --detach FETCH_HEAD
-fi
+git -C /workspace/app fetch --depth 1 origin "$STAGE2_CODE_REV"
+git -C /workspace/app checkout --detach FETCH_HEAD
 cd /workspace/app
 if [ ! -x "$STAGE2_VENV/bin/python" ]; then
   python -m venv --system-site-packages "$STAGE2_VENV"
