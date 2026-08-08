@@ -263,7 +263,7 @@ def _download_vggt_weights(models_dir: Path) -> None:
         # from SAM3 approval and from any stale/revoked endpoint credential by
         # always downloading it anonymously. Explicit alternate checkpoints
         # (including the gated Commercial model) require real credentials.
-        token = None if model_id == DEFAULT_VGGT_MODEL_ID else _hugging_face_token()
+        token = False if model_id == DEFAULT_VGGT_MODEL_ID else _hugging_face_token()
         if model_id != DEFAULT_VGGT_MODEL_ID and token is None:
             raise RuntimeError(
                 f"{model_id} requires an approved Hugging Face token in HF_TOKEN"

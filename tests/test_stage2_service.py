@@ -729,7 +729,7 @@ class Stage2ServiceTest(unittest.TestCase):
             self.assertEqual(stage2._vggt_model_id(), "facebook/VGGT-1B-Commercial")
             self.assertEqual(stage2._vggt_license_scope(), "commercial")
 
-    def test_public_vggt_cache_miss_downloads_anonymously_without_hf_token(self):
+    def test_public_vggt_cache_miss_ignores_even_a_stale_hf_token(self):
         calls = []
 
         def snapshot_download(**kwargs):
@@ -741,14 +741,14 @@ class Stage2ServiceTest(unittest.TestCase):
         fake_hub = types.SimpleNamespace(snapshot_download=snapshot_download)
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             stage2.os.environ,
-            {},
+            {"HF_TOKEN": "revoked-placeholder"},
             clear=True,
         ), patch.dict(sys.modules, {"huggingface_hub": fake_hub}):
             models = Path(tmp)
             stage2._download_vggt_weights(models)
 
             self.assertEqual(calls[0]["repo_id"], "facebook/VGGT-1B")
-            self.assertIsNone(calls[0]["token"])
+            self.assertIs(calls[0]["token"], False)
             self.assertEqual(
                 (models / "VGGT" / stage2.VGGT_MODEL_MARKER).read_text().strip(),
                 "facebook/VGGT-1B",
@@ -776,7 +776,7 @@ class Stage2ServiceTest(unittest.TestCase):
             Path(__file__).resolve().parents[1] / "scripts" / "download_weights.sh"
         ).read_text()
         self.assertNotRegex(script, r"HUGGING_FACE_HUB_TOKEN\"\) or True")
-        self.assertIn('token=None if vggt_model_id == "facebook/VGGT-1B" else token', script)
+        self.assertIn('token=False if vggt_model_id == "facebook/VGGT-1B" else token', script)
 
     def test_glb_contains_bounded_colored_points_and_camera_lines(self):
         points = np.arange(36, dtype=np.float32).reshape(2, 2, 3, 3)
