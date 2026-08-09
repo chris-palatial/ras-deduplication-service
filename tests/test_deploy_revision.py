@@ -259,6 +259,7 @@ class DeployRevisionTests(unittest.TestCase):
                 "status": "COMPLETED",
                 "output": {
                     "status": "ok",
+                    "analysis_type": "validation_v1",
                     "mode": "dry_run",
                     "stage2_code_revision": REVISION,
                 },
@@ -276,6 +277,10 @@ class DeployRevisionTests(unittest.TestCase):
 
         self.assertEqual(report, {"status": "passed", "attempts": 1, "revision": REVISION})
         self.assertEqual(invoke.call_args_list[0].args[0], "POST")
+        self.assertEqual(
+            invoke.call_args_list[0].args[3]["input"]["analysis_type"],
+            "validation_v1",
+        )
         self.assertEqual(invoke.call_args_list[1].args[0], "GET")
         self.assertNotIn("test-key", json.dumps(report))
 
@@ -301,6 +306,7 @@ class DeployRevisionTests(unittest.TestCase):
                 "status": "COMPLETED",
                 "output": {
                     "status": "ok",
+                    "analysis_type": "validation_v1",
                     "mode": "dry_run",
                     "stage2_code_revision": REVISION,
                 },
@@ -327,6 +333,7 @@ class DeployRevisionTests(unittest.TestCase):
                 "status": "COMPLETED",
                 "output": {
                     "status": "ok",
+                    "analysis_type": "validation_v1",
                     "mode": "dry_run",
                     "stage2_code_revision": NEWER_REVISION,
                 },
@@ -336,6 +343,7 @@ class DeployRevisionTests(unittest.TestCase):
                 "status": "COMPLETED",
                 "output": {
                     "status": "ok",
+                    "analysis_type": "validation_v1",
                     "mode": "dry_run",
                     "stage2_code_revision": REVISION,
                 },
@@ -362,6 +370,7 @@ class DeployRevisionTests(unittest.TestCase):
                     "status": "COMPLETED",
                     "output": {
                         "status": "ok",
+                        "analysis_type": "validation_v1",
                         "mode": "dry_run",
                         "stage2_code_revision": REVISION if attempt == 7 else NEWER_REVISION,
                     },
