@@ -17,15 +17,19 @@ import importlib
 import importlib.util
 import json
 import math
+import re
 import shutil
+import struct
 import sys
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+from artifact_contract import GLB_MAX_BYTES
 
 # Resolve vendor checkout. Layout:
 #   services/replicate-any-scene-stage2/
@@ -43,6 +47,22 @@ DEFAULT_VGGT_MODEL_ID = "facebook/VGGT-1B"
 COMMERCIAL_VGGT_MODEL_ID = "facebook/VGGT-1B-Commercial"
 SAM3_MODEL_ID = "facebook/sam3"
 VGGT_MODEL_MARKER = ".stage2_model_id"
+VGGT_OMEGA_ANALYSIS_TYPE = "geometry_vggt_omega_1b"
+VGGT_OMEGA_MODEL_ID = "facebook/VGGT-Omega"
+VGGT_OMEGA_SPACE_ID = "facebook/vggt-omega"
+VGGT_OMEGA_SPACE_REVISION = "2597ec6a276ea34d26206087a511f517e2a0024f"
+VGGT_OMEGA_GITHUB_REVISION = "39a0cb8af88554f15ddcb5354cd52bde588fa014"
+VGGT_OMEGA_MODEL_REVISION = "05654241adc2f218dfb089c373a011f8a7040576"
+VGGT_OMEGA_CHECKPOINT = "vggt_omega_1b_512.pt"
+VGGT_OMEGA_SPACE_ORIGIN = "https://facebook-vggt-omega.hf.space"
+VGGT_OMEGA_SPACE_HOST = "facebook-vggt-omega.hf.space"
+VGGT_OMEGA_METADATA_URL = "https://huggingface.co/api/spaces/facebook/vggt-omega"
+VGGT_OMEGA_MAX_FRAMES = 24
+VGGT_OMEGA_MAX_POINTS_K = 500
+VGGT_OMEGA_CONFIDENCE_PERCENTILE = 50.0
+VGGT_OMEGA_PROVENANCE_LEVEL = "hosted_unattested"
+_VGGT_OMEGA_EVENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_GLB_JSON_CHUNK = 0x4E4F534A
 ARTIFACT_MEDIA_TYPES = {
     "point_cloud.glb": "model/gltf-binary",
     "point_cloud.ply": "application/octet-stream",
@@ -56,10 +76,10 @@ REQUIRED_ARTIFACTS = {
 RUNPOD_ANALYSIS_TYPE_MODES = {
     "validation_v1": "dry_run",
     "geometry_vggt_1b": "geometry",
+    VGGT_OMEGA_ANALYSIS_TYPE: "geometry",
     "dedup_ras_vggt_sam3": "full",
 }
 NON_RUNPOD_ANALYSIS_TYPES = {
-    "geometry_vggt_omega_1b": "route it to the dedicated VGGT-Omega endpoint",
     "mask_sam3": "route it to the fal SAM 3 adapter",
     "mask_sam31": "route it to the fal SAM 3.1 adapter",
 }
@@ -772,6 +792,698 @@ def _materialize_video(payload: dict[str, Any], work: Path) -> Path:
     return _download_video(video_url, work)
 
 
+class VggtOmegaSpaceError(RuntimeError):
+    """Safe, structured failure from the official VGGT-Omega Space adapter."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _omega_space_headers(*, accept: str = "application/json") -> dict[str, str]:
+    headers = {"Accept": accept}
+    token = _hugging_face_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _close_http_response(response: Any) -> None:
+    close = getattr(response, "close", None)
+    if callable(close):
+        close()
+
+
+def _verify_vggt_omega_space_revision() -> dict[str, str]:
+    """Fail closed unless the public Space and its running replica are reviewed."""
+    import requests
+
+    response = None
+    try:
+        response = requests.get(
+            VGGT_OMEGA_METADATA_URL,
+            headers=_omega_space_headers(),
+            timeout=_env_int("STAGE2_OMEGA_METADATA_TIMEOUT_SECONDS", 30, 5, 120),
+            allow_redirects=False,
+        )
+        if 300 <= response.status_code < 400:
+            raise VggtOmegaSpaceError(
+                "omega_space_revision_unverified",
+                "Official VGGT-Omega Space metadata redirected; revision was not verified.",
+            )
+        if response.status_code != 200:
+            raise VggtOmegaSpaceError(
+                "omega_space_revision_unverified",
+                f"Official VGGT-Omega Space metadata returned HTTP {response.status_code}; revision was not verified.",
+            )
+        try:
+            metadata = response.json()
+        except (TypeError, ValueError) as exc:
+            raise VggtOmegaSpaceError(
+                "omega_space_revision_unverified",
+                "Official VGGT-Omega Space metadata was not valid JSON; revision was not verified.",
+            ) from exc
+    except VggtOmegaSpaceError:
+        raise
+    except requests.RequestException as exc:
+        raise VggtOmegaSpaceError(
+            "omega_space_revision_unverified",
+            f"Official VGGT-Omega Space metadata request failed ({type(exc).__name__}); revision was not verified.",
+        ) from exc
+    finally:
+        if response is not None:
+            _close_http_response(response)
+
+    runtime = metadata.get("runtime") if isinstance(metadata, dict) else None
+    repo_revision = metadata.get("sha") if isinstance(metadata, dict) else None
+    runtime_revision = runtime.get("sha") if isinstance(runtime, dict) else None
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("id") != VGGT_OMEGA_SPACE_ID
+        or repo_revision != VGGT_OMEGA_SPACE_REVISION
+        or runtime_revision != VGGT_OMEGA_SPACE_REVISION
+        or runtime.get("stage") != "RUNNING"
+    ):
+        raise VggtOmegaSpaceError(
+            "omega_space_revision_mismatch",
+            "Official VGGT-Omega Space revision changed; this adapter refuses unreviewed model execution.",
+        )
+    return {
+        "space_id": VGGT_OMEGA_SPACE_ID,
+        "space_revision": VGGT_OMEGA_SPACE_REVISION,
+    }
+
+
+def _sample_vggt_omega_frames(
+    video_path: Path,
+    target_dir: Path,
+    requested_max_frames: int,
+) -> tuple[list[Path], list[int], list[float] | None]:
+    """Decode one exact, uniform frame plan and cap the hosted call at 24 images."""
+    import cv2
+
+    sample_count = min(max(2, int(requested_max_frames)), VGGT_OMEGA_MAX_FRAMES)
+    plan = _source_frame_plan(video_path, sample_count)
+    if plan is None:
+        raise VggtOmegaSpaceError(
+            "omega_frame_sampling_failed",
+            "Could not enumerate decoded source frames for exact VGGT-Omega sampling.",
+        )
+    source_indices, source_timestamps = plan
+    if (
+        len(source_indices) < 2
+        or len(source_indices) > VGGT_OMEGA_MAX_FRAMES
+        or source_indices != sorted(set(source_indices))
+    ):
+        raise VggtOmegaSpaceError(
+            "omega_frame_sampling_failed",
+            "Source video did not provide a valid exact VGGT-Omega frame plan.",
+        )
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        capture.release()
+        raise VggtOmegaSpaceError(
+            "omega_frame_sampling_failed",
+            "Could not decode the source video for VGGT-Omega.",
+        )
+
+    paths: list[Path] = []
+    target_lookup = {frame_index: ordinal for ordinal, frame_index in enumerate(source_indices)}
+    last_index = source_indices[-1]
+    decoded_index = 0
+    try:
+        while decoded_index <= last_index:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            ordinal = target_lookup.get(decoded_index)
+            if ordinal is not None:
+                path = target_dir / f"{ordinal:06d}.jpg"
+                saved = cv2.imwrite(
+                    str(path),
+                    frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 92],
+                )
+                if not saved or not path.is_file() or path.stat().st_size <= 0:
+                    raise VggtOmegaSpaceError(
+                        "omega_frame_sampling_failed",
+                        "Could not encode an exact sampled frame for VGGT-Omega.",
+                    )
+                paths.append(path)
+            decoded_index += 1
+    finally:
+        capture.release()
+
+    if len(paths) != len(source_indices):
+        raise VggtOmegaSpaceError(
+            "omega_frame_sampling_failed",
+            "Source video ended before all exact VGGT-Omega sample frames were decoded.",
+        )
+    return paths, source_indices, source_timestamps
+
+
+def _upload_vggt_omega_frames(frame_paths: list[Path]) -> list[dict[str, Any]]:
+    """Upload only the exact sampled frames to the reviewed Gradio origin."""
+    import requests
+
+    if len(frame_paths) < 2 or len(frame_paths) > VGGT_OMEGA_MAX_FRAMES:
+        raise VggtOmegaSpaceError(
+            "omega_frame_upload_failed",
+            "VGGT-Omega frame upload requires between 2 and 24 sampled images.",
+        )
+
+    response = None
+    try:
+        with ExitStack() as stack:
+            files = [
+                (
+                    "files",
+                    (
+                        path.name,
+                        stack.enter_context(path.open("rb")),
+                        "image/jpeg",
+                    ),
+                )
+                for path in frame_paths
+            ]
+            response = requests.post(
+                f"{VGGT_OMEGA_SPACE_ORIGIN}/gradio_api/upload",
+                headers=_omega_space_headers(),
+                files=files,
+                timeout=_env_int("STAGE2_OMEGA_UPLOAD_TIMEOUT_SECONDS", 180, 30, 600),
+                allow_redirects=False,
+            )
+        if 300 <= response.status_code < 400:
+            raise VggtOmegaSpaceError(
+                "omega_frame_upload_failed",
+                "Official VGGT-Omega Space frame upload redirected and was rejected.",
+            )
+        if response.status_code != 200:
+            raise VggtOmegaSpaceError(
+                "omega_frame_upload_failed",
+                f"Official VGGT-Omega Space frame upload returned HTTP {response.status_code}.",
+            )
+        try:
+            remote_paths = response.json()
+        except (TypeError, ValueError) as exc:
+            raise VggtOmegaSpaceError(
+                "omega_frame_upload_failed",
+                "Official VGGT-Omega Space frame upload returned invalid JSON.",
+            ) from exc
+    except VggtOmegaSpaceError:
+        raise
+    except requests.RequestException as exc:
+        raise VggtOmegaSpaceError(
+            "omega_frame_upload_failed",
+            f"Official VGGT-Omega Space frame upload failed ({type(exc).__name__}).",
+        ) from exc
+    finally:
+        if response is not None:
+            _close_http_response(response)
+
+    if not isinstance(remote_paths, list) or len(remote_paths) != len(frame_paths):
+        raise VggtOmegaSpaceError(
+            "omega_frame_upload_failed",
+            "Official VGGT-Omega Space did not acknowledge every sampled frame.",
+        )
+
+    uploaded: list[dict[str, Any]] = []
+    for local_path, remote_path in zip(frame_paths, remote_paths):
+        if (
+            not isinstance(remote_path, str)
+            or not remote_path
+            or len(remote_path) > 4096
+            or "\n" in remote_path
+            or "\r" in remote_path
+        ):
+            raise VggtOmegaSpaceError(
+                "omega_frame_upload_failed",
+                "Official VGGT-Omega Space returned an invalid sampled-frame handle.",
+            )
+        uploaded.append(
+            {
+                "path": remote_path,
+                "orig_name": local_path.name,
+                "mime_type": "image/jpeg",
+                "meta": {"_type": "gradio.FileData"},
+            }
+        )
+    return uploaded
+
+
+def _submit_vggt_omega_gradio(api_name: str, data: list[Any]) -> str:
+    import requests
+
+    if api_name not in {"update_gallery_on_upload", "gradio_demo"}:
+        raise VggtOmegaSpaceError(
+            "omega_space_protocol_failed",
+            "Unsupported official VGGT-Omega Space API operation.",
+        )
+    response = None
+    try:
+        response = requests.post(
+            f"{VGGT_OMEGA_SPACE_ORIGIN}/gradio_api/call/{api_name}",
+            headers={**_omega_space_headers(), "Content-Type": "application/json"},
+            json={"data": data},
+            timeout=_env_int("STAGE2_OMEGA_SUBMIT_TIMEOUT_SECONDS", 60, 10, 180),
+            allow_redirects=False,
+        )
+        if 300 <= response.status_code < 400:
+            raise VggtOmegaSpaceError(
+                "omega_space_protocol_failed",
+                f"Official VGGT-Omega Space {api_name} submission redirected and was rejected.",
+            )
+        if response.status_code != 200:
+            raise VggtOmegaSpaceError(
+                "omega_space_protocol_failed",
+                f"Official VGGT-Omega Space {api_name} submission returned HTTP {response.status_code}.",
+            )
+        try:
+            value = response.json()
+        except (TypeError, ValueError) as exc:
+            raise VggtOmegaSpaceError(
+                "omega_space_protocol_failed",
+                f"Official VGGT-Omega Space {api_name} submission returned invalid JSON.",
+            ) from exc
+    except VggtOmegaSpaceError:
+        raise
+    except requests.RequestException as exc:
+        raise VggtOmegaSpaceError(
+            "omega_space_protocol_failed",
+            f"Official VGGT-Omega Space {api_name} submission failed ({type(exc).__name__}).",
+        ) from exc
+    finally:
+        if response is not None:
+            _close_http_response(response)
+
+    event_id = value.get("event_id") if isinstance(value, dict) else None
+    if not isinstance(event_id, str) or not _VGGT_OMEGA_EVENT_ID_RE.fullmatch(event_id):
+        raise VggtOmegaSpaceError(
+            "omega_space_protocol_failed",
+            f"Official VGGT-Omega Space {api_name} submission returned an invalid event id.",
+        )
+    return event_id
+
+
+def _wait_vggt_omega_gradio(
+    api_name: str,
+    event_id: str,
+    *,
+    deadline: float | None = None,
+) -> list[Any]:
+    import requests
+
+    if api_name not in {"update_gallery_on_upload", "gradio_demo"}:
+        raise VggtOmegaSpaceError(
+            "omega_space_protocol_failed",
+            "Unsupported official VGGT-Omega Space API operation.",
+        )
+    if not _VGGT_OMEGA_EVENT_ID_RE.fullmatch(event_id):
+        raise VggtOmegaSpaceError(
+            "omega_space_protocol_failed",
+            "Official VGGT-Omega Space event id was invalid.",
+        )
+
+    timeout_seconds = _env_int("STAGE2_OMEGA_RESULT_TIMEOUT_SECONDS", 900, 60, 1200)
+    if deadline is None:
+        deadline = time.monotonic() + timeout_seconds
+
+    def timeout_error() -> VggtOmegaSpaceError:
+        return VggtOmegaSpaceError(
+            "omega_space_result_timeout",
+            f"Official VGGT-Omega Space {api_name} result exceeded its total wait deadline.",
+        )
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise timeout_error()
+
+    response = None
+    deadline_timer: threading.Timer | None = None
+    deadline_expired = threading.Event()
+    try:
+        response = requests.get(
+            f"{VGGT_OMEGA_SPACE_ORIGIN}/gradio_api/call/{api_name}/{event_id}",
+            headers=_omega_space_headers(accept="text/event-stream"),
+            stream=True,
+            timeout=max(0.1, min(float(timeout_seconds), remaining)),
+            allow_redirects=False,
+        )
+        if 300 <= response.status_code < 400:
+            raise VggtOmegaSpaceError(
+                "omega_space_protocol_failed",
+                f"Official VGGT-Omega Space {api_name} result redirected and was rejected.",
+            )
+        if response.status_code != 200:
+            raise VggtOmegaSpaceError(
+                "omega_space_protocol_failed",
+                f"Official VGGT-Omega Space {api_name} result returned HTTP {response.status_code}.",
+            )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise timeout_error()
+
+        # `requests` timeouts limit one idle socket read, not the complete SSE
+        # lifetime. Gradio emits heartbeat lines while a job is queued, so a
+        # read timeout alone can keep a paid RunPod worker alive indefinitely.
+        # Close the stream at the monotonic deadline and also check that
+        # deadline on every provider line.
+        def expire_response() -> None:
+            deadline_expired.set()
+            if response is not None:
+                _close_http_response(response)
+
+        deadline_timer = threading.Timer(remaining, expire_response)
+        deadline_timer.daemon = True
+        deadline_timer.start()
+
+        event_name = ""
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if deadline_expired.is_set() or time.monotonic() >= deadline:
+                raise timeout_error()
+            line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
+            if line.startswith("event:"):
+                event_name = line.split(":", 1)[1].strip().lower()
+                continue
+            if not line.startswith("data:"):
+                continue
+            if event_name == "error":
+                raise VggtOmegaSpaceError(
+                    "omega_space_execution_failed",
+                    f"Official VGGT-Omega Space {api_name} job failed.",
+                )
+            if event_name != "complete":
+                continue
+            try:
+                result = json.loads(line.split(":", 1)[1].strip())
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise VggtOmegaSpaceError(
+                    "omega_space_protocol_failed",
+                    f"Official VGGT-Omega Space {api_name} result was invalid JSON.",
+                ) from exc
+            if not isinstance(result, list):
+                raise VggtOmegaSpaceError(
+                    "omega_space_protocol_failed",
+                    f"Official VGGT-Omega Space {api_name} result had an invalid shape.",
+                )
+            if deadline_expired.is_set() or time.monotonic() >= deadline:
+                raise timeout_error()
+            return result
+        if deadline_expired.is_set() or time.monotonic() >= deadline:
+            raise timeout_error()
+    except VggtOmegaSpaceError:
+        raise
+    except requests.RequestException as exc:
+        if deadline_expired.is_set() or time.monotonic() >= deadline:
+            raise timeout_error() from exc
+        raise VggtOmegaSpaceError(
+            "omega_space_protocol_failed",
+            f"Official VGGT-Omega Space {api_name} result failed ({type(exc).__name__}).",
+        ) from exc
+    finally:
+        if deadline_timer is not None:
+            deadline_timer.cancel()
+        if response is not None:
+            _close_http_response(response)
+
+    raise VggtOmegaSpaceError(
+        "omega_space_protocol_failed",
+        f"Official VGGT-Omega Space {api_name} result stream ended before completion.",
+    )
+
+
+def _vggt_omega_glb_url(file_data: Any) -> str:
+    value = file_data.get("url") if isinstance(file_data, dict) else None
+    metadata = file_data.get("meta") if isinstance(file_data, dict) else None
+    if (
+        not isinstance(value, str)
+        or not value
+        or not isinstance(metadata, dict)
+        or metadata.get("_type") != "gradio.FileData"
+    ):
+        raise VggtOmegaSpaceError(
+            "omega_glb_invalid",
+            "Official VGGT-Omega Space did not return a downloadable GLB artifact.",
+        )
+    parsed = urlparse(value)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise VggtOmegaSpaceError(
+            "omega_glb_host_rejected",
+            "Official VGGT-Omega Space returned a GLB URL with an invalid host.",
+        ) from exc
+    if (
+        parsed.scheme.lower() != "https"
+        or (parsed.hostname or "").lower() != VGGT_OMEGA_SPACE_HOST
+        or port not in (None, 443)
+        or parsed.username is not None
+        or parsed.password is not None
+        or not parsed.path.startswith("/gradio_api/file=")
+        or parsed.fragment
+    ):
+        raise VggtOmegaSpaceError(
+            "omega_glb_host_rejected",
+            "Official VGGT-Omega Space returned a GLB URL outside the reviewed artifact host.",
+        )
+    return value
+
+
+def _validate_vggt_omega_glb(path: Path) -> int:
+    size = path.stat().st_size if path.is_file() else 0
+    if size < 12:
+        raise VggtOmegaSpaceError(
+            "omega_glb_invalid",
+            "Official VGGT-Omega Space returned an empty or truncated GLB artifact.",
+        )
+    if size > GLB_MAX_BYTES:
+        raise VggtOmegaSpaceError(
+            "omega_glb_too_large",
+            f"Official VGGT-Omega GLB exceeds the {GLB_MAX_BYTES}-byte artifact contract.",
+        )
+    with path.open("rb") as handle:
+        header = handle.read(12)
+        magic, version, declared_size = struct.unpack("<4sII", header)
+        if magic != b"glTF" or version != 2 or declared_size != size:
+            raise VggtOmegaSpaceError(
+                "omega_glb_invalid",
+                "Official VGGT-Omega Space returned an invalid glTF 2.0 GLB artifact.",
+            )
+
+        chunk_index = 0
+        while handle.tell() < size:
+            chunk_header = handle.read(8)
+            if len(chunk_header) != 8:
+                raise VggtOmegaSpaceError(
+                    "omega_glb_invalid",
+                    "Official VGGT-Omega Space returned an invalid glTF 2.0 GLB artifact.",
+                )
+            chunk_length, chunk_type = struct.unpack("<II", chunk_header)
+            if chunk_length % 4 != 0 or chunk_length > size - handle.tell():
+                raise VggtOmegaSpaceError(
+                    "omega_glb_invalid",
+                    "Official VGGT-Omega Space returned an invalid glTF 2.0 GLB artifact.",
+                )
+            chunk = handle.read(chunk_length)
+            if len(chunk) != chunk_length:
+                raise VggtOmegaSpaceError(
+                    "omega_glb_invalid",
+                    "Official VGGT-Omega Space returned an invalid glTF 2.0 GLB artifact.",
+                )
+            if chunk_index == 0:
+                if chunk_type != _GLB_JSON_CHUNK or not chunk:
+                    raise VggtOmegaSpaceError(
+                        "omega_glb_invalid",
+                        "Official VGGT-Omega Space returned an invalid glTF 2.0 GLB artifact.",
+                    )
+                try:
+                    document = json.loads(chunk.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+                    raise VggtOmegaSpaceError(
+                        "omega_glb_invalid",
+                        "Official VGGT-Omega Space returned an invalid glTF 2.0 GLB artifact.",
+                    ) from exc
+                asset = document.get("asset") if isinstance(document, dict) else None
+                if not isinstance(asset, dict) or asset.get("version") != "2.0":
+                    raise VggtOmegaSpaceError(
+                        "omega_glb_invalid",
+                        "Official VGGT-Omega Space returned an invalid glTF 2.0 GLB artifact.",
+                    )
+            chunk_index += 1
+
+    if chunk_index == 0:
+        raise VggtOmegaSpaceError(
+            "omega_glb_invalid",
+            "Official VGGT-Omega Space returned an invalid glTF 2.0 GLB artifact.",
+        )
+    return size
+
+
+def _download_vggt_omega_glb(url: str, destination: Path) -> int:
+    import requests
+
+    # Validate before the request so the worker can never be turned into a
+    # generic fetcher by a compromised or changed Space response.
+    _vggt_omega_glb_url(
+        {"url": url, "meta": {"_type": "gradio.FileData"}}
+    )
+    response = None
+    destination.unlink(missing_ok=True)
+    try:
+        response = requests.get(
+            url,
+            headers=_omega_space_headers(accept="model/gltf-binary"),
+            stream=True,
+            timeout=_env_int("STAGE2_OMEGA_GLB_TIMEOUT_SECONDS", 180, 30, 600),
+            allow_redirects=False,
+        )
+        if 300 <= response.status_code < 400:
+            raise VggtOmegaSpaceError(
+                "omega_glb_download_failed",
+                "Official VGGT-Omega GLB download redirected and was rejected.",
+            )
+        if response.status_code != 200:
+            raise VggtOmegaSpaceError(
+                "omega_glb_download_failed",
+                f"Official VGGT-Omega GLB download returned HTTP {response.status_code}.",
+            )
+        declared_raw = response.headers.get("content-length")
+        if declared_raw is not None:
+            try:
+                declared = int(declared_raw)
+            except (TypeError, ValueError) as exc:
+                raise VggtOmegaSpaceError(
+                    "omega_glb_invalid",
+                    "Official VGGT-Omega GLB returned an invalid Content-Length.",
+                ) from exc
+            if declared <= 0:
+                raise VggtOmegaSpaceError(
+                    "omega_glb_invalid",
+                    "Official VGGT-Omega Space returned an empty GLB artifact.",
+                )
+            if declared > GLB_MAX_BYTES:
+                raise VggtOmegaSpaceError(
+                    "omega_glb_too_large",
+                    f"Official VGGT-Omega GLB exceeds the {GLB_MAX_BYTES}-byte artifact contract.",
+                )
+
+        written = 0
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("wb") as handle:
+            for chunk in response.iter_content(chunk_size=1 << 20):
+                if not chunk:
+                    continue
+                written += len(chunk)
+                if written > GLB_MAX_BYTES:
+                    raise VggtOmegaSpaceError(
+                        "omega_glb_too_large",
+                        f"Official VGGT-Omega GLB exceeds the {GLB_MAX_BYTES}-byte artifact contract.",
+                    )
+                handle.write(chunk)
+        return _validate_vggt_omega_glb(destination)
+    except VggtOmegaSpaceError:
+        destination.unlink(missing_ok=True)
+        raise
+    except requests.RequestException as exc:
+        destination.unlink(missing_ok=True)
+        raise VggtOmegaSpaceError(
+            "omega_glb_download_failed",
+            f"Official VGGT-Omega GLB download failed ({type(exc).__name__}).",
+        ) from exc
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        if response is not None:
+            _close_http_response(response)
+
+
+def _run_vggt_omega_space(
+    frame_paths: list[Path],
+    destination: Path,
+) -> dict[str, Any]:
+    revision = _verify_vggt_omega_space_revision()
+    uploaded_frames = _upload_vggt_omega_frames(frame_paths)
+    result_deadline = time.monotonic() + _env_int(
+        "STAGE2_OMEGA_RESULT_TIMEOUT_SECONDS",
+        900,
+        60,
+        1200,
+    )
+
+    prepare_event = _submit_vggt_omega_gradio(
+        "update_gallery_on_upload",
+        [None, uploaded_frames, 1.0],
+    )
+    prepare_result = _wait_vggt_omega_gradio(
+        "update_gallery_on_upload",
+        prepare_event,
+        deadline=result_deadline,
+    )
+    if len(prepare_result) != 4:
+        raise VggtOmegaSpaceError(
+            "omega_space_protocol_failed",
+            "Official VGGT-Omega Space returned an unexpected preparation result.",
+        )
+    target_dir = prepare_result[1]
+    if not isinstance(target_dir, str) or not target_dir or len(target_dir) > 4096:
+        raise VggtOmegaSpaceError(
+            "omega_space_protocol_failed",
+            "Official VGGT-Omega Space did not return a valid reconstruction handle.",
+        )
+
+    demo_event = _submit_vggt_omega_gradio(
+        "gradio_demo",
+        [
+            target_dir,
+            VGGT_OMEGA_CONFIDENCE_PERCENTILE,
+            False,
+            False,
+            True,
+            False,
+            VGGT_OMEGA_MAX_POINTS_K,
+        ],
+    )
+    demo_result = _wait_vggt_omega_gradio(
+        "gradio_demo",
+        demo_event,
+        deadline=result_deadline,
+    )
+    if len(demo_result) != 2:
+        raise VggtOmegaSpaceError(
+            "omega_space_protocol_failed",
+            "Official VGGT-Omega Space returned an unexpected reconstruction result.",
+        )
+    glb_file_data = demo_result[0]
+    glb_url = _vggt_omega_glb_url(glb_file_data)
+    temporary_destination = destination.with_name(f".{destination.name}.omega-download")
+    temporary_destination.unlink(missing_ok=True)
+    try:
+        glb_bytes = _download_vggt_omega_glb(glb_url, temporary_destination)
+        # The two Gradio calls share opaque replica-local state. Re-check the
+        # reviewed Space revision after that stateful operation and before the
+        # artifact can enter the normal durable-delivery path.
+        final_revision = _verify_vggt_omega_space_revision()
+        if final_revision != revision:
+            raise VggtOmegaSpaceError(
+                "omega_space_revision_mismatch",
+                "Official VGGT-Omega Space revision changed during execution; the artifact was rejected.",
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(temporary_destination, destination)
+    finally:
+        temporary_destination.unlink(missing_ok=True)
+    return {
+        **revision,
+        "glb_bytes": glb_bytes,
+        "max_points": VGGT_OMEGA_MAX_POINTS_K * 1000,
+        "confidence_percentile": VGGT_OMEGA_CONFIDENCE_PERCENTILE,
+    }
+
+
 def _masks_to_instances(all_masks: dict[str, list]) -> list[dict[str, Any]]:
     instances: list[dict[str, Any]] = []
     for category, tracks in (all_masks or {}).items():
@@ -1359,6 +2071,13 @@ def _artifact_exports_enabled(payload: dict[str, Any] | None = None) -> bool:
     return bool(_upload_ticket(payload)) or bool(os.environ.get("STAGE2_ARTIFACT_DIR", "").strip()) or os.environ.get("STAGE2_KEEP_WORK") == "1"
 
 
+def _durable_artifact_delivery_enabled(payload: dict[str, Any] | None = None) -> bool:
+    """Return whether a completed artifact can outlive the current worker."""
+    return bool(_upload_ticket(payload)) or bool(
+        os.environ.get("STAGE2_ARTIFACT_DIR", "").strip()
+    )
+
+
 def _env_int(name: str, default: int, low: int, high: int) -> int:
     try:
         value = int(os.environ.get(name, str(default)))
@@ -1585,6 +2304,149 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
             "status": "error",
             "mode": "geometry",
             "error": str(exc),
+            "timings_ms": timings,
+        }
+    finally:
+        if os.environ.get("STAGE2_KEEP_WORK") != "1":
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def run_stage2_omega_geometry(payload: dict[str, Any]) -> dict[str, Any]:
+    """Run genuine VGGT-Omega geometry through Meta's reviewed public Space.
+
+    RunPod remains the job orchestrator and the only artifact-delivery owner.
+    The hosted Space is used only for Omega geometry; this path never imports
+    local VGGT, CUDA, SAM3, or ReplicateAnyScene deduplication code.
+    """
+    t_all = time.time()
+    timings: dict[str, int] = {}
+    stage = "artifact_contract"
+    if not _durable_artifact_delivery_enabled(payload):
+        return {
+            "status": "error",
+            "mode": "geometry",
+            "error_code": "artifact_delivery_unavailable",
+            "error": (
+                "VGGT-Omega geometry requires durable artifact delivery; "
+                "provide an upload ticket or configure persistent artifact storage."
+            ),
+            "timings_ms": {"total": int((time.time() - t_all) * 1000)},
+        }
+
+    work = Path(tempfile.mkdtemp(prefix="ras-stage2-omega-"))
+    out_dir = work / "output"
+    frame_dir = work / "omega-frames"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        stage = "intake"
+        t0 = time.time()
+        video_path = _materialize_video(payload, work)
+        timings["download"] = int((time.time() - t0) * 1000)
+
+        stage = "sample_frames"
+        t0 = time.time()
+        frame_paths, source_frame_indices, source_frame_timestamps = _sample_vggt_omega_frames(
+            video_path,
+            frame_dir,
+            int(payload["max_frames"]),
+        )
+        timings["sample"] = int((time.time() - t0) * 1000)
+
+        stage = "vggt_omega"
+        t0 = time.time()
+        omega_result = _run_vggt_omega_space(frame_paths, out_dir / "point_cloud.glb")
+        timings["vggt_omega"] = int((time.time() - t0) * 1000)
+
+        stage = "artifact_delivery"
+        t0 = time.time()
+        artifacts = _artifact_manifest(out_dir, work, payload)
+        timings["artifact_delivery"] = int((time.time() - t0) * 1000)
+        timings["total"] = int((time.time() - t_all) * 1000)
+        delivery_error = _artifact_delivery_error(payload, artifacts)
+        response = {
+            "status": "ok",
+            "mode": "geometry",
+            "implementation": "VGGT-Omega geometry via Meta's official Hugging Face Space",
+            "frames_used": len(frame_paths),
+            "source_frame_indices": source_frame_indices,
+            "source_frame_timestamps": source_frame_timestamps,
+            "categories": payload["categories"],
+            "raw_track_count": 0,
+            "instance_count": 0,
+            "instances": [],
+            "geometry": {
+                "backend": "huggingface_space",
+                "model_id": VGGT_OMEGA_MODEL_ID,
+                "source_revision": VGGT_OMEGA_SPACE_REVISION,
+                "space_id": VGGT_OMEGA_SPACE_ID,
+                "space_revision": VGGT_OMEGA_SPACE_REVISION,
+                "github_source_revision": VGGT_OMEGA_GITHUB_REVISION,
+                "model_repository_revision": VGGT_OMEGA_MODEL_REVISION,
+                "checkpoint_filename": VGGT_OMEGA_CHECKPOINT,
+                "provenance_level": VGGT_OMEGA_PROVENANCE_LEVEL,
+                "license_scope": "research_noncommercial",
+                "sam3_required": False,
+                "execution_orchestrator": "runpod",
+                "artifact_export": {
+                    "point_cloud_glb": {
+                        "bytes": omega_result["glb_bytes"],
+                        "requested_max_points": omega_result["max_points"],
+                        "confidence_percentile": omega_result["confidence_percentile"],
+                    }
+                },
+            },
+            "sam": {
+                "backend": "not_run",
+                "reason": "VGGT-Omega analysis is geometry-only and intentionally skips SAM3",
+            },
+            "artifacts": artifacts,
+            "timings_ms": timings,
+            "pipeline": [
+                {"id": "intake", "name": "Video intake", "status": "ok", "ms": timings.get("download")},
+                {
+                    "id": "sample_frames",
+                    "name": "Exact uniform frame sampling",
+                    "status": "ok",
+                    "ms": timings.get("sample"),
+                    "detail": {"frames_used": len(frame_paths), "frame_cap": VGGT_OMEGA_MAX_FRAMES},
+                },
+                {
+                    "id": "vggt_omega",
+                    "name": "VGGT-Omega hosted geometry",
+                    "status": "ok",
+                    "ms": timings.get("vggt_omega"),
+                },
+                {"id": "sam", "name": "SAM3", "status": "skipped_geometry_mode"},
+                {"id": "dedup", "name": "Spatial dedup", "status": "skipped_geometry_mode"},
+                {
+                    "id": "artifact_delivery",
+                    "name": "Artifact delivery",
+                    "status": "error" if delivery_error else "ok",
+                    "ms": timings.get("artifact_delivery"),
+                },
+            ],
+        }
+        if delivery_error:
+            response.update({"status": "error", **delivery_error})
+        return response
+    except VggtOmegaSpaceError as exc:
+        timings["total"] = int((time.time() - t_all) * 1000)
+        return {
+            "status": "error",
+            "mode": "geometry",
+            "error_code": exc.code,
+            "error": str(exc),
+            "failed_stage": stage,
+            "timings_ms": timings,
+        }
+    except Exception as exc:
+        timings["total"] = int((time.time() - t_all) * 1000)
+        return {
+            "status": "error",
+            "mode": "geometry",
+            "error_code": "omega_internal_failure",
+            "error": f"VGGT-Omega geometry execution failed ({type(exc).__name__}).",
+            "failed_stage": stage,
             "timings_ms": timings,
         }
     finally:
@@ -1852,6 +2714,22 @@ def _resolve_runpod_analysis_type(payload: dict[str, Any], mode: str) -> tuple[s
                 f"expected_geometry_source_revision must be {DEFAULT_VGGT_REVISION} "
                 f"for analysis_type {raw_analysis_type}"
             )
+    if raw_analysis_type == VGGT_OMEGA_ANALYSIS_TYPE:
+        expected_model_id = payload.get("expected_geometry_model_id")
+        if expected_model_id is not None and expected_model_id != VGGT_OMEGA_MODEL_ID:
+            return raw_analysis_type, (
+                f"expected_geometry_model_id must be {VGGT_OMEGA_MODEL_ID} "
+                f"for analysis_type {raw_analysis_type}"
+            )
+        expected_source_revision = payload.get("expected_geometry_source_revision")
+        if (
+            expected_source_revision is not None
+            and expected_source_revision != VGGT_OMEGA_SPACE_REVISION
+        ):
+            return raw_analysis_type, (
+                f"expected_geometry_source_revision must be {VGGT_OMEGA_SPACE_REVISION} "
+                f"for analysis_type {raw_analysis_type}"
+            )
     if raw_analysis_type == "dedup_ras_vggt_sam3":
         if SAM3_REVISION != DEFAULT_SAM3_REVISION:
             return raw_analysis_type, (
@@ -1916,6 +2794,23 @@ def _attach_success_provenance(
             or geometry.get("source_revision") != DEFAULT_VGGT_REVISION
         ):
             return provenance_error("VGGT")
+    if analysis_type == VGGT_OMEGA_ANALYSIS_TYPE:
+        geometry = result.get("geometry")
+        if not isinstance(geometry, dict) or (
+            geometry.get("backend") != "huggingface_space"
+            or geometry.get("model_id") != VGGT_OMEGA_MODEL_ID
+            or geometry.get("source_revision") != VGGT_OMEGA_SPACE_REVISION
+            or geometry.get("space_id") != VGGT_OMEGA_SPACE_ID
+            or geometry.get("space_revision") != VGGT_OMEGA_SPACE_REVISION
+            or geometry.get("github_source_revision") != VGGT_OMEGA_GITHUB_REVISION
+            or geometry.get("model_repository_revision") != VGGT_OMEGA_MODEL_REVISION
+            or geometry.get("checkpoint_filename") != VGGT_OMEGA_CHECKPOINT
+            or geometry.get("provenance_level") != VGGT_OMEGA_PROVENANCE_LEVEL
+            or geometry.get("license_scope") != "research_noncommercial"
+            or geometry.get("sam3_required") is not False
+            or geometry.get("execution_orchestrator") != "runpod"
+        ):
+            return provenance_error("VGGT-Omega")
     if analysis_type == "dedup_ras_vggt_sam3":
         sam = result.get("sam")
         if not isinstance(sam, dict) or (
@@ -1962,7 +2857,11 @@ def run_stage2(payload: dict[str, Any]) -> dict[str, Any]:
     if mode == "dry_run":
         result = run_stage2_dry(payload)
     elif mode == "geometry":
-        result = run_stage2_geometry(payload)
+        result = (
+            run_stage2_omega_geometry(payload)
+            if analysis_type == VGGT_OMEGA_ANALYSIS_TYPE
+            else run_stage2_geometry(payload)
+        )
     else:
         result = run_stage2_full(payload)
     return _attach_success_provenance(result, mode=mode, analysis_type=analysis_type)
