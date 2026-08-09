@@ -292,8 +292,15 @@ def upload_artifact_file(
     media_type: str,
     *,
     timeout: int = 300,
+    require_put_acknowledgement: bool = False,
 ) -> dict[str, Any]:
-    """Upload one file and return a digest receipt suitable for result JSON."""
+    """Upload one file and return a digest receipt suitable for result JSON.
+
+    Production uploads recover an ambiguous PUT by verifying the durable
+    object. Transport canaries can require a direct PUT acknowledgement so an
+    object left by an earlier run cannot turn a blocked client into a false
+    success.
+    """
     file_path = Path(path)
     data = file_path.read_bytes()
     if not data:
@@ -367,6 +374,11 @@ def upload_artifact_file(
         except Exception as exc:
             failure = _upload_error("artifact_put", exc, index + 1)
             last = failure
+            if require_put_acknowledgement:
+                if not failure.retryable or index + 1 >= ATTEMPTS:
+                    raise failure from exc
+                time.sleep(min(2**index, 5))
+                continue
             # Even a deterministic HTTP response can follow an internal store
             # exception after the object landed. Confirm the durable state
             # before deciding whether this attempt failed.
