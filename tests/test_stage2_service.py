@@ -948,6 +948,13 @@ class Stage2ServiceTest(unittest.TestCase):
 
     def test_debug_artifacts_are_opt_in_and_default_glb_cap_is_300k(self):
         class PointCloud:
+            vertices = np.array(
+                [[10.0, 11.0, 12.0], [20.0, 21.0, 22.0]], dtype=np.float32
+            )
+            colors = np.array(
+                [[10, 20, 30, 255], [40, 50, 60, 255]], dtype=np.uint8
+            )
+
             def export(self, path):
                 Path(path).write_bytes(b"ply")
 
@@ -968,6 +975,16 @@ class Stage2ServiceTest(unittest.TestCase):
             stage2._export_vggt_artifacts(pred, out_dir)
             self.assertEqual([p.name for p in out_dir.iterdir()], [])
             self.assertEqual(write_glb.call_args.kwargs["max_points"], 300_000)
+            self.assertEqual(write_glb.call_args.kwargs["confidence_percentile"], 50.0)
+            self.assertEqual(
+                write_glb.call_args.kwargs["confidence_prefiltered_percentile"], 50.0
+            )
+            self.assertIsNone(write_glb.call_args.kwargs["confidence"])
+            self.assertEqual(write_glb.call_args.kwargs["coordinate_system"], "vggt_first_camera")
+            np.testing.assert_array_equal(write_glb.call_args.args[1], PointCloud.vertices)
+            np.testing.assert_array_equal(
+                write_glb.call_args.args[2], PointCloud.colors[:, :3]
+            )
 
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             stage2.os.environ,
@@ -993,6 +1010,45 @@ class Stage2ServiceTest(unittest.TestCase):
             )
             camera = json.loads((out_dir / "camera_intrinsics.json").read_text())
             self.assertEqual(camera["schema"], "vggt-camera-intrinsics-v1")
+
+    def test_preview_glb_fallback_never_pairs_depth_points_with_pointmap_confidence(self):
+        depth_conf = np.array([[[3.0, 4.0]]], dtype=np.float32)
+        pred = {
+            "world_points": np.zeros((1, 1, 2, 3), dtype=np.float32),
+            "colors": np.ones((1, 1, 2, 3), dtype=np.uint8),
+            "world_points_conf": np.array([[[100.0, 200.0]]], dtype=np.float32),
+            "depth_conf": depth_conf,
+            "point_cloud_data": object(),
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "point_cloud_glb.write_point_cloud_glb", return_value={"point_count": 2}
+        ) as write_glb:
+            stage2._export_vggt_artifacts(pred, Path(tmp))
+
+        self.assertIs(write_glb.call_args.kwargs["confidence"], depth_conf)
+        self.assertIsNone(
+            write_glb.call_args.kwargs["confidence_prefiltered_percentile"]
+        )
+
+        without_depth_conf = dict(pred)
+        without_depth_conf.pop("depth_conf")
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "point_cloud_glb.write_point_cloud_glb"
+        ) as write_glb:
+            result = stage2._export_vggt_artifacts(without_depth_conf, Path(tmp))
+        write_glb.assert_not_called()
+        self.assertNotIn("point_cloud_glb", result)
+        self.assertIn("matching depth confidence are unavailable", result["warnings"][0]["error"])
+
+    def test_room_alignment_fallback_is_not_reported_as_applied(self):
+        self.assertFalse(stage2._room_alignment_was_applied(np.eye(3), np.zeros(3)))
+        self.assertFalse(stage2._room_alignment_was_applied(np.full((3, 3), np.nan), np.zeros(3)))
+        rotation = np.array(
+            [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]],
+            dtype=np.float64,
+        )
+        self.assertTrue(stage2._room_alignment_was_applied(rotation, np.zeros(3)))
+        self.assertTrue(stage2._room_alignment_was_applied(np.eye(3), np.array([0.0, 0.0, 1.0])))
 
     def test_mask_video_is_h264_yuv420p_faststart_and_source_duration_aligned(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1279,6 +1335,12 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertEqual(document["meshes"][0]["primitives"][0]["mode"], 0)
         self.assertEqual(document["meshes"][1]["primitives"][0]["mode"], 1)
         self.assertFalse(document["extras"]["isSurfaceMesh"])
+        self.assertEqual(document["extras"]["coordinateSystem"], "vggt-first-camera-opengl-y-up")
+        self.assertEqual(document["extras"]["upAxis"], "Y")
+        self.assertEqual(document["extras"]["colorSpace"], "linear-srgb")
+        self.assertEqual(document["nodes"][0]["extras"]["role"], "point-cloud")
+        self.assertEqual(document["nodes"][1]["extras"]["role"], "camera-poses")
+        self.assertFalse(document["nodes"][1]["extras"]["defaultVisible"])
 
         bin_header_offset = 20 + json_length
         bin_length, bin_type = struct.unpack_from("<II", data, bin_header_offset)
@@ -1297,6 +1359,204 @@ class Stage2ServiceTest(unittest.TestCase):
                 view["byteOffset"] : view["byteOffset"] + view["byteLength"]
             ]
             self.assertEqual(color_data[3::4], b"\xff" * accessor["count"])
+
+    def test_glb_aligns_vggt_to_first_camera_and_encodes_linear_colors(self):
+        points = np.array(
+            [
+                [10.0, -1.0, 2.0],
+                [12.0, 1.0, 4.0],
+            ],
+            dtype=np.float32,
+        )
+        colors = np.full((2, 3), 128, dtype=np.uint8)
+        extrinsics = np.eye(4, dtype=np.float32)[None, ...]
+        extrinsics[0, 0, 3] = -10.0
+
+        data, _stats = build_point_cloud_glb(
+            points,
+            colors,
+            extrinsics=extrinsics,
+            confidence_percentile=0,
+        )
+        json_length = struct.unpack_from("<I", data, 12)[0]
+        document = json.loads(data[20 : 20 + json_length].decode().rstrip(" "))
+        bin_header_offset = 20 + json_length
+        binary = data[bin_header_offset + 8 :]
+
+        position_accessor = document["accessors"][0]
+        position_view = document["bufferViews"][position_accessor["bufferView"]]
+        position_bytes = binary[
+            position_view["byteOffset"] : position_view["byteOffset"] + position_view["byteLength"]
+        ]
+        exported_points = np.frombuffer(position_bytes, dtype="<f4").reshape(-1, 3)
+        np.testing.assert_allclose(
+            exported_points,
+            np.array([[0.0, 1.0, -2.0], [2.0, -1.0, -4.0]], dtype=np.float32),
+        )
+
+        color_accessor = document["accessors"][1]
+        color_view = document["bufferViews"][color_accessor["bufferView"]]
+        color_bytes = binary[
+            color_view["byteOffset"] : color_view["byteOffset"] + color_view["byteLength"]
+        ]
+        self.assertEqual(color_bytes[:4], bytes([55, 55, 55, 255]))
+        self.assertEqual(document["extras"]["sourceColorSpace"], "srgb")
+        self.assertEqual(document["extras"]["colorSpace"], "linear-srgb")
+        self.assertGreater(document["extras"]["previewRadius"], 0)
+        self.assertEqual(len(document["extras"]["previewCenter"]), 3)
+
+    def test_glb_camera_paths_share_the_rotated_first_camera_frame(self):
+        points = np.array([[-1.0, -1.0, 2.0], [1.0, 1.0, 4.0]], dtype=np.float32)
+        colors = np.full((2, 3), 255, dtype=np.uint8)
+        angle = np.radians(35.0)
+        rotation = np.array(
+            [
+                [np.cos(angle), 0.0, np.sin(angle)],
+                [0.0, 1.0, 0.0],
+                [-np.sin(angle), 0.0, np.cos(angle)],
+            ],
+            dtype=np.float32,
+        )
+        extrinsics = np.repeat(np.eye(4, dtype=np.float32)[None, ...], 2, axis=0)
+        extrinsics[0, :3, :3] = rotation
+        extrinsics[0, :3, 3] = [2.0, -1.0, 0.5]
+        extrinsics[1, :3, 3] = [-1.0, 0.5, 2.0]
+
+        data, _stats = build_point_cloud_glb(
+            points,
+            colors,
+            extrinsics=extrinsics,
+            confidence_percentile=0,
+        )
+        json_length = struct.unpack_from("<I", data, 12)[0]
+        document = json.loads(data[20 : 20 + json_length].decode().rstrip(" "))
+        binary = data[28 + json_length :]
+        camera_accessor_index = document["meshes"][1]["primitives"][0]["attributes"]["POSITION"]
+        camera_accessor = document["accessors"][camera_accessor_index]
+        camera_view = document["bufferViews"][camera_accessor["bufferView"]]
+        camera_bytes = binary[
+            camera_view["byteOffset"] : camera_view["byteOffset"] + camera_view["byteLength"]
+        ]
+        camera_points = np.frombuffer(camera_bytes, dtype="<f4").reshape(-1, 3)
+
+        np.testing.assert_allclose(camera_points[[0, 2, 4, 6]], np.zeros((4, 3)), atol=1e-5)
+        self.assertLess(float(camera_points[1, 2]), 0.0)
+        first_transform = np.diag([1.0, -1.0, -1.0, 1.0]) @ extrinsics[0]
+        second_origin_world = np.linalg.inv(extrinsics[1]) @ np.array([0.0, 0.0, 0.0, 1.0])
+        expected_second_origin = (first_transform @ second_origin_world)[:3]
+        np.testing.assert_allclose(camera_points[16], expected_second_origin, atol=1e-5)
+        np.testing.assert_allclose(camera_accessor["min"], camera_points.min(axis=0), atol=1e-5)
+        np.testing.assert_allclose(camera_accessor["max"], camera_points.max(axis=0), atol=1e-5)
+
+    def test_glb_reports_axis_only_fallback_for_invalid_first_camera(self):
+        points = np.array([[-1.0, -1.0, 2.0], [1.0, 1.0, 4.0]], dtype=np.float32)
+        colors = np.full((2, 3), 255, dtype=np.uint8)
+        extrinsics = np.eye(4, dtype=np.float32)[None, ...]
+        extrinsics[0, 0, 0] = 2.0
+
+        data, stats = build_point_cloud_glb(points, colors, extrinsics=extrinsics)
+        json_length = struct.unpack_from("<I", data, 12)[0]
+        document = json.loads(data[20 : 20 + json_length].decode().rstrip(" "))
+        self.assertEqual(document["extras"]["coordinateSystem"], "vggt-world-opengl-y-up")
+        self.assertFalse(document["extras"]["firstCameraAlignmentApplied"])
+        self.assertEqual(stats["camera_count"], 0)
+
+    def test_glb_confidence_contract_matches_applied_filter(self):
+        points = np.column_stack(
+            (np.arange(4, dtype=np.float32), np.zeros(4, dtype=np.float32), np.ones(4, dtype=np.float32))
+        )
+        colors = np.full((4, 3), 255, dtype=np.uint8)
+        confidence = np.array([0.0, 0.0, 1.0, 2.0], dtype=np.float32)
+
+        data, stats = build_point_cloud_glb(points, colors, confidence=confidence)
+        json_length = struct.unpack_from("<I", data, 12)[0]
+        document = json.loads(data[20 : 20 + json_length].decode().rstrip(" "))
+        self.assertTrue(document["extras"]["confidenceFilterApplied"])
+        self.assertEqual(document["extras"]["confidencePercentile"], 50.0)
+        self.assertEqual(document["extras"]["confidenceThreshold"], 0.5)
+        self.assertEqual(document["extras"]["pointCount"], 2)
+        self.assertTrue(stats["confidence_filter_applied"])
+        self.assertEqual(stats["confidence_filter_source"], "exporter")
+        self.assertEqual(stats["confidence_percentile"], 50.0)
+        self.assertEqual(stats["confidence_threshold"], 0.5)
+
+        no_confidence_data, no_confidence_stats = build_point_cloud_glb(points, colors)
+        no_confidence_json_length = struct.unpack_from("<I", no_confidence_data, 12)[0]
+        no_confidence_document = json.loads(
+            no_confidence_data[20 : 20 + no_confidence_json_length].decode().rstrip(" ")
+        )
+        self.assertFalse(no_confidence_document["extras"]["confidenceFilterApplied"])
+        self.assertIsNone(no_confidence_document["extras"]["confidencePercentile"])
+        self.assertIsNone(no_confidence_stats["confidence_percentile"])
+
+        prefiltered_data, prefiltered_stats = build_point_cloud_glb(
+            points,
+            colors,
+            confidence_prefiltered_percentile=50,
+        )
+        prefiltered_json_length = struct.unpack_from("<I", prefiltered_data, 12)[0]
+        prefiltered_document = json.loads(
+            prefiltered_data[20 : 20 + prefiltered_json_length].decode().rstrip(" ")
+        )
+        self.assertTrue(prefiltered_document["extras"]["confidenceFilterApplied"])
+        self.assertEqual(
+            prefiltered_document["extras"]["confidenceFilterSource"],
+            "upstream-depth-prefiltered",
+        )
+        self.assertEqual(prefiltered_document["extras"]["confidencePercentile"], 50.0)
+        self.assertIsNone(prefiltered_document["extras"]["confidenceThreshold"])
+        self.assertEqual(
+            prefiltered_stats["confidence_filter_source"],
+            "upstream-depth-prefiltered",
+        )
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            build_point_cloud_glb(
+                points,
+                colors,
+                confidence=confidence,
+                confidence_prefiltered_percentile=50,
+            )
+
+        with self.assertRaisesRegex(ValueError, "fewer than two"):
+            build_point_cloud_glb(
+                np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
+                np.array([[255, 255, 255]], dtype=np.uint8),
+                confidence_prefiltered_percentile=50,
+            )
+
+    def test_glb_converts_room_aligned_z_up_geometry_to_gltf_y_up(self):
+        points = np.array(
+            [
+                [0.0, 2.0, 0.0],
+                [0.0, 2.0, 3.0],
+            ],
+            dtype=np.float32,
+        )
+        colors = np.full((2, 3), 255, dtype=np.uint8)
+
+        data, _stats = build_point_cloud_glb(
+            points,
+            colors,
+            confidence_percentile=0,
+            coordinate_system="room_z_up",
+        )
+        json_length = struct.unpack_from("<I", data, 12)[0]
+        document = json.loads(data[20 : 20 + json_length].decode().rstrip(" "))
+        bin_header_offset = 20 + json_length
+        binary = data[bin_header_offset + 8 :]
+        accessor = document["accessors"][0]
+        view = document["bufferViews"][accessor["bufferView"]]
+        position_bytes = binary[view["byteOffset"] : view["byteOffset"] + view["byteLength"]]
+        exported_points = np.frombuffer(position_bytes, dtype="<f4").reshape(-1, 3)
+
+        np.testing.assert_allclose(
+            exported_points,
+            np.array([[0.0, 0.0, -2.0], [0.0, 3.0, -2.0]], dtype=np.float32),
+        )
+        self.assertEqual(document["extras"]["coordinateSystem"], "room-aligned-gltf-y-up")
+        self.assertEqual(document["extras"]["upAxis"], "Y")
+        self.assertFalse(document["extras"]["firstCameraAlignmentApplied"])
 
     def test_glb_hard_cap_stays_within_signed_16_mib_contract(self):
         count = GLB_HARD_MAX_POINTS + 101
@@ -1370,7 +1630,7 @@ class Stage2ServiceTest(unittest.TestCase):
                 np.zeros((2, 3), dtype=np.float32),
                 np.zeros((1, 3), dtype=np.uint8),
             )
-        with self.assertRaisesRegex(ValueError, "no finite"):
+        with self.assertRaisesRegex(ValueError, "fewer than two"):
             build_point_cloud_glb(
                 np.full((2, 3), np.nan, dtype=np.float32),
                 np.zeros((2, 3), dtype=np.uint8),

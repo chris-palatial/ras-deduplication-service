@@ -1102,30 +1102,79 @@ def _env_int(name: str, default: int, low: int, high: int) -> int:
     return max(low, min(value, high))
 
 
-def _env_float(name: str, default: float, low: float, high: float) -> float:
-    try:
-        value = float(os.environ.get(name, str(default)))
-    except (TypeError, ValueError):
-        value = default
-    return max(low, min(value, high))
-
-
 def _debug_artifacts_enabled() -> bool:
     return os.environ.get("STAGE2_EXPORT_DEBUG_ARTIFACTS", "").strip() == "1"
 
 
-def _export_vggt_artifacts(pred: dict[str, Any], out_dir: Path) -> dict[str, Any]:
+def _room_alignment_was_applied(rotation: Any, translation: Any) -> bool:
+    """Distinguish RAS's identity/zero fallback from a real room alignment."""
+    import numpy as np
+
+    R = np.asarray(rotation, dtype=np.float64)
+    t = np.asarray(translation, dtype=np.float64)
+    if R.shape != (3, 3) or t.shape != (3,) or not np.isfinite(R).all() or not np.isfinite(t).all():
+        return False
+    return not (
+        np.allclose(R, np.eye(3), atol=1e-6)
+        and np.allclose(t, np.zeros(3), atol=1e-6)
+    )
+
+
+def _upstream_preview_point_cloud(pred: dict[str, Any]) -> tuple[Any, Any] | None:
+    """Return RAS's depth-confidence-filtered preview points when available."""
+    import numpy as np
+
+    cloud = pred.get("point_cloud_data")
+    if cloud is None:
+        return None
+    vertices = np.asarray(getattr(cloud, "vertices", None))
+    colors = np.asarray(getattr(cloud, "colors", None))
+    if (
+        vertices.ndim != 2
+        or vertices.shape[1] != 3
+        or len(vertices) == 0
+        or colors.ndim != 2
+        or colors.shape[0] != len(vertices)
+        or colors.shape[1] < 3
+    ):
+        return None
+    return vertices, colors[:, :3]
+
+
+def _export_vggt_artifacts(
+    pred: dict[str, Any],
+    out_dir: Path,
+    *,
+    coordinate_system: str = "vggt_first_camera",
+) -> dict[str, Any]:
     """Export the compact viewer GLB; large compatibility files are opt-in."""
     from point_cloud_glb import GLB_HARD_MAX_POINTS, write_point_cloud_glb
 
     exported: dict[str, Any] = {}
     warnings: list[dict[str, str]] = []
     try:
+        upstream_cloud = _upstream_preview_point_cloud(pred)
+        if upstream_cloud is not None:
+            preview_points, preview_colors = upstream_cloud
+            preview_confidence = None
+            prefiltered_percentile = 50.0
+        else:
+            # A raw fallback is safe only when its matching depth-confidence
+            # branch is explicitly present. Never silently downgrade preview
+            # quality or pair depth points with point-map confidence.
+            preview_points = pred["world_points"]
+            preview_colors = pred["colors"]
+            preview_confidence = pred.get("depth_conf")
+            if preview_confidence is None:
+                raise ValueError(
+                    "RAS preview point cloud and matching depth confidence are unavailable"
+                )
+            prefiltered_percentile = None
         exported["point_cloud_glb"] = write_point_cloud_glb(
             out_dir / "point_cloud.glb",
-            pred["world_points"],
-            pred["colors"],
-            confidence=pred.get("world_points_conf"),
+            preview_points,
+            preview_colors,
+            confidence=preview_confidence,
             extrinsics=pred.get("extrinsics"),
             max_points=_env_int(
                 "STAGE2_POINT_CLOUD_MAX_POINTS",
@@ -1133,9 +1182,9 @@ def _export_vggt_artifacts(pred: dict[str, Any], out_dir: Path) -> dict[str, Any
                 10_000,
                 GLB_HARD_MAX_POINTS,
             ),
-            confidence_percentile=_env_float(
-                "STAGE2_POINT_CLOUD_CONFIDENCE_PERCENTILE", 25.0, 0.0, 100.0
-            ),
+            confidence_percentile=50.0,
+            confidence_prefiltered_percentile=prefiltered_percentile,
+            coordinate_system=coordinate_system,
         )
     except Exception as exc:
         warnings.append({"name": "point_cloud.glb", "error": f"{type(exc).__name__}: {exc}"})
@@ -1212,7 +1261,11 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
         timings["vggt"] = int((time.time() - t0) * 1000)
 
         t0 = time.time()
-        export_meta = _export_vggt_artifacts(pred, out_dir) if _artifact_exports_enabled(payload) else {}
+        export_meta = _export_vggt_artifacts(
+            pred,
+            out_dir,
+            coordinate_system="vggt_first_camera",
+        ) if _artifact_exports_enabled(payload) else {}
         timings["artifact_export"] = int((time.time() - t0) * 1000)
 
         t0 = time.time()
@@ -1341,12 +1394,15 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
         timings["vggt"] = int((time.time() - t0) * 1000)
 
         wall_masks, floor_masks = [], []
+        room_alignment_applied = False
         if room_align:
             t0 = time.time()
             sam3_image = load_sam3_image_model()
             wall_masks, floor_masks = segment_wall_and_floor(pred["colors"], sam3_image)
             R, t = align_to_room_coordinate_system(pred["world_points"], wall_masks, floor_masks)
-            pred = align_vggt_predictions(pred, R, t)
+            room_alignment_applied = _room_alignment_was_applied(R, t)
+            if room_alignment_applied:
+                pred = align_vggt_predictions(pred, R, t)
             unload_model(sam3_image)
             timings["room_align"] = int((time.time() - t0) * 1000)
         else:
@@ -1357,7 +1413,11 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
         color_dir.mkdir(parents=True, exist_ok=True)
         for i, image in enumerate(pred["colors"]):
             cv2.imwrite(str(color_dir / f"{i}.jpg"), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-        export_meta = _export_vggt_artifacts(pred, out_dir) if _artifact_exports_enabled(payload) else {}
+        export_meta = _export_vggt_artifacts(
+            pred,
+            out_dir,
+            coordinate_system="room_z_up" if room_alignment_applied else "vggt_first_camera",
+        ) if _artifact_exports_enabled(payload) else {}
 
         t0 = time.time()
         sam3_video = load_sam3_video_model()
@@ -1418,6 +1478,8 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
                 "model_id": _vggt_model_id(),
                 "license_scope": _vggt_license_scope(),
                 "room_align": room_align,
+                "room_align_requested": room_align,
+                "room_alignment_applied": room_alignment_applied,
                 "wall_mask_frames": len(wall_masks),
                 "floor_mask_frames": len(floor_masks),
                 "artifact_export": export_meta,
@@ -1433,7 +1495,11 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
                 {"id": "intake", "status": "ok", "ms": timings.get("download")},
                 {"id": "sample_frames", "status": "ok", "ms": timings.get("sample")},
                 {"id": "vggt", "status": "ok", "ms": timings.get("vggt")},
-                {"id": "room_align", "status": "ok" if room_align else "skipped", "ms": timings.get("room_align")},
+                {
+                    "id": "room_align",
+                    "status": "ok" if room_alignment_applied else "not_applied" if room_align else "skipped",
+                    "ms": timings.get("room_align"),
+                },
                 {"id": "sam_dedup", "status": "ok", "ms": timings.get("sam_dedup_vis")},
                 {"id": "mask_video", "status": "ok", "ms": timings.get("mask_video_normalize")},
                 {
