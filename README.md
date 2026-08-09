@@ -1,6 +1,7 @@
-# ReplicateAnyScene Stage 2 service
+# ReplicateAnyScene Stage 2 + VGGT-Omega geometry service
 
-Thin RunPod / HTTP wrapper around the **public paper repo** Stage 2 only.
+Thin RunPod / HTTP wrapper around the **public paper repo** Stage 2, plus a
+geometry-only adapter for Meta's official VGGT-Omega Hugging Face Space.
 
 We do **not** reimplement VGGT, SAM3, or spatial dedup here.
 Those live in:
@@ -12,7 +13,7 @@ Those live in:
 
 | File | Role |
 | --- | --- |
-| `stage2_service.py` | Calls RAS Stage 2 sequence; model-free and VGGT-only preflight modes |
+| `stage2_service.py` | Calls RAS Stage 2; provides model-free, local VGGT, and hosted VGGT-Omega geometry modes |
 | `point_cloud_glb.py` | Exports bounded colored VGGT points + camera frustums as glTF 2.0 GLB |
 | `artifact_upload.py` | Uses Agent Lab upload tickets to deliver files to R2 and return receipts |
 | `handler.py` | RunPod Serverless entry |
@@ -27,11 +28,63 @@ Those live in:
 - `full` — exact RAS Stage 2 path (stops before Stage 3 mesh generation)
 
 New Agent Lab requests also carry a stable `analysis_type`. This worker owns
-`validation_v1`, `geometry_vggt_1b`, and `dedup_ras_vggt_sam3`; it rejects fal
-mask types and `geometry_vggt_omega_1b` because those belong to separate
-backends. Typed results preserve the analysis id on both success and failure;
-VGGT results also echo the checkpoint repository and exact source revision.
+`validation_v1`, `geometry_vggt_1b`, `geometry_vggt_omega_1b`, and
+`dedup_ras_vggt_sam3`; it rejects fal mask types because those belong to a
+separate backend. Typed results preserve the analysis id on both success and
+failure and verify the model runner's provenance instead of rewriting it.
 Legacy requests without `analysis_type` remain supported.
+
+### Hosted VGGT-Omega geometry
+
+`geometry_vggt_omega_1b` is genuine VGGT-Omega inference through Meta's
+official [`facebook/vggt-omega`](https://huggingface.co/spaces/facebook/vggt-omega)
+Space. RunPod still owns input validation, exact frame extraction, orchestration,
+artifact validation, and durable Agent Lab delivery. This path does not clone
+or load local VGGT/SAM3/RAS model code and does not bypass the gated
+VGGT-Omega checkpoint. It is geometry-only: it returns a point-cloud GLB and
+never claims SAM masks, physical-object deduplication, or the complete RAS
+pipeline.
+
+The adapter is fail-closed around the reviewed contract:
+
+- The Space repository and running replica must both report revision
+  `2597ec6a276ea34d26206087a511f517e2a0024f` before and after inference.
+- At most 24 uniformly spaced decoded source frames are JPEG-encoded in exact
+  index order and uploaded as images. The Space receives no input video and
+  therefore cannot silently choose a different FPS sample.
+- The official `update_gallery_on_upload` call runs first, followed by
+  `gradio_demo` with the 50th-percentile confidence setting and a requested
+  maximum of 500,000 points.
+- The returned file must use HTTPS on the exact
+  `facebook-vggt-omega.hf.space` Gradio artifact host. Redirects, credentials,
+  alternate ports, non-Gradio paths, files over 16 MiB, and invalid glTF 2.0
+  GLB containers or mandatory JSON chunks are rejected before durable
+  publication.
+- One monotonic result deadline covers both stateful Gradio calls. SSE
+  heartbeats cannot extend that deadline and keep the paid RunPod worker alive.
+- Inference starts only when an upload ticket or persistent artifact root can
+  outlive the worker. `STAGE2_KEEP_WORK=1` alone is a debug aid, not durable
+  delivery.
+- Temporary Space URLs, replica-local handles, credentials, and worker paths
+  are never included in result JSON. The normal artifact manifest contains
+  only Agent Lab R2 receipts.
+
+Successful results report model id `facebook/VGGT-Omega`, the pinned Space
+revision above, audited upstream GitHub revision
+`39a0cb8af88554f15ddcb5354cd52bde588fa014`, audited model-repository revision
+`05654241adc2f218dfb089c373a011f8a7040576`, checkpoint filename
+`vggt_omega_1b_512.pt`, backend `huggingface_space`, and provenance level
+`hosted_unattested`. The last label is intentional: the reviewed Space source
+downloads that checkpoint without passing a revision to `hf_hub_download`, so
+the worker can attest the Space code it called but cannot cryptographically
+attest which checkpoint bytes its remote replica loaded.
+
+This integration is suitable for internal research comparison, not a
+production availability promise. It adds a second hosted queue with its own
+ZeroGPU quota, cold starts, and no service-level guarantee. Queue exhaustion,
+revision drift, malformed responses, timeouts, and artifact-delivery failures
+remain explicit job failures; the worker never substitutes local VGGT-1B or a
+synthetic result.
 
 ## Weights
 
@@ -126,6 +179,9 @@ printing request credentials or endpoint output when verification does not pass.
 ```json
 {
   "input": {
+    "analysis_type": "geometry_vggt_omega_1b",
+    "expected_geometry_model_id": "facebook/VGGT-Omega",
+    "expected_geometry_source_revision": "2597ec6a276ea34d26206087a511f517e2a0024f",
     "video_url": "https://…/clip.mp4",
     "categories": ["chair", "table"],
     "max_frames": 24,

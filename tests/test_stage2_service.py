@@ -32,6 +32,22 @@ class Stage2ServiceTest(unittest.TestCase):
 
         self.assertIn("pycocotools==2.0.11", requirements.splitlines())
 
+    def test_deployment_packaging_includes_shared_artifact_contract(self):
+        root = Path(__file__).resolve().parents[1]
+        dockerfile = (root / "Dockerfile").read_text()
+        workflow = (root / ".github" / "workflows" / "ci.yml").read_text()
+
+        wrapper_copy = next(
+            line for line in dockerfile.splitlines()
+            if line.startswith("COPY stage2_service.py")
+        )
+        compile_step = next(
+            line for line in workflow.splitlines()
+            if "python -m py_compile" in line
+        )
+        self.assertIn("artifact_contract.py", wrapper_copy)
+        self.assertIn("artifact_contract.py", compile_step)
+
     def test_endpoint_response_reports_exact_code_revision(self):
         revision = "0123456789abcdef0123456789abcdef01234567"
         with tempfile.TemporaryDirectory() as tmp:
@@ -671,7 +687,6 @@ class Stage2ServiceTest(unittest.TestCase):
 
     def test_analysis_type_explicitly_rejects_backends_not_owned_by_this_worker(self):
         cases = (
-            ("geometry_vggt_omega_1b", "geometry", "VGGT-Omega endpoint"),
             ("mask_sam3", "full", "fal SAM 3 adapter"),
             ("mask_sam31", "full", "fal SAM 3.1 adapter"),
         )
@@ -2256,6 +2271,587 @@ class Stage2ServiceTest(unittest.TestCase):
                 np.full((2, 3), np.nan, dtype=np.float32),
                 np.zeros((2, 3), dtype=np.uint8),
             )
+
+
+class OmegaHTTPResponse:
+    def __init__(
+        self,
+        *,
+        status_code=200,
+        json_value=None,
+        lines=None,
+        chunks=None,
+        headers=None,
+    ):
+        self.status_code = status_code
+        self._json_value = json_value
+        self._lines = list(lines or [])
+        self._chunks = list(chunks or [])
+        self.headers = dict(headers or {})
+        self.closed = False
+
+    def json(self):
+        if isinstance(self._json_value, Exception):
+            raise self._json_value
+        return self._json_value
+
+    def iter_lines(self, decode_unicode=False):
+        del decode_unicode
+        yield from self._lines
+
+    def iter_content(self, chunk_size):
+        self.chunk_size = chunk_size
+        yield from self._chunks
+
+    def close(self):
+        self.closed = True
+
+
+class VggtOmegaAdapterTest(unittest.TestCase):
+    @staticmethod
+    def _space_metadata(revision=None, *, stage="RUNNING"):
+        revision = revision or stage2.VGGT_OMEGA_SPACE_REVISION
+        return {
+            "id": stage2.VGGT_OMEGA_SPACE_ID,
+            "sha": revision,
+            "runtime": {"sha": revision, "stage": stage},
+        }
+
+    @staticmethod
+    def _geometry_provenance():
+        return {
+            "backend": "huggingface_space",
+            "model_id": stage2.VGGT_OMEGA_MODEL_ID,
+            "source_revision": stage2.VGGT_OMEGA_SPACE_REVISION,
+            "space_id": stage2.VGGT_OMEGA_SPACE_ID,
+            "space_revision": stage2.VGGT_OMEGA_SPACE_REVISION,
+            "github_source_revision": stage2.VGGT_OMEGA_GITHUB_REVISION,
+            "model_repository_revision": stage2.VGGT_OMEGA_MODEL_REVISION,
+            "checkpoint_filename": stage2.VGGT_OMEGA_CHECKPOINT,
+            "provenance_level": stage2.VGGT_OMEGA_PROVENANCE_LEVEL,
+            "license_scope": "research_noncommercial",
+            "sam3_required": False,
+            "execution_orchestrator": "runpod",
+        }
+
+    @staticmethod
+    def _minimal_glb() -> bytes:
+        json_chunk = json.dumps(
+            {"asset": {"version": "2.0"}},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        json_chunk += b" " * (-len(json_chunk) % 4)
+        total_length = 12 + 8 + len(json_chunk)
+        return (
+            struct.pack("<4sII", b"glTF", 2, total_length)
+            + struct.pack("<II", len(json_chunk), stage2._GLB_JSON_CHUNK)
+            + json_chunk
+        )
+
+    def test_omega_analysis_routes_only_to_dedicated_geometry_runner(self):
+        runner_result = {
+            "status": "ok",
+            "mode": "geometry",
+            "geometry": self._geometry_provenance(),
+        }
+        request = {
+            "analysis_type": stage2.VGGT_OMEGA_ANALYSIS_TYPE,
+            "mode": "geometry",
+            "categories": ["chair"],
+            "max_frames": 160,
+            "expected_geometry_model_id": stage2.VGGT_OMEGA_MODEL_ID,
+            "expected_geometry_source_revision": stage2.VGGT_OMEGA_SPACE_REVISION,
+        }
+        with patch.object(
+            stage2,
+            "run_stage2_omega_geometry",
+            return_value=runner_result,
+        ) as omega_runner, patch.object(stage2, "run_stage2_geometry") as vggt_runner:
+            result = stage2.run_stage2(request)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["analysis_type"], stage2.VGGT_OMEGA_ANALYSIS_TYPE)
+        self.assertEqual(omega_runner.call_args.args[0]["max_frames"], 160)
+        omega_runner.assert_called_once()
+        vggt_runner.assert_not_called()
+
+    def test_omega_analysis_rejects_wrong_mode_and_caller_identity(self):
+        common = {
+            "analysis_type": stage2.VGGT_OMEGA_ANALYSIS_TYPE,
+            "mode": "geometry",
+            "categories": ["chair"],
+            "max_frames": 24,
+        }
+        wrong_mode = stage2.run_stage2({**common, "mode": "full"})
+        self.assertEqual(wrong_mode["status"], "error")
+        self.assertIn("requires mode geometry", wrong_mode["error"])
+
+        wrong_model = stage2.run_stage2({
+            **common,
+            "expected_geometry_model_id": stage2.DEFAULT_VGGT_MODEL_ID,
+        })
+        self.assertEqual(wrong_model["status"], "error")
+        self.assertIn("expected_geometry_model_id", wrong_model["error"])
+
+        wrong_revision = stage2.run_stage2({
+            **common,
+            "expected_geometry_source_revision": "0" * 40,
+        })
+        self.assertEqual(wrong_revision["status"], "error")
+        self.assertIn("expected_geometry_source_revision", wrong_revision["error"])
+
+    def test_omega_provenance_is_verified_field_by_field(self):
+        expected = self._geometry_provenance()
+        mutations = {
+            "backend": "local",
+            "model_id": stage2.DEFAULT_VGGT_MODEL_ID,
+            "source_revision": "0" * 40,
+            "space_id": "attacker/space",
+            "space_revision": "1" * 40,
+            "github_source_revision": "2" * 40,
+            "model_repository_revision": "3" * 40,
+            "checkpoint_filename": "other.pt",
+            "provenance_level": "verified_checkpoint",
+            "license_scope": "commercial",
+            "sam3_required": True,
+            "execution_orchestrator": "browser",
+        }
+        for field, wrong_value in mutations.items():
+            with self.subTest(field=field):
+                geometry = {**expected, field: wrong_value}
+                result = stage2._attach_success_provenance(
+                    {"status": "ok", "mode": "geometry", "geometry": geometry},
+                    mode="geometry",
+                    analysis_type=stage2.VGGT_OMEGA_ANALYSIS_TYPE,
+                )
+                self.assertEqual(result["status"], "error")
+                self.assertIn("VGGT-Omega", result["error"])
+                self.assertNotIn("geometry", result)
+
+    def test_omega_uniform_frame_plan_includes_endpoints_and_short_clips_once(self):
+        entries = [{"best_effort_timestamp_time": str(index / 30)} for index in range(327)]
+        with patch.object(stage2, "_ffprobe_json", return_value={"frames": entries}):
+            indices, timestamps = stage2._source_frame_plan(Path("clip.mp4"), 24)
+        expected = np.linspace(0, 326, 24).astype(int).tolist()
+        self.assertEqual(indices, expected)
+        self.assertEqual(indices[0], 0)
+        self.assertEqual(indices[-1], 326)
+        self.assertEqual(len(timestamps), 24)
+
+        short_entries = [{"best_effort_timestamp_time": str(index / 30)} for index in range(3)]
+        with patch.object(stage2, "_ffprobe_json", return_value={"frames": short_entries}):
+            short_indices, _ = stage2._source_frame_plan(Path("short.mp4"), 24)
+        self.assertEqual(short_indices, [0, 1, 2])
+
+    def test_omega_frame_extraction_caps_at_24_and_uses_the_exact_plan(self):
+        expected_indices = np.linspace(0, 326, 24).astype(int).tolist()
+
+        class Capture:
+            def __init__(self):
+                self.index = 0
+                self.released = False
+
+            def isOpened(self):
+                return True
+
+            def read(self):
+                if self.index >= 327:
+                    return False, None
+                frame = self.index
+                self.index += 1
+                return True, frame
+
+            def release(self):
+                self.released = True
+
+        capture = Capture()
+
+        def write_frame(filename, frame, params):
+            del frame, params
+            Path(filename).write_bytes(b"jpeg")
+            return True
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            stage2,
+            "_source_frame_plan",
+            return_value=(expected_indices, [float(i) for i in range(24)]),
+        ) as plan, patch("cv2.VideoCapture", return_value=capture), patch(
+            "cv2.imwrite",
+            side_effect=write_frame,
+        ):
+            paths, indices, timestamps = stage2._sample_vggt_omega_frames(
+                Path("clip.mp4"),
+                Path(tmp),
+                160,
+            )
+
+        plan.assert_called_once_with(Path("clip.mp4"), 24)
+        self.assertEqual(indices, expected_indices)
+        self.assertEqual(timestamps, [float(i) for i in range(24)])
+        self.assertEqual(len(paths), 24)
+        self.assertEqual([path.name for path in paths], [f"{i:06d}.jpg" for i in range(24)])
+        self.assertEqual(capture.index, 327)
+        self.assertTrue(capture.released)
+
+    def test_omega_missing_exact_frame_and_upload_over_cap_fail_closed(self):
+        class ShortCapture:
+            def __init__(self):
+                self.index = 0
+
+            def isOpened(self):
+                return True
+
+            def read(self):
+                if self.index >= 2:
+                    return False, None
+                self.index += 1
+                return True, self.index
+
+            def release(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            stage2,
+            "_source_frame_plan",
+            return_value=([0, 2], [0.0, 1.0]),
+        ), patch("cv2.VideoCapture", return_value=ShortCapture()), patch(
+            "cv2.imwrite",
+            side_effect=lambda filename, _frame, _params: Path(filename).write_bytes(b"jpeg") or True,
+        ), self.assertRaisesRegex(stage2.VggtOmegaSpaceError, "ended before"):
+            stage2._sample_vggt_omega_frames(Path("clip.mp4"), Path(tmp), 24)
+
+        with patch("requests.post") as post, self.assertRaisesRegex(
+            stage2.VggtOmegaSpaceError,
+            "between 2 and 24",
+        ):
+            stage2._upload_vggt_omega_frames([Path(f"{i}.jpg") for i in range(25)])
+        post.assert_not_called()
+
+    def test_omega_calls_every_official_endpoint_with_exact_contract(self):
+        glb = self._minimal_glb()
+        glb_url = f"{stage2.VGGT_OMEGA_SPACE_ORIGIN}/gradio_api/file=/tmp/scene.glb"
+        metadata_before = OmegaHTTPResponse(json_value=self._space_metadata())
+        prepare_stream = OmegaHTTPResponse(lines=[
+            "event: complete",
+            'data: [[], "/tmp/opaque-session", [], {"interactive": true}]',
+        ])
+        demo_stream = OmegaHTTPResponse(lines=[
+            "event: complete",
+            "data: " + json.dumps([
+                {
+                    "url": glb_url,
+                    "meta": {"_type": "gradio.FileData"},
+                },
+                "Complete",
+            ]),
+        ])
+        glb_response = OmegaHTTPResponse(
+            chunks=[glb],
+            headers={"content-length": str(len(glb))},
+        )
+        metadata_after = OmegaHTTPResponse(json_value=self._space_metadata())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frames = []
+            for index in range(2):
+                frame = root / f"{index:06d}.jpg"
+                frame.write_bytes(b"jpeg")
+                frames.append(frame)
+            destination = root / "output" / "point_cloud.glb"
+            post_responses = [
+                OmegaHTTPResponse(json_value=["/tmp/upload-a", "/tmp/upload-b"]),
+                OmegaHTTPResponse(json_value={"event_id": "prepare-event"}),
+                OmegaHTTPResponse(json_value={"event_id": "demo-event"}),
+            ]
+            get_responses = [
+                metadata_before,
+                prepare_stream,
+                demo_stream,
+                glb_response,
+                metadata_after,
+            ]
+            with patch("requests.post", side_effect=post_responses) as post, patch(
+                "requests.get",
+                side_effect=get_responses,
+            ) as get:
+                result = stage2._run_vggt_omega_space(frames, destination)
+
+            self.assertEqual(destination.read_bytes(), glb)
+
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(get.call_count, 5)
+        self.assertEqual(
+            get.call_args_list[0].args[0],
+            stage2.VGGT_OMEGA_METADATA_URL,
+        )
+        self.assertEqual(
+            post.call_args_list[0].args[0],
+            f"{stage2.VGGT_OMEGA_SPACE_ORIGIN}/gradio_api/upload",
+        )
+        self.assertEqual(len(post.call_args_list[0].kwargs["files"]), 2)
+        prepare_data = post.call_args_list[1].kwargs["json"]["data"]
+        self.assertIsNone(prepare_data[0])
+        self.assertEqual(len(prepare_data[1]), 2)
+        self.assertEqual(prepare_data[2], 1.0)
+        demo_data = post.call_args_list[2].kwargs["json"]["data"]
+        self.assertEqual(
+            demo_data,
+            ["/tmp/opaque-session", 50.0, False, False, True, False, 500],
+        )
+        self.assertEqual(get.call_args_list[3].args[0], glb_url)
+        self.assertFalse(get.call_args_list[3].kwargs["allow_redirects"])
+        self.assertEqual(result["space_revision"], stage2.VGGT_OMEGA_SPACE_REVISION)
+        self.assertEqual(result["max_points"], 500_000)
+        self.assertNotIn("opaque-session", json.dumps(result))
+        self.assertNotIn(glb_url, json.dumps(result))
+
+    def test_omega_revision_mismatch_blocks_upload_and_nonrunning_space(self):
+        bad_revision = OmegaHTTPResponse(json_value=self._space_metadata("0" * 40))
+        with patch("requests.get", return_value=bad_revision), patch("requests.post") as post:
+            with self.assertRaisesRegex(stage2.VggtOmegaSpaceError, "revision changed"):
+                stage2._run_vggt_omega_space([Path("a.jpg"), Path("b.jpg")], Path("out.glb"))
+        post.assert_not_called()
+
+        stopped = OmegaHTTPResponse(json_value=self._space_metadata(stage="STOPPED"))
+        with patch("requests.get", return_value=stopped), self.assertRaises(
+            stage2.VggtOmegaSpaceError,
+        ):
+            stage2._verify_vggt_omega_space_revision()
+
+    def test_omega_post_execution_revision_failure_discards_download(self):
+        glb = self._minimal_glb()
+        safe_url = f"{stage2.VGGT_OMEGA_SPACE_ORIGIN}/gradio_api/file=/tmp/scene.glb"
+        revision = {
+            "space_id": stage2.VGGT_OMEGA_SPACE_ID,
+            "space_revision": stage2.VGGT_OMEGA_SPACE_REVISION,
+        }
+
+        def downloaded(_url, destination):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(glb)
+            return len(glb)
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            stage2,
+            "_verify_vggt_omega_space_revision",
+            side_effect=[
+                revision,
+                stage2.VggtOmegaSpaceError(
+                    "omega_space_revision_mismatch",
+                    "Official VGGT-Omega Space revision changed.",
+                ),
+            ],
+        ), patch.object(stage2, "_upload_vggt_omega_frames", return_value=[{}, {}]), patch.object(
+            stage2,
+            "_submit_vggt_omega_gradio",
+            side_effect=["prepare", "demo"],
+        ), patch.object(
+            stage2,
+            "_wait_vggt_omega_gradio",
+            side_effect=[
+                [[], "/tmp/opaque-session", [], {}],
+                [{"url": safe_url, "meta": {"_type": "gradio.FileData"}}, "Complete"],
+            ],
+        ), patch.object(stage2, "_download_vggt_omega_glb", side_effect=downloaded):
+            destination = Path(tmp) / "point_cloud.glb"
+            with self.assertRaises(stage2.VggtOmegaSpaceError):
+                stage2._run_vggt_omega_space([Path("a.jpg"), Path("b.jpg")], destination)
+            self.assertFalse(destination.exists())
+            self.assertFalse((Path(tmp) / ".point_cloud.glb.omega-download").exists())
+
+    def test_omega_glb_url_and_filedata_are_strictly_allowlisted(self):
+        good = {
+            "url": f"{stage2.VGGT_OMEGA_SPACE_ORIGIN}/gradio_api/file=/tmp/scene.glb",
+            "meta": {"_type": "gradio.FileData"},
+        }
+        self.assertEqual(stage2._vggt_omega_glb_url(good), good["url"])
+        unsafe = (
+            {**good, "url": "http://facebook-vggt-omega.hf.space/gradio_api/file=/tmp/a.glb"},
+            {**good, "url": "https://facebook-vggt-omega.hf.space.attacker.test/gradio_api/file=/tmp/a.glb"},
+            {**good, "url": "https://user:pass@facebook-vggt-omega.hf.space/gradio_api/file=/tmp/a.glb"},
+            {**good, "url": "https://facebook-vggt-omega.hf.space:444/gradio_api/file=/tmp/a.glb"},
+            {**good, "url": "https://facebook-vggt-omega.hf.space/not-gradio/a.glb"},
+            {**good, "url": good["url"] + "#fragment"},
+            {"url": good["url"]},
+        )
+        for file_data in unsafe:
+            with self.subTest(url=file_data.get("url")), self.assertRaises(
+                stage2.VggtOmegaSpaceError,
+            ):
+                stage2._vggt_omega_glb_url(file_data)
+
+        with patch("requests.get") as get, self.assertRaises(stage2.VggtOmegaSpaceError):
+            stage2._download_vggt_omega_glb(
+                "https://attacker.test/gradio_api/file=/tmp/a.glb",
+                Path("never-created.glb"),
+            )
+        get.assert_not_called()
+
+    def test_omega_glb_enforces_contract_stream_cap_and_magic(self):
+        self.assertEqual(stage2.GLB_MAX_BYTES, 16 * 1024 * 1024)
+        safe_url = f"{stage2.VGGT_OMEGA_SPACE_ORIGIN}/gradio_api/file=/tmp/scene.glb"
+        with tempfile.TemporaryDirectory() as tmp, patch.object(stage2, "GLB_MAX_BYTES", 16):
+            destination = Path(tmp) / "point_cloud.glb"
+            declared = OmegaHTTPResponse(headers={"content-length": "17"})
+            with patch("requests.get", return_value=declared), self.assertRaisesRegex(
+                stage2.VggtOmegaSpaceError,
+                "exceeds",
+            ):
+                stage2._download_vggt_omega_glb(safe_url, destination)
+            self.assertFalse(destination.exists())
+
+            streamed = OmegaHTTPResponse(
+                chunks=[struct.pack("<4sII", b"glTF", 2, 17), b"12345"],
+            )
+            with patch("requests.get", return_value=streamed), self.assertRaisesRegex(
+                stage2.VggtOmegaSpaceError,
+                "exceeds",
+            ):
+                stage2._download_vggt_omega_glb(safe_url, destination)
+            self.assertFalse(destination.exists())
+
+            invalid = Path(tmp) / "invalid.glb"
+            invalid.write_bytes(struct.pack("<4sII", b"NOPE", 2, 12))
+            with self.assertRaisesRegex(stage2.VggtOmegaSpaceError, "invalid glTF"):
+                stage2._validate_vggt_omega_glb(invalid)
+
+            wrong_length = Path(tmp) / "wrong-length.glb"
+            wrong_length.write_bytes(struct.pack("<4sII", b"glTF", 2, 99))
+            with self.assertRaisesRegex(stage2.VggtOmegaSpaceError, "invalid glTF"):
+                stage2._validate_vggt_omega_glb(wrong_length)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            header_only = root / "header-only.glb"
+            header_only.write_bytes(struct.pack("<4sII", b"glTF", 2, 12))
+            with self.assertRaisesRegex(stage2.VggtOmegaSpaceError, "invalid glTF"):
+                stage2._validate_vggt_omega_glb(header_only)
+
+            wrong_first_chunk = root / "wrong-first-chunk.glb"
+            wrong_first_chunk.write_bytes(
+                struct.pack("<4sII", b"glTF", 2, 24)
+                + struct.pack("<II", 4, 0x004E4942)
+                + b"data"
+            )
+            with self.assertRaisesRegex(stage2.VggtOmegaSpaceError, "invalid glTF"):
+                stage2._validate_vggt_omega_glb(wrong_first_chunk)
+
+            valid = root / "valid.glb"
+            valid.write_bytes(self._minimal_glb())
+            self.assertEqual(stage2._validate_vggt_omega_glb(valid), valid.stat().st_size)
+
+    def test_omega_result_deadline_cannot_be_extended_by_sse_heartbeats(self):
+        response = OmegaHTTPResponse(lines=[
+            "event: heartbeat",
+            "data: null",
+        ])
+        with patch("requests.get", return_value=response), patch.object(
+            stage2.time,
+            "monotonic",
+            side_effect=[0.0, 0.0, 1.0, 11.0],
+        ), self.assertRaises(stage2.VggtOmegaSpaceError) as caught:
+            stage2._wait_vggt_omega_gradio(
+                "gradio_demo",
+                "safe-event",
+                deadline=10.0,
+            )
+
+        self.assertEqual(caught.exception.code, "omega_space_result_timeout")
+        self.assertTrue(response.closed)
+
+    def test_omega_external_errors_are_sanitized(self):
+        secret = "do-not-leak-signed-token"
+        with patch(
+            "requests.post",
+            side_effect=requests.HTTPError(f"https://example.test/?token={secret}"),
+        ), self.assertRaises(stage2.VggtOmegaSpaceError) as caught:
+            stage2._submit_vggt_omega_gradio("gradio_demo", [])
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertNotIn("example.test", str(caught.exception))
+
+        response = OmegaHTTPResponse(lines=[
+            "event: error",
+            f"data: https://example.test/?token={secret}",
+        ])
+        with patch("requests.get", return_value=response), self.assertRaises(
+            stage2.VggtOmegaSpaceError,
+        ) as caught:
+            stage2._wait_vggt_omega_gradio("gradio_demo", "safe-event")
+        self.assertNotIn(secret, str(caught.exception))
+
+    def test_omega_runner_returns_normal_artifact_receipts_and_truthful_geometry(self):
+        receipts = {
+            "durable": True,
+            "complete": True,
+            "delivery": "agent-lab-r2",
+            "files": ["point_cloud.glb"],
+            "required_files": ["point_cloud.glb"],
+            "missing_required": [],
+            "receipts": [{
+                "name": "point_cloud.glb",
+                "sha256": "a" * 64,
+                "bytes": 12,
+                "mediaType": "model/gltf-binary",
+            }],
+            "errors": [],
+        }
+        with patch.object(stage2, "_artifact_exports_enabled", return_value=True), patch.object(
+            stage2,
+            "_materialize_video",
+            return_value=Path("source.mp4"),
+        ), patch.object(
+            stage2,
+            "_sample_vggt_omega_frames",
+            return_value=([Path("a.jpg"), Path("b.jpg")], [0, 10], [0.0, 1.0]),
+        ), patch.object(
+            stage2,
+            "_run_vggt_omega_space",
+            return_value={
+                "space_id": stage2.VGGT_OMEGA_SPACE_ID,
+                "space_revision": stage2.VGGT_OMEGA_SPACE_REVISION,
+                "glb_bytes": 12,
+                "max_points": 500_000,
+                "confidence_percentile": 50.0,
+            },
+        ), patch.object(stage2, "_artifact_manifest", return_value=receipts):
+            result = stage2.run_stage2_omega_geometry({
+                "mode": "geometry",
+                "categories": ["chair"],
+                "max_frames": 160,
+                "upload": {"ticket": "not-inspected-by-this-test"},
+            })
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["frames_used"], 2)
+        self.assertEqual(result["source_frame_indices"], [0, 10])
+        self.assertEqual(result["geometry"]["backend"], "huggingface_space")
+        self.assertEqual(result["geometry"]["provenance_level"], "hosted_unattested")
+        self.assertEqual(result["sam"]["backend"], "not_run")
+        self.assertEqual(result["instance_count"], 0)
+        self.assertEqual(result["artifacts"], receipts)
+        serialized = json.dumps(result)
+        self.assertNotIn("hf.space/gradio_api/file", serialized)
+        self.assertNotIn("opaque-session", serialized)
+
+    def test_omega_runner_refuses_paid_work_without_artifact_delivery(self):
+        with patch.dict(
+            stage2.os.environ,
+            {"STAGE2_KEEP_WORK": "1"},
+            clear=True,
+        ), patch.object(
+            stage2,
+            "_materialize_video",
+        ) as materialize:
+            result = stage2.run_stage2_omega_geometry({
+                "mode": "geometry",
+                "categories": ["chair"],
+                "max_frames": 24,
+            })
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error_code"], "artifact_delivery_unavailable")
+        materialize.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -18,15 +18,16 @@ from typing import Any
 
 import numpy as np
 
+from artifact_contract import GLB_MAX_BYTES
+
 
 _GLB_MAGIC = 0x46546C67
 _GLB_VERSION = 2
 _JSON_CHUNK = 0x4E4F534A
 _BIN_CHUNK = 0x004E4942
-# Agent Lab's signed upload policy allows a 16 MiB GLB. Each point occupies
-# 16 bytes (float32 XYZ + normalized uint8 RGBA); 900k leaves over 2 MiB for
-# camera lines, buffer alignment, and JSON container metadata.
-GLB_MAX_BYTES = 16 * 1024 * 1024
+# Each point occupies 16 bytes (float32 XYZ + normalized uint8 RGBA); 900k
+# leaves over 2 MiB for camera lines, buffer alignment, and JSON metadata under
+# the shared Agent Lab artifact contract.
 GLB_HARD_MAX_POINTS = 900_000
 GLB_HARD_MAX_CAMERAS = 160
 _OUTLIER_RADIUS_FACTOR = 3.0
