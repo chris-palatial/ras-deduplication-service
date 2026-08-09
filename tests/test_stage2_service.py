@@ -493,9 +493,15 @@ class Stage2ServiceTest(unittest.TestCase):
                     "v": "2",
                     "key": "runs/stage2-a/hash-point_cloud.glb",
                     "url": "https://signed.example/?X-Amz-Signature=secret",
-                    "headers": {"content-type": "model/gltf-binary"},
+                    "headers": {
+                        "content-length": "3",
+                        "content-md5": "safe-md5",
+                        "content-type": "model/gltf-binary",
+                        "x-amz-checksum-sha256": "safe-sha256",
+                        "User-Agent": "caller-controlled",
+                    },
                 },
-            ) as post_json, patch("artifact_upload.urllib.request.urlopen", return_value=PutResponse()):
+            ) as post_json, patch("artifact_upload.urllib.request.urlopen", return_value=PutResponse()) as put:
                 receipt = upload_artifact_file(upload, path, "model/gltf-binary")
 
         self.assertEqual(post_json.call_args.args[1]["policy"], policy)
@@ -504,6 +510,39 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertNotIn("url", receipt)
         self.assertNotIn("token", receipt)
         self.assertNotIn("secret", json.dumps(receipt))
+        put_request = put.call_args.args[0]
+        self.assertEqual(
+            put_request.get_header("User-agent"),
+            artifact_uploader.UPLOADER_USER_AGENT,
+        )
+        self.assertEqual(put_request.get_header("Content-length"), "3")
+        self.assertEqual(put_request.get_header("Content-md5"), "safe-md5")
+        self.assertEqual(put_request.get_header("Content-type"), "model/gltf-binary")
+        self.assertEqual(put_request.get_header("X-amz-checksum-sha256"), "safe-sha256")
+
+    def test_artifact_post_uses_stable_uploader_identity_and_rejects_override(self):
+        class JsonResponse(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        with patch(
+            "artifact_upload.urllib.request.urlopen",
+            return_value=JsonResponse(b'{"status":"ok"}'),
+        ) as request:
+            result = artifact_uploader._post_json(
+                "https://edge.example/api/jobs/upload-grant",
+                {"safe": True},
+                {"User-Agent": "caller-controlled", "cf-access-client-id": "configured"},
+                30,
+            )
+
+        self.assertEqual(result, {"status": "ok"})
+        sent = request.call_args.args[0]
+        self.assertEqual(sent.get_header("User-agent"), artifact_uploader.UPLOADER_USER_AGENT)
+        self.assertEqual(sent.get_header("Cf-access-client-id"), "configured")
 
     def test_artifact_uploader_refreshes_grant_before_each_put_retry(self):
         class PutResponse:
@@ -726,6 +765,69 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertEqual(post_json.call_count, 1)
         sleep.assert_not_called()
         self.assertNotIn("do-not-leak", str(caught.exception))
+
+    def test_artifact_uploader_preserves_only_allowlisted_gateway_rejection_code(self):
+        body = io.BytesIO(json.dumps({
+            "error": "invalid or expired upload ticket",
+            "error_code": "upload_ticket_signature_invalid",
+            "token": "must-not-leak",
+        }).encode())
+        error = urllib.error.HTTPError(
+            "https://edge.example/api/jobs/upload-grant?token=must-not-leak",
+            403,
+            "forbidden",
+            {"content-type": "application/json"},
+            body,
+        )
+        failure = artifact_uploader._upload_error("upload_grant", error)
+        self.assertEqual(failure.gateway_error_code, "upload_ticket_signature_invalid")
+        self.assertEqual(failure.failure_record("point_cloud.glb"), {
+            "name": "point_cloud.glb",
+            "code": "artifact_upload_failed",
+            "phase": "upload_grant",
+            "retryable": False,
+            "attempts": 1,
+            "detail": "artifact upload authorization returned HTTP 403",
+            "http_status": 403,
+            "gateway_error_code": "upload_ticket_signature_invalid",
+        })
+        self.assertNotIn("must-not-leak", json.dumps(failure.failure_record("point_cloud.glb")))
+
+        untrusted = urllib.error.HTTPError(
+            "https://edge.example/api/jobs/upload-grant",
+            403,
+            "forbidden",
+            {"content-type": "application/json"},
+            io.BytesIO(b'{"error_code":"attacker_controlled","detail":"must-not-leak"}'),
+        )
+        sanitized = artifact_uploader._upload_error("upload_grant", untrusted)
+        self.assertIsNone(sanitized.gateway_error_code)
+        self.assertNotIn("attacker", json.dumps(sanitized.failure_record("point_cloud.glb")))
+
+        non_string = urllib.error.HTTPError(
+            "https://edge.example/api/jobs/upload-grant",
+            403,
+            "forbidden",
+            {"content-type": "application/json"},
+            io.BytesIO(b'{"error_code":[]}'),
+        )
+        non_string_failure = artifact_uploader._upload_error("upload_grant", non_string)
+        self.assertIsNone(non_string_failure.gateway_error_code)
+        self.assertEqual(non_string_failure.http_status, 403)
+
+        cloudflare = urllib.error.HTTPError(
+            "https://edge.example/api/jobs/upload-grant",
+            403,
+            "forbidden",
+            {"content-type": "text/plain; charset=UTF-8"},
+            io.BytesIO(b"error code: 1010\n"),
+        )
+        edge_failure = artifact_uploader._upload_error("upload_grant", cloudflare)
+        self.assertEqual(edge_failure.edge_error_code, "cloudflare_1010")
+        self.assertEqual(
+            edge_failure.failure_record("point_cloud.glb")["edge_error_code"],
+            "cloudflare_1010",
+        )
 
     def test_ambiguous_put_verification_stops_at_ticket_expiry(self):
         payload = {"exp": 100_000}

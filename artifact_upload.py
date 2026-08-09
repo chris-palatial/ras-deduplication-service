@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -20,6 +21,10 @@ from typing import Any, Callable
 ATTEMPTS = 3
 LOST_PUT_VERIFY_ATTEMPTS = 5
 LOST_PUT_VERIFY_WINDOW_SECONDS = 15
+# Cloudflare Browser Integrity Check rejects urllib's default Python signature
+# before the artifact Worker runs. Keep one honest service identity on grant,
+# verification, and PUT requests; optional ticket headers cannot override it.
+UPLOADER_USER_AGENT = "palatial-stage2-artifact-uploader/2"
 
 PHASE_LABELS = {
     "ticket_validation": "artifact upload ticket validation",
@@ -27,6 +32,15 @@ PHASE_LABELS = {
     "artifact_put": "artifact storage write",
     "upload_verify": "artifact storage verification",
 }
+
+GATEWAY_ERROR_CODES = {
+    "upload_ticket_expired",
+    "upload_ticket_malformed_policy_token",
+    "upload_ticket_claim_mismatch",
+    "upload_ticket_policy_mismatch",
+    "upload_ticket_signature_invalid",
+}
+EDGE_ERROR_CODES = {"cloudflare_1010"}
 
 
 class ArtifactUploadError(RuntimeError):
@@ -40,12 +54,18 @@ class ArtifactUploadError(RuntimeError):
         retryable: bool = False,
         attempts: int = 1,
         cause_type: str = "RuntimeError",
+        gateway_error_code: str | None = None,
+        edge_error_code: str | None = None,
     ) -> None:
         self.phase = phase
         self.http_status = http_status
         self.retryable = retryable
         self.attempts = max(1, int(attempts))
         self.cause_type = cause_type if cause_type.isidentifier() else "Exception"
+        self.gateway_error_code = (
+            gateway_error_code if gateway_error_code in GATEWAY_ERROR_CODES else None
+        )
+        self.edge_error_code = edge_error_code if edge_error_code in EDGE_ERROR_CODES else None
         super().__init__(self.safe_detail())
 
     def safe_detail(self) -> str:
@@ -61,6 +81,8 @@ class ArtifactUploadError(RuntimeError):
             retryable=self.retryable,
             attempts=attempts,
             cause_type=self.cause_type,
+            gateway_error_code=self.gateway_error_code,
+            edge_error_code=self.edge_error_code,
         )
 
     def failure_record(self, name: str) -> dict[str, Any]:
@@ -74,7 +96,32 @@ class ArtifactUploadError(RuntimeError):
         }
         if self.http_status is not None:
             record["http_status"] = self.http_status
+        if self.gateway_error_code is not None:
+            record["gateway_error_code"] = self.gateway_error_code
+        if self.edge_error_code is not None:
+            record["edge_error_code"] = self.edge_error_code
         return record
+
+
+def _http_error_codes(exc: urllib.error.HTTPError) -> tuple[str | None, str | None]:
+    """Read only bounded allowlisted codes, never arbitrary response text."""
+    try:
+        content_type = str(exc.headers.get("content-type") or "").lower()
+        raw = exc.read(4097)
+        if len(raw) > 4096:
+            return None, None
+        if "application/json" in content_type:
+            value = json.loads(raw)
+            code = value.get("error_code") if isinstance(value, dict) else None
+            return (
+                code if isinstance(code, str) and code in GATEWAY_ERROR_CODES else None
+            ), None
+        text = raw.decode("ascii")
+        if re.fullmatch(r"\s*error code:\s*1010\s*", text, flags=re.IGNORECASE):
+            return None, "cloudflare_1010"
+        return None, None
+    except (AttributeError, KeyError, OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return None, None
 
 
 def _upload_error(phase: str, exc: Exception, attempts: int = 1) -> ArtifactUploadError:
@@ -84,12 +131,15 @@ def _upload_error(phase: str, exc: Exception, attempts: int = 1) -> ArtifactUplo
     if isinstance(exc, urllib.error.HTTPError):
         status = int(exc.code)
         retryable = status in {408, 425, 429} or status >= 500
+        gateway_error_code, edge_error_code = _http_error_codes(exc)
         return ArtifactUploadError(
             phase,
             http_status=status,
             retryable=retryable,
             attempts=attempts,
             cause_type=type(exc).__name__,
+            gateway_error_code=gateway_error_code,
+            edge_error_code=edge_error_code,
         )
     retryable = isinstance(
         exc,
@@ -121,10 +171,17 @@ def digests(data: bytes) -> tuple[str, str]:
 
 
 def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeout: float) -> dict[str, Any]:
+    request_headers = {
+        key: value for key, value in headers.items() if key.lower() != "user-agent"
+    }
+    request_headers.update({
+        "content-type": "application/json",
+        "user-agent": UPLOADER_USER_AGENT,
+    })
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
-        headers={"content-type": "application/json", **headers},
+        headers=request_headers,
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -285,7 +342,11 @@ def upload_artifact_file(
         return key, url, headers
 
     def put(url: str, headers: dict[str, str]) -> None:
-        req = urllib.request.Request(url, data=data, headers=headers, method="PUT")
+        request_headers = {
+            key: value for key, value in headers.items() if key.lower() != "user-agent"
+        }
+        request_headers["user-agent"] = UPLOADER_USER_AGENT
+        req = urllib.request.Request(url, data=data, headers=request_headers, method="PUT")
         with urllib.request.urlopen(req, timeout=timeout) as response:
             response.read()
 
