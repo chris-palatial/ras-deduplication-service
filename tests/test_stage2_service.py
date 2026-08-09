@@ -720,7 +720,7 @@ class Stage2ServiceTest(unittest.TestCase):
             "token": "secret-ticket",
             "exp": 9_999_999_999_999,
         }
-        http_error = urllib.error.HTTPError(grant["url"], 409, "conflict", {}, None)
+        http_error = urllib.error.HTTPError(grant["url"], 403, "forbidden", {}, None)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "point_cloud.glb"
             path.write_bytes(b"glb")
@@ -735,6 +735,110 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertEqual(put.call_count, 1)
         verify.assert_called_once()
         sleep.assert_not_called()
+
+    def test_artifact_uploader_strict_mode_surfaces_put_rejection_even_when_object_exists(self):
+        grant = {
+            "v": "2",
+            "key": "runs/stage2-a/hash-point_cloud.glb",
+            "url": "https://signed.example/?X-Amz-Signature=secret",
+            "headers": {"content-length": "3"},
+        }
+        upload = {
+            "base": "https://edge.example",
+            "runId": "stage2-a",
+            "token": "secret-ticket",
+            "exp": 9_999_999_999_999,
+        }
+        http_error = urllib.error.HTTPError(grant["url"], 403, "forbidden", {}, None)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "point_cloud.glb"
+            path.write_bytes(b"glb")
+            with patch("artifact_upload._post_json", return_value=grant), patch(
+                "artifact_upload._stored_already", return_value=True
+            ) as verify, patch(
+                "artifact_upload.urllib.request.urlopen", side_effect=http_error
+            ) as put, patch("artifact_upload.time.sleep") as sleep:
+                with self.assertRaises(artifact_uploader.ArtifactUploadError) as caught:
+                    upload_artifact_file(
+                        upload,
+                        path,
+                        "model/gltf-binary",
+                        require_put_acknowledgement=True,
+                    )
+
+        self.assertEqual(caught.exception.phase, "artifact_put")
+        self.assertEqual(caught.exception.http_status, 403)
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(caught.exception.attempts, 1)
+        self.assertEqual(put.call_count, 1)
+        verify.assert_not_called()
+        sleep.assert_not_called()
+        self.assertNotIn("signed.example", str(caught.exception))
+        self.assertNotIn("secret", str(caught.exception))
+
+    def test_artifact_uploader_strict_mode_retries_transient_put_with_fresh_grant(self):
+        grants = [
+            {
+                "v": "2",
+                "key": "runs/stage2-a/hash-point_cloud.glb",
+                "url": "https://signed.example/attempt-1",
+                "headers": {"content-length": "3"},
+            },
+            {
+                "v": "2",
+                "key": "runs/stage2-a/hash-point_cloud.glb",
+                "url": "https://signed.example/attempt-2",
+                "headers": {"content-length": "3"},
+            },
+        ]
+
+        class PutResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b""
+
+        put_urls = []
+
+        def put(request, **_kwargs):
+            put_urls.append(request.full_url)
+            if len(put_urls) == 1:
+                raise OSError("transient PUT failure")
+            return PutResponse()
+
+        upload = {
+            "base": "https://edge.example",
+            "runId": "stage2-a",
+            "token": "secret-ticket",
+            "exp": 9_999_999_999_999,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "point_cloud.glb"
+            path.write_bytes(b"glb")
+            with patch("artifact_upload._post_json", side_effect=grants) as post_json, patch(
+                "artifact_upload._stored_already"
+            ) as verify, patch(
+                "artifact_upload.urllib.request.urlopen", side_effect=put
+            ), patch("artifact_upload.time.sleep") as sleep:
+                receipt = upload_artifact_file(
+                    upload,
+                    path,
+                    "model/gltf-binary",
+                    require_put_acknowledgement=True,
+                )
+
+        self.assertEqual(receipt["key"], grants[0]["key"])
+        self.assertEqual(post_json.call_count, 2)
+        self.assertEqual(
+            put_urls,
+            ["https://signed.example/attempt-1", "https://signed.example/attempt-2"],
+        )
+        verify.assert_not_called()
+        sleep.assert_called_once_with(1)
 
     def test_artifact_uploader_does_not_retry_deterministic_grant_rejection(self):
         upload = {
