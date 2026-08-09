@@ -282,6 +282,7 @@ def run_post_deploy_smoke(
             api_key,
             {
                 "input": {
+                    "analysis_type": "validation_v1",
                     "mode": "dry_run",
                     "video_b64": SMOKE_VIDEO_B64,
                     "media_type": "video/mp4",
@@ -322,7 +323,11 @@ def run_post_deploy_smoke(
             # A rolling release may briefly route to an old warm worker. Retry a
             # bounded number of fresh jobs without exposing the old response.
             last_observation = "stale_worker_revision"
-        elif output.get("status") != "ok" or output.get("mode") != "dry_run":
+        elif (
+            output.get("status") != "ok"
+            or output.get("mode") != "dry_run"
+            or output.get("analysis_type") != "validation_v1"
+        ):
             raise RuntimeError("RunPod post-deploy dry_run returned a non-ok result")
         else:
             return {

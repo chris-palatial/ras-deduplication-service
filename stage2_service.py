@@ -13,6 +13,7 @@ import os
 import base64
 import binascii
 import fcntl
+import importlib
 import json
 import math
 import shutil
@@ -31,12 +32,15 @@ from urllib.parse import urlparse
 #     vendor/ReplicateAnyScene/   (paper repo)
 RAS_ROOT = Path(os.environ.get("RAS_ROOT", Path(__file__).resolve().parent / "vendor" / "ReplicateAnyScene")).resolve()
 RAS_REVISION = os.environ.get("RAS_REVISION", "671191457e7244d9337ef3faf558ee92bbf9bf73")
-VGGT_REVISION = os.environ.get("VGGT_REVISION", "44b3afbd1869d8bde4894dd8ea1e293112dd5eba")
-SAM3_REVISION = os.environ.get("SAM3_REVISION", "bfbed072a07a6a52c8d5fdc75a7a186251a835b1")
+DEFAULT_VGGT_REVISION = "9e4fa662a8893ed348d048e8b57816c12593448b"
+VGGT_REVISION = os.environ.get("VGGT_REVISION", DEFAULT_VGGT_REVISION)
+DEFAULT_SAM3_REVISION = "bfbed072a07a6a52c8d5fdc75a7a186251a835b1"
+SAM3_REVISION = os.environ.get("SAM3_REVISION", DEFAULT_SAM3_REVISION)
 MAX_INLINE_VIDEO_BYTES = 6 * 1024 * 1024
 MAX_REMOTE_VIDEO_BYTES = 64 * 1024 * 1024
 DEFAULT_VGGT_MODEL_ID = "facebook/VGGT-1B"
 COMMERCIAL_VGGT_MODEL_ID = "facebook/VGGT-1B-Commercial"
+SAM3_MODEL_ID = "facebook/sam3"
 VGGT_MODEL_MARKER = ".stage2_model_id"
 ARTIFACT_MEDIA_TYPES = {
     "point_cloud.glb": "model/gltf-binary",
@@ -48,6 +52,17 @@ REQUIRED_ARTIFACTS = {
     "geometry": ("point_cloud.glb",),
     "full": ("point_cloud.glb", "instance_masks.mp4"),
 }
+RUNPOD_ANALYSIS_TYPE_MODES = {
+    "validation_v1": "dry_run",
+    "geometry_vggt_1b": "geometry",
+    "dedup_ras_vggt_sam3": "full",
+}
+NON_RUNPOD_ANALYSIS_TYPES = {
+    "geometry_vggt_omega_1b": "route it to the dedicated VGGT-Omega endpoint",
+    "mask_sam3": "route it to the fal SAM 3 adapter",
+    "mask_sam31": "route it to the fal SAM 3.1 adapter",
+}
+VGGT_1B_ANALYSIS_TYPES = frozenset({"geometry_vggt_1b", "dedup_ras_vggt_sam3"})
 _PROCESS_INITIALIZATION_LOCK = threading.Lock()
 
 
@@ -155,6 +170,57 @@ def _clone_if_missing(url: str, dest: Path, revision: str) -> None:
     _run(["git", "clone", "--filter=blob:none", "--no-checkout", url, str(dest)])
     _run(["git", "-C", str(dest), "fetch", "--depth", "1", "origin", revision])
     _run(["git", "-C", str(dest), "checkout", "--detach", "FETCH_HEAD"])
+
+
+def _verified_checkout_revision(dest: Path, expected_revision: str) -> str:
+    """Return the actual clean checkout revision or fail before claiming provenance."""
+    import subprocess
+
+    try:
+        head = subprocess.check_output(
+            ["git", "-C", str(dest), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        clean = subprocess.call(
+            ["git", "-C", str(dest), "diff-index", "--quiet", "HEAD", "--"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ) == 0
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"could not verify source checkout at {dest}") from exc
+    if head != expected_revision or not clean:
+        raise RuntimeError(
+            f"source checkout at {dest} does not match clean revision {expected_revision}"
+        )
+    return head
+
+
+def _prefer_source_checkouts(ras: Path) -> None:
+    """Make the verified runtime-owned source trees win over stale site packages."""
+    for source_root in (ras / "sam3", ras / "vggt", ras):
+        if not source_root.is_dir():
+            continue
+        value = str(source_root)
+        while value in sys.path:
+            sys.path.remove(value)
+        sys.path.insert(0, value)
+
+
+def _verify_import_from_checkout(module_name: str, checkout: Path) -> None:
+    module = importlib.import_module(module_name)
+    module_file_value = getattr(module, "__file__", None)
+    if not isinstance(module_file_value, str) or not module_file_value:
+        raise RuntimeError(
+            f"{module_name} did not resolve to a concrete file inside {checkout}"
+        )
+    module_file = Path(module_file_value).resolve()
+    try:
+        module_file.relative_to(checkout.resolve())
+    except (ValueError, OSError) as exc:
+        raise RuntimeError(
+            f"{module_name} resolved outside the verified source checkout at {checkout}"
+        ) from exc
 
 
 @contextmanager
@@ -399,8 +465,15 @@ def _ensure_ras_installed(*, require_sam3: bool = True) -> None:
         if require_sam3:
             _clone_if_missing("https://github.com/facebookresearch/sam3.git", ras / "sam3", SAM3_REVISION)
 
+        _prefer_source_checkouts(ras)
+
         # Install dependencies before importing huggingface_hub to download weights.
         _ensure_python_packages(ras, require_sam3=require_sam3)
+        # VGGT's top-level `vggt` is a PEP 420 namespace package and has no
+        # __file__. Verify the concrete model modules that inference imports.
+        _verify_import_from_checkout("vggt.models.vggt", ras / "vggt")
+        if require_sam3:
+            _verify_import_from_checkout("sam3.model_builder", ras / "sam3")
 
         if not _vggt_weights_ok(models_dir / "VGGT", _vggt_model_id()):
             _download_vggt_weights(models_dir)
@@ -422,13 +495,9 @@ def _ensure_ras_on_path() -> Path:
             f"ReplicateAnyScene checkout not found at {ras}. "
             "Clone https://github.com/xiac20/ReplicateAnyScene and install vggt+sam3 packages."
         )
-    root = str(ras)
-    # Prefer RAS root for `import src.*`; keep vendor package installs for vggt/sam3.
-    if root in sys.path:
-        sys.path.remove(root)
-    sys.path.insert(0, root)
+    _prefer_source_checkouts(ras)
     # Models loader expects cwd-relative ./models and ./sam3 paths.
-    os.chdir(root)
+    os.chdir(ras)
     return ras
 
 
@@ -1231,6 +1300,7 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
 
         _ensure_ras_installed(require_sam3=False)
         ras_root = _ensure_ras_on_path()
+        vggt_source_revision = _verified_checkout_revision(ras_root / "vggt", VGGT_REVISION)
         _link_models_dir(ras_root)
 
         import gc
@@ -1288,6 +1358,7 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
                 "backend": "vggt",
                 "device": device,
                 "model_id": _vggt_model_id(),
+                "source_revision": vggt_source_revision,
                 "license_scope": _vggt_license_scope(),
                 "world_points_shape": list(pred["world_points"].shape),
                 "sam3_required": False,
@@ -1360,6 +1431,8 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
 
         _ensure_ras_installed()
         ras_root = _ensure_ras_on_path()
+        vggt_source_revision = _verified_checkout_revision(ras_root / "vggt", VGGT_REVISION)
+        sam3_source_revision = _verified_checkout_revision(ras_root / "sam3", SAM3_REVISION)
         _link_models_dir(ras_root)
 
         import torch
@@ -1476,6 +1549,7 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
                 "backend": "vggt",
                 "device": device,
                 "model_id": _vggt_model_id(),
+                "source_revision": vggt_source_revision,
                 "license_scope": _vggt_license_scope(),
                 "room_align": room_align,
                 "room_align_requested": room_align,
@@ -1486,6 +1560,8 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
             },
             "sam": {
                 "backend": "sam3_video",
+                "model_id": SAM3_MODEL_ID,
+                "source_revision": sam3_source_revision,
                 "raw_tracks": raw_count,
                 "mask_video": mask_video_meta,
             },
@@ -1534,10 +1610,130 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
             shutil.rmtree(work, ignore_errors=True)
 
 
+def _resolve_runpod_analysis_type(payload: dict[str, Any], mode: str) -> tuple[str | None, str | None]:
+    raw_analysis_type = payload.get("analysis_type")
+    if raw_analysis_type is None:
+        return None, None
+    if not isinstance(raw_analysis_type, str) or not raw_analysis_type:
+        supported = ", ".join(RUNPOD_ANALYSIS_TYPE_MODES)
+        return None, f"analysis_type must be one of: {supported}"
+
+    if raw_analysis_type in NON_RUNPOD_ANALYSIS_TYPES:
+        return raw_analysis_type, (
+            f"analysis_type {raw_analysis_type} is not owned by this RunPod worker; "
+            f"{NON_RUNPOD_ANALYSIS_TYPES[raw_analysis_type]}"
+        )
+
+    expected_mode = RUNPOD_ANALYSIS_TYPE_MODES.get(raw_analysis_type)
+    if expected_mode is None:
+        supported = ", ".join(RUNPOD_ANALYSIS_TYPE_MODES)
+        return raw_analysis_type, f"analysis_type must be one of: {supported}"
+    if expected_mode != mode:
+        return raw_analysis_type, (
+            f"analysis_type {raw_analysis_type} requires mode {expected_mode}, not {mode}"
+        )
+    if raw_analysis_type in VGGT_1B_ANALYSIS_TYPES:
+        configured_model_id = _vggt_model_id()
+        if configured_model_id != DEFAULT_VGGT_MODEL_ID:
+            return raw_analysis_type, (
+                f"analysis_type {raw_analysis_type} requires VGGT model {DEFAULT_VGGT_MODEL_ID}; "
+                f"this worker is configured for {configured_model_id}"
+            )
+        if VGGT_REVISION != DEFAULT_VGGT_REVISION:
+            return raw_analysis_type, (
+                f"analysis_type {raw_analysis_type} requires VGGT source {DEFAULT_VGGT_REVISION}; "
+                f"this worker is configured for {VGGT_REVISION}"
+            )
+        expected_model_id = payload.get("expected_geometry_model_id")
+        if expected_model_id is not None and expected_model_id != DEFAULT_VGGT_MODEL_ID:
+            return raw_analysis_type, (
+                f"expected_geometry_model_id must be {DEFAULT_VGGT_MODEL_ID} "
+                f"for analysis_type {raw_analysis_type}"
+            )
+        expected_source_revision = payload.get("expected_geometry_source_revision")
+        if expected_source_revision is not None and expected_source_revision != DEFAULT_VGGT_REVISION:
+            return raw_analysis_type, (
+                f"expected_geometry_source_revision must be {DEFAULT_VGGT_REVISION} "
+                f"for analysis_type {raw_analysis_type}"
+            )
+    if raw_analysis_type == "dedup_ras_vggt_sam3":
+        if SAM3_REVISION != DEFAULT_SAM3_REVISION:
+            return raw_analysis_type, (
+                f"analysis_type {raw_analysis_type} requires SAM 3 source {DEFAULT_SAM3_REVISION}; "
+                f"this worker is configured for {SAM3_REVISION}"
+            )
+        expected_model_id = payload.get("expected_sam_model_id")
+        if expected_model_id is not None and expected_model_id != SAM3_MODEL_ID:
+            return raw_analysis_type, (
+                f"expected_sam_model_id must be {SAM3_MODEL_ID} "
+                f"for analysis_type {raw_analysis_type}"
+            )
+        expected_source_revision = payload.get("expected_sam_source_revision")
+        if expected_source_revision is not None and expected_source_revision != DEFAULT_SAM3_REVISION:
+            return raw_analysis_type, (
+                f"expected_sam_source_revision must be {DEFAULT_SAM3_REVISION} "
+                f"for analysis_type {raw_analysis_type}"
+            )
+    return raw_analysis_type, None
+
+
+def _attach_success_provenance(
+    result: dict[str, Any],
+    *,
+    mode: str,
+    analysis_type: str | None,
+) -> dict[str, Any]:
+    if result.get("status") != "ok":
+        return result
+
+    # Legacy callers predate versioned analysis types. Preserve their response
+    # shape, but never manufacture provenance for the typed contract: the
+    # model runner must report what it actually loaded and we verify it here.
+    if analysis_type is None:
+        return result
+
+    def provenance_error(component: str) -> dict[str, Any]:
+        return {
+            "status": "error",
+            "mode": mode,
+            "analysis_type": analysis_type,
+            "error": (
+                f"{component} execution provenance did not match the immutable "
+                f"analysis_type {analysis_type} contract"
+            ),
+        }
+
+    if analysis_type in VGGT_1B_ANALYSIS_TYPES:
+        geometry = result.get("geometry")
+        if not isinstance(geometry, dict) or (
+            geometry.get("model_id") != DEFAULT_VGGT_MODEL_ID
+            or geometry.get("source_revision") != DEFAULT_VGGT_REVISION
+        ):
+            return provenance_error("VGGT")
+    if analysis_type == "dedup_ras_vggt_sam3":
+        sam = result.get("sam")
+        if not isinstance(sam, dict) or (
+            sam.get("model_id") != SAM3_MODEL_ID
+            or sam.get("source_revision") != DEFAULT_SAM3_REVISION
+        ):
+            return provenance_error("SAM 3")
+
+    enriched = {**result, "analysis_type": analysis_type}
+    return enriched
+
+
 def run_stage2(payload: dict[str, Any]) -> dict[str, Any]:
     mode = str(payload.get("mode") or os.environ.get("STAGE2_MODE_DEFAULT") or "full").lower()
     if mode not in {"dry_run", "geometry", "full"}:
         return {"status": "error", "mode": mode, "error": "mode must be dry_run, geometry, or full"}
+    analysis_type, analysis_error = _resolve_runpod_analysis_type(payload, mode)
+    if analysis_error:
+        return {
+            "status": "error",
+            "mode": mode,
+            "analysis_type": analysis_type,
+            "error": analysis_error,
+        }
     try:
         max_frames = int(payload.get("max_frames") or (24 if mode == "dry_run" else 48))
     except (TypeError, ValueError):
@@ -1552,7 +1748,9 @@ def run_stage2(payload: dict[str, Any]) -> dict[str, Any]:
         return {"status": "error", "mode": mode, "error": "max_frames must be an integer from 2 to 160"}
     payload = {**payload, "mode": mode, "max_frames": max_frames, "categories": categories}
     if mode == "dry_run":
-        return run_stage2_dry(payload)
-    if mode == "geometry":
-        return run_stage2_geometry(payload)
-    return run_stage2_full(payload)
+        result = run_stage2_dry(payload)
+    elif mode == "geometry":
+        result = run_stage2_geometry(payload)
+    else:
+        result = run_stage2_full(payload)
+    return _attach_success_provenance(result, mode=mode, analysis_type=analysis_type)

@@ -93,12 +93,46 @@ class Stage2ServiceTest(unittest.TestCase):
             stage2, "_clone_if_missing", side_effect=cloned
         ), patch.object(
             stage2, "_ensure_python_packages", side_effect=lambda *_args, **_kwargs: events.append("packages")
+        ), patch.object(
+            stage2,
+            "_verify_import_from_checkout",
+            side_effect=lambda module, _path: events.append(f"verify:{module}"),
         ), patch.object(stage2, "_vggt_weights_ok", return_value=True):
             stage2._ensure_ras_installed(require_sam3=False)
 
         self.assertEqual(events[0], "lock_enter")
         self.assertEqual(events[-1], "lock_exit")
-        self.assertEqual(events[1:-1], ["clone:ras", "clone:vggt", "packages"])
+        self.assertEqual(
+            events[1:-1],
+            ["clone:ras", "clone:vggt", "packages", "verify:vggt.models.vggt"],
+        )
+
+    def test_import_provenance_accepts_real_namespace_package_model_module(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = Path(tmp) / "vggt-checkout"
+            model_dir = checkout / "vggt" / "models"
+            model_dir.mkdir(parents=True)
+            (model_dir / "vggt.py").write_text("MODEL_SENTINEL = True\n")
+
+            original_path = list(sys.path)
+            previous_modules = {
+                name: module
+                for name, module in sys.modules.items()
+                if name == "vggt" or name.startswith("vggt.")
+            }
+            for name in previous_modules:
+                sys.modules.pop(name, None)
+            sys.path.insert(0, str(checkout))
+            try:
+                stage2._verify_import_from_checkout("vggt.models.vggt", checkout)
+                namespace = __import__("vggt")
+                self.assertIsNone(namespace.__file__)
+            finally:
+                sys.path[:] = original_path
+                for name in list(sys.modules):
+                    if name == "vggt" or name.startswith("vggt."):
+                        sys.modules.pop(name, None)
+                sys.modules.update(previous_modules)
 
     def test_concurrent_first_jobs_create_one_models_link(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -166,6 +200,226 @@ class Stage2ServiceTest(unittest.TestCase):
         )
         self.assertEqual(result["status"], "error")
         self.assertIn("dry_run, geometry, or full", result["error"])
+
+    def test_analysis_type_allowlist_routes_matching_modes_and_echoes_provenance(self):
+        cases = (
+            ("validation_v1", "dry_run", "run_stage2_dry"),
+            ("geometry_vggt_1b", "geometry", "run_stage2_geometry"),
+            ("dedup_ras_vggt_sam3", "full", "run_stage2_full"),
+        )
+        for analysis_type, mode, runner_name in cases:
+            runner_result = {"status": "ok", "mode": mode}
+            if mode in {"geometry", "full"}:
+                runner_result["geometry"] = {
+                    "backend": "vggt",
+                    "model_id": stage2.DEFAULT_VGGT_MODEL_ID,
+                    "source_revision": stage2.DEFAULT_VGGT_REVISION,
+                }
+            if mode == "full":
+                runner_result["sam"] = {
+                    "backend": "sam3_video",
+                    "model_id": stage2.SAM3_MODEL_ID,
+                    "source_revision": stage2.DEFAULT_SAM3_REVISION,
+                }
+            with self.subTest(analysis_type=analysis_type), patch.object(
+                stage2,
+                runner_name,
+                return_value=runner_result,
+            ) as runner:
+                result = stage2.run_stage2({
+                    "analysis_type": analysis_type,
+                    "mode": mode,
+                    "categories": ["chair"],
+                    "max_frames": 8,
+                })
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["analysis_type"], analysis_type)
+            if mode in {"geometry", "full"}:
+                self.assertEqual(result["geometry"]["model_id"], stage2.DEFAULT_VGGT_MODEL_ID)
+                self.assertEqual(result["geometry"]["source_revision"], stage2.DEFAULT_VGGT_REVISION)
+            if mode == "full":
+                self.assertEqual(result["sam"]["model_id"], stage2.SAM3_MODEL_ID)
+                self.assertEqual(result["sam"]["source_revision"], stage2.DEFAULT_SAM3_REVISION)
+            runner.assert_called_once()
+
+    def test_typed_analysis_rejects_runner_provenance_instead_of_rewriting_it(self):
+        cases = (
+            (
+                "geometry_vggt_1b",
+                "geometry",
+                {
+                    "status": "ok",
+                    "mode": "geometry",
+                    "geometry": {
+                        "model_id": stage2.DEFAULT_VGGT_MODEL_ID,
+                        "source_revision": "0" * 40,
+                    },
+                },
+                "VGGT",
+            ),
+            (
+                "dedup_ras_vggt_sam3",
+                "full",
+                {
+                    "status": "ok",
+                    "mode": "full",
+                    "geometry": {
+                        "model_id": stage2.DEFAULT_VGGT_MODEL_ID,
+                        "source_revision": stage2.DEFAULT_VGGT_REVISION,
+                    },
+                    "sam": {
+                        "model_id": stage2.SAM3_MODEL_ID,
+                        "source_revision": "0" * 40,
+                    },
+                },
+                "SAM 3",
+            ),
+        )
+        for analysis_type, mode, runner_result, component in cases:
+            runner_name = "run_stage2_geometry" if mode == "geometry" else "run_stage2_full"
+            with self.subTest(analysis_type=analysis_type), patch.object(
+                stage2, runner_name, return_value=runner_result
+            ):
+                result = stage2.run_stage2({
+                    "analysis_type": analysis_type,
+                    "mode": mode,
+                    "categories": ["chair"],
+                    "max_frames": 8,
+                })
+
+            self.assertEqual(result["status"], "error")
+            self.assertEqual(result["analysis_type"], analysis_type)
+            self.assertIn(component, result["error"])
+            self.assertNotIn("geometry", result)
+            self.assertNotIn("sam", result)
+
+    def test_analysis_type_rejects_incompatible_modes_before_running_models(self):
+        cases = (
+            ("validation_v1", "geometry", "dry_run"),
+            ("geometry_vggt_1b", "full", "geometry"),
+            ("dedup_ras_vggt_sam3", "dry_run", "full"),
+        )
+        for analysis_type, mode, expected_mode in cases:
+            with self.subTest(analysis_type=analysis_type, mode=mode):
+                result = stage2.run_stage2({
+                    "analysis_type": analysis_type,
+                    "mode": mode,
+                    "categories": ["chair"],
+                    "max_frames": 8,
+                })
+            self.assertEqual(result["status"], "error")
+            self.assertIn(f"requires mode {expected_mode}", result["error"])
+
+    def test_analysis_type_explicitly_rejects_backends_not_owned_by_this_worker(self):
+        cases = (
+            ("geometry_vggt_omega_1b", "geometry", "VGGT-Omega endpoint"),
+            ("mask_sam3", "full", "fal SAM 3 adapter"),
+            ("mask_sam31", "full", "fal SAM 3.1 adapter"),
+        )
+        for analysis_type, mode, owner in cases:
+            with self.subTest(analysis_type=analysis_type):
+                result = stage2.run_stage2({
+                    "analysis_type": analysis_type,
+                    "mode": mode,
+                    "categories": ["chair"],
+                    "max_frames": 8,
+                })
+            self.assertEqual(result["status"], "error")
+            self.assertIn("not owned by this RunPod worker", result["error"])
+            self.assertIn(owner, result["error"])
+
+    def test_analysis_type_rejects_unknown_values_and_false_vggt_identity(self):
+        unknown = stage2.run_stage2({
+            "analysis_type": "geometry_future_model",
+            "mode": "geometry",
+            "categories": ["chair"],
+            "max_frames": 8,
+        })
+        self.assertEqual(unknown["status"], "error")
+        self.assertIn("analysis_type must be one of", unknown["error"])
+
+        with patch.dict(stage2.os.environ, {"VGGT_MODEL_ID": "facebook/VGGT-1B-Commercial"}):
+            mismatched_model = stage2.run_stage2({
+                "analysis_type": "geometry_vggt_1b",
+                "mode": "geometry",
+                "categories": ["chair"],
+                "max_frames": 8,
+            })
+        self.assertEqual(mismatched_model["status"], "error")
+        self.assertIn("requires VGGT model facebook/VGGT-1B", mismatched_model["error"])
+        self.assertIn("facebook/VGGT-1B-Commercial", mismatched_model["error"])
+
+        with patch.object(stage2, "VGGT_REVISION", "44b3afbd51d87cbd9b4a233b187017460ea2f27e"):
+            mismatched_revision = stage2.run_stage2({
+                "analysis_type": "geometry_vggt_1b",
+                "mode": "geometry",
+                "categories": ["chair"],
+                "max_frames": 8,
+            })
+        self.assertEqual(mismatched_revision["status"], "error")
+        self.assertIn(f"requires VGGT source {stage2.DEFAULT_VGGT_REVISION}", mismatched_revision["error"])
+
+    def test_analysis_type_rejects_caller_model_expectations_that_do_not_match(self):
+        common = {
+            "analysis_type": "geometry_vggt_1b",
+            "mode": "geometry",
+            "categories": ["chair"],
+            "max_frames": 8,
+        }
+        wrong_model = stage2.run_stage2({
+            **common,
+            "expected_geometry_model_id": "facebook/VGGT-Omega",
+        })
+        self.assertEqual(wrong_model["status"], "error")
+        self.assertIn("expected_geometry_model_id", wrong_model["error"])
+
+        wrong_revision = stage2.run_stage2({
+            **common,
+            "expected_geometry_source_revision": "0" * 40,
+        })
+        self.assertEqual(wrong_revision["status"], "error")
+        self.assertIn("expected_geometry_source_revision", wrong_revision["error"])
+
+        full_common = {
+            "analysis_type": "dedup_ras_vggt_sam3",
+            "mode": "full",
+            "categories": ["chair"],
+            "max_frames": 8,
+        }
+        wrong_sam_model = stage2.run_stage2({
+            **full_common,
+            "expected_sam_model_id": "facebook/sam3.1",
+        })
+        self.assertEqual(wrong_sam_model["status"], "error")
+        self.assertIn("expected_sam_model_id", wrong_sam_model["error"])
+
+        wrong_sam_revision = stage2.run_stage2({
+            **full_common,
+            "expected_sam_source_revision": "0" * 40,
+        })
+        self.assertEqual(wrong_sam_revision["status"], "error")
+        self.assertIn("expected_sam_source_revision", wrong_sam_revision["error"])
+
+        with patch.object(stage2, "SAM3_REVISION", "0" * 40):
+            mismatched_sam_worker = stage2.run_stage2(full_common)
+        self.assertEqual(mismatched_sam_worker["status"], "error")
+        self.assertIn(f"requires SAM 3 source {stage2.DEFAULT_SAM3_REVISION}", mismatched_sam_worker["error"])
+
+    def test_legacy_request_without_analysis_type_remains_supported(self):
+        with patch.object(
+            stage2,
+            "run_stage2_dry",
+            return_value={"status": "ok", "mode": "dry_run"},
+        ) as runner:
+            result = stage2.run_stage2({
+                "mode": "dry_run",
+                "categories": ["chair"],
+                "max_frames": 8,
+            })
+
+        self.assertEqual(result, {"status": "ok", "mode": "dry_run"})
+        runner.assert_called_once()
 
     def test_rejects_category_and_frame_boundaries(self):
         result = stage2.run_stage2(
@@ -1257,6 +1511,15 @@ class Stage2ServiceTest(unittest.TestCase):
         with patch.dict(stage2.os.environ, {"VGGT_MODEL_ID": "facebook/VGGT-1B-Commercial"}, clear=True):
             self.assertEqual(stage2._vggt_model_id(), "facebook/VGGT-1B-Commercial")
             self.assertEqual(stage2._vggt_license_scope(), "commercial")
+
+    def test_vggt_source_uses_official_memory_fix_without_changing_model_identity(self):
+        expected_revision = "9e4fa662a8893ed348d048e8b57816c12593448b"
+        root = Path(__file__).resolve().parents[1]
+        dockerfile = (root / "Dockerfile").read_text()
+
+        self.assertEqual(stage2.DEFAULT_VGGT_REVISION, expected_revision)
+        self.assertEqual(stage2.DEFAULT_VGGT_MODEL_ID, "facebook/VGGT-1B")
+        self.assertIn(f"ARG VGGT_REVISION={expected_revision}", dockerfile)
 
     def test_public_vggt_cache_miss_ignores_even_a_stale_hf_token(self):
         calls = []

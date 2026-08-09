@@ -25,6 +25,12 @@ Those live in:
 - `geometry` — run real VGGT geometry; deliberately skip SAM3 and dedup
 - `full` — exact RAS Stage 2 path (stops before Stage 3 mesh generation)
 
+New Agent Lab requests also carry a stable `analysis_type`. This worker owns
+`validation_v1`, `geometry_vggt_1b`, and `dedup_ras_vggt_sam3`; it rejects fal
+mask types and `geometry_vggt_omega_1b` because those belong to separate
+backends. Typed VGGT results echo the analysis id, checkpoint repository, and
+exact source revision. Legacy requests without `analysis_type` remain supported.
+
 ## Weights
 
 Same as their README (not in git):
@@ -54,9 +60,13 @@ While SAM3 access is pending, pre-seed only the public VGGT weights:
 STAGE2_DOWNLOAD_SAM3=0 bash scripts/download_weights.sh
 ```
 
-The reviewed source revisions are pinned in the wrapper and Dockerfile. The
-official SAM3 checkpoint is gated by Meta on Hugging Face; the service does not
-fall back to unofficial mirrors or bypass its license approval.
+The reviewed source revisions are pinned in the wrapper and Dockerfile. VGGT is
+pinned to Meta's official inference-memory fix
+[`9e4fa662a8893ed348d048e8b57816c12593448b`](https://github.com/facebookresearch/vggt/commit/9e4fa662a8893ed348d048e8b57816c12593448b),
+which retains the `facebook/VGGT-1B` checkpoint and prediction contract while
+avoiding redundant intermediate-tensor caching. The official SAM3 checkpoint is
+gated by Meta on Hugging Face; the service does not fall back to unofficial
+mirrors or bypass its license approval.
 
 ## RunPod
 
