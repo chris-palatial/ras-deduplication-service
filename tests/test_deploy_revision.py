@@ -13,14 +13,27 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
+import stage2_service as stage2
 from scripts import deploy_revision, prune_runtimes
 
 
 REVISION = "0123456789abcdef0123456789abcdef01234567"
 NEWER_REVISION = "89abcdef0123456789abcdef0123456789abcdef"
+SOURCE_EVIDENCE = {
+    "ras_revision": deploy_revision.EXPECTED_RAS_REVISION,
+    "vggt_revision": deploy_revision.EXPECTED_VGGT_REVISION,
+    "sam3_revision": deploy_revision.EXPECTED_SAM3_REVISION,
+    "sam3_required": True,
+    "weights_required": False,
+}
 
 
 class DeployRevisionTests(unittest.TestCase):
+    def test_deploy_source_smoke_pins_match_worker_contract(self):
+        self.assertEqual(deploy_revision.EXPECTED_RAS_REVISION, stage2.RAS_REVISION)
+        self.assertEqual(deploy_revision.EXPECTED_VGGT_REVISION, stage2.DEFAULT_VGGT_REVISION)
+        self.assertEqual(deploy_revision.EXPECTED_SAM3_REVISION, stage2.DEFAULT_SAM3_REVISION)
+
     def test_docker_build_uses_a_secret_mount_for_hugging_face_credentials(self):
         dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text()
 
@@ -262,6 +275,7 @@ class DeployRevisionTests(unittest.TestCase):
                     "analysis_type": "validation_v1",
                     "mode": "dry_run",
                     "stage2_code_revision": REVISION,
+                    "source": SOURCE_EVIDENCE,
                 },
             },
         ]
@@ -309,6 +323,7 @@ class DeployRevisionTests(unittest.TestCase):
                     "analysis_type": "validation_v1",
                     "mode": "dry_run",
                     "stage2_code_revision": REVISION,
+                    "source": SOURCE_EVIDENCE,
                 },
             }
 
@@ -326,6 +341,29 @@ class DeployRevisionTests(unittest.TestCase):
         self.assertEqual(methods.count("POST"), 1, "paid /run must never be retried")
         self.assertEqual(methods.count("GET"), 2)
 
+    def test_post_deploy_smoke_requires_pinned_source_bootstrap(self):
+        responses = [
+            {"id": "smoke-job-1"},
+            {
+                "status": "COMPLETED",
+                "output": {
+                    "status": "ok",
+                    "analysis_type": "validation_v1",
+                    "mode": "dry_run",
+                    "stage2_code_revision": REVISION,
+                },
+            },
+        ]
+        with patch.object(deploy_revision, "invoke_json", side_effect=responses), patch.object(
+            deploy_revision.time, "sleep"
+        ), self.assertRaisesRegex(RuntimeError, "pinned source bootstrap"):
+            deploy_revision.run_post_deploy_smoke(
+                "endpoint-test",
+                REVISION,
+                "test-key",
+                timeout_seconds=60,
+            )
+
     def test_post_deploy_smoke_retries_a_stale_warm_worker(self):
         responses = [
             {"id": "smoke-job-1"},
@@ -336,6 +374,7 @@ class DeployRevisionTests(unittest.TestCase):
                     "analysis_type": "validation_v1",
                     "mode": "dry_run",
                     "stage2_code_revision": NEWER_REVISION,
+                    "source": SOURCE_EVIDENCE,
                 },
             },
             {"id": "smoke-job-2"},
@@ -346,6 +385,7 @@ class DeployRevisionTests(unittest.TestCase):
                     "analysis_type": "validation_v1",
                     "mode": "dry_run",
                     "stage2_code_revision": REVISION,
+                    "source": SOURCE_EVIDENCE,
                 },
             },
         ]
@@ -373,6 +413,7 @@ class DeployRevisionTests(unittest.TestCase):
                         "analysis_type": "validation_v1",
                         "mode": "dry_run",
                         "stage2_code_revision": REVISION if attempt == 7 else NEWER_REVISION,
+                        "source": SOURCE_EVIDENCE,
                     },
                 },
             ])
