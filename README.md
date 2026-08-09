@@ -133,9 +133,12 @@ make the job explicitly fail with `artifact_delivery_failed` instead of
 returning a partial `status: ok`. Its JSON contains digest receipts only. Agent
 Lab verifies each receipt against R2 before exposing `/media/*` URLs; no signed
 PUT URL, file bytes, base64 output, or temporary worker path is returned.
-Every failed PUT is checked for an already-stored object and, when a retry is
-needed, obtains a fresh short-lived upload grant instead of replaying its old
-presigned URL.
+Every failed PUT is checked for an already-stored object first. When a retry is
+safe, the uploader obtains a fresh short-lived grant instead of replaying its
+old presigned URL; explicit 4xx/409 rejections are verified once but never
+retried when the object is absent. Results and worker logs retain only the
+failure phase, HTTP status, retryability, and attempt count, never a ticket or
+signed URL.
 
 Before upload, the full-mode mask visualization is normalized to browser-safe
 H.264/yuv420p MP4 with fast-start metadata. Each sampled mask frame keeps the

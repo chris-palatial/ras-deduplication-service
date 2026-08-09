@@ -985,7 +985,7 @@ def _artifact_manifest(out_dir: Path, work: Path, payload: dict[str, Any] | None
     ) if out_dir.is_dir() else []
     upload = _upload_ticket(payload)
     if upload:
-        from artifact_upload import upload_artifact_file
+        from artifact_upload import artifact_failure_record, upload_artifact_file
 
         mode = str((payload or {}).get("mode") or "")
         required_files = list(REQUIRED_ARTIFACTS.get(mode, ()))
@@ -1011,15 +1011,17 @@ def _artifact_manifest(out_dir: Path, work: Path, payload: dict[str, Any] | None
                     upload_artifact_file(upload, out_dir / name, ARTIFACT_MEDIA_TYPES[name])
                 )
             except Exception as exc:
-                # Signed PUT URLs are credentials.  Never copy arbitrary
-                # transport exception strings into the public result.
-                errors.append(
-                    {
-                        "name": name,
-                        "code": "artifact_upload_failed",
-                        "detail": f"{type(exc).__name__}; inspect worker logs for transport detail",
-                    }
+                # Signed PUT URLs are credentials. Keep only the uploader's
+                # bounded phase/status record in both logs and provider JSON.
+                failure = artifact_failure_record(name, exc)
+                print(
+                    json.dumps(
+                        {"event": "artifact_upload_failed", **failure},
+                        sort_keys=True,
+                    ),
+                    flush=True,
                 )
+                errors.append(failure)
         receipt_names = {str(receipt.get("name") or "") for receipt in receipts}
         missing_required = [name for name in required_files if name not in receipt_names]
         complete = not missing_required
