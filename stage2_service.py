@@ -314,7 +314,7 @@ def _download_sam3_weights(models_dir: Path) -> None:
             if marker.exists():
                 marker.unlink()
         raise RuntimeError(
-            f"Stage2 weights incomplete under {models_dir}. "
+            f"Required model weights are incomplete under {models_dir}. "
             f"VGGT ok={_vggt_weights_ok(vggt_dir, _vggt_model_id())} "
             f"model={_vggt_model_id()} SAM3 pt={_find_sam3_pt(sam_dir)}"
         )
@@ -921,7 +921,7 @@ def run_stage2_dry(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "status": "ok",
             "mode": "dry_run",
-            "implementation": "replicate-any-scene-stage2 dry_run (no VGGT/SAM)",
+            "implementation": "ReplicateAnyScene input validation (video download and frame sampling only; no VGGT or SAM 3)",
             "upstream": "https://github.com/xiac20/ReplicateAnyScene",
             "frames_used": frames_ok,
             "source_frame_indices": idxs,
@@ -1036,7 +1036,7 @@ def _artifact_manifest(out_dir: Path, work: Path, payload: dict[str, Any] | None
             "note": (
                 "Artifacts uploaded directly to Agent Lab storage; receipts require edge verification."
                 if complete and not errors
-                else "Required artifacts could not all be delivered; the Stage 2 job must be treated as failed."
+                else "Required result files could not all be delivered; the processing run must be treated as failed."
                 if not complete
                 else "Some artifacts could not be uploaded; only verified receipts are usable."
                 if durable
@@ -1078,7 +1078,7 @@ def _artifact_delivery_error(
         missing = list(REQUIRED_ARTIFACTS.get(str((payload or {}).get("mode") or ""), ()))
     return {
         "error_code": "artifact_delivery_failed",
-        "error": "Required Stage 2 artifacts could not be delivered to durable storage.",
+        "error": "Required result files could not be delivered to durable storage.",
         "artifact_delivery": {
             "required_files": artifacts.get("required_files", []),
             "missing_required": missing,
@@ -1221,7 +1221,7 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
         response = {
             "status": "ok",
             "mode": "geometry",
-            "implementation": "ReplicateAnyScene Stage 2 VGGT geometry preflight",
+            "implementation": "ReplicateAnyScene VGGT geometry preview",
             "upstream_revision": RAS_REVISION,
             "frames_used": n_frames,
             "source_frame_indices": source_frame_indices,
@@ -1401,7 +1401,7 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
         response = {
             "status": "ok",
             "mode": "full",
-            "implementation": "ReplicateAnyScene main.py Stage 2 (vendor)",
+            "implementation": "ReplicateAnyScene spatial-guided visual deduplication (vendor pipeline)",
             "upstream": "https://github.com/xiac20/ReplicateAnyScene",
             "upstream_revision": RAS_REVISION,
             "frames_used": n_frames,

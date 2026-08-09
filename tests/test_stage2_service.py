@@ -386,6 +386,10 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertEqual(manifest["errors"][0]["code"], "artifact_upload_failed")
         failure = stage2._artifact_delivery_error(payload, manifest)
         self.assertEqual(failure["error_code"], "artifact_delivery_failed")
+        self.assertEqual(
+            failure["error"],
+            "Required result files could not be delivered to durable storage.",
+        )
         self.assertNotIn("secret", json.dumps(manifest))
         self.assertNotIn("signed.example", json.dumps(manifest))
 
