@@ -14,6 +14,7 @@ import base64
 import binascii
 import fcntl
 import importlib
+import importlib.util
 import json
 import math
 import shutil
@@ -205,6 +206,38 @@ def _prefer_source_checkouts(ras: Path) -> None:
         while value in sys.path:
             sys.path.remove(value)
         sys.path.insert(0, value)
+        # These revision-scoped paths may not exist when the worker process
+        # starts. Python caches a failed path lookup, so invalidate that entry
+        # after the checkout is created on the network volume.
+        sys.path_importer_cache.pop(value, None)
+    importlib.invalidate_caches()
+
+    vggt_package = ras / "vggt" / "vggt"
+    if vggt_package.is_dir():
+        _activate_source_namespace("vggt", vggt_package)
+
+
+def _activate_source_namespace(package_name: str, package_dir: Path) -> None:
+    """Pin a PEP 420 package to one reviewed source checkout.
+
+    VGGT intentionally has no ``__init__.py``. A regular package with the same
+    name in the base image otherwise wins over that namespace even when the
+    checkout is first on ``sys.path``. Build the namespace explicitly so both
+    first-job imports and provenance checks resolve the revision-scoped tree.
+    """
+    if not package_dir.is_dir() or (package_dir / "__init__.py").exists():
+        raise RuntimeError(
+            f"{package_name} source namespace has an unexpected layout at {package_dir}"
+        )
+    for module_name in list(sys.modules):
+        if module_name == package_name or module_name.startswith(f"{package_name}."):
+            sys.modules.pop(module_name, None)
+    importlib.invalidate_caches()
+    spec = importlib.util.spec_from_loader(package_name, loader=None, is_package=True)
+    if spec is None:
+        raise RuntimeError(f"could not create source namespace for {package_name}")
+    spec.submodule_search_locations = [str(package_dir.resolve())]
+    sys.modules[package_name] = importlib.util.module_from_spec(spec)
 
 
 def _verify_import_from_checkout(module_name: str, checkout: Path) -> None:
@@ -432,6 +465,7 @@ def _ensure_python_packages(ras: Path, *, require_sam3: bool) -> None:
         # reads at process startup. Install a normal wheel so this same job can
         # import VGGT immediately after first-time bootstrap.
         _pip_install(str(ras / "vggt"))
+        _activate_source_namespace("vggt", ras / "vggt" / "vggt")
     if require_sam3 and _import_error("sam3.model_builder"):
         print("[stage2] pip install sam3 ...", flush=True)
         # non-editable install is more reliable on network volumes

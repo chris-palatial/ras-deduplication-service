@@ -1,4 +1,5 @@
 import base64
+import importlib
 import io
 import json
 import subprocess
@@ -133,6 +134,74 @@ class Stage2ServiceTest(unittest.TestCase):
                     if name == "vggt" or name.startswith("vggt."):
                         sys.modules.pop(name, None)
                 sys.modules.update(previous_modules)
+
+    def test_source_checkout_replaces_a_shadowing_regular_vggt_package(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ras = root / "ReplicateAnyScene"
+            package_dir = ras / "vggt" / "vggt"
+            model_dir = package_dir / "models"
+            model_dir.mkdir(parents=True)
+            (model_dir / "vggt.py").write_text("MODEL_SENTINEL = 'reviewed-source'\n")
+
+            shadow = root / "shadow"
+            shadow_package = shadow / "vggt"
+            shadow_package.mkdir(parents=True)
+            (shadow_package / "__init__.py").write_text("SHADOW_SENTINEL = True\n")
+
+            original_path = list(sys.path)
+            previous_modules = {
+                name: module
+                for name, module in sys.modules.items()
+                if name == "vggt" or name.startswith("vggt.")
+            }
+            for name in previous_modules:
+                sys.modules.pop(name, None)
+            sys.path.insert(0, str(shadow))
+            try:
+                shadowed = importlib.import_module("vggt")
+                self.assertTrue(shadowed.SHADOW_SENTINEL)
+
+                stage2._prefer_source_checkouts(ras)
+                reviewed = importlib.import_module("vggt.models.vggt")
+
+                self.assertEqual(reviewed.MODEL_SENTINEL, "reviewed-source")
+                self.assertEqual(
+                    list(importlib.import_module("vggt").__path__),
+                    [str(package_dir.resolve())],
+                )
+                stage2._verify_import_from_checkout("vggt.models.vggt", ras / "vggt")
+            finally:
+                sys.path[:] = original_path
+                for name in list(sys.modules):
+                    if name == "vggt" or name.startswith("vggt."):
+                        sys.modules.pop(name, None)
+                sys.modules.update(previous_modules)
+
+    def test_source_namespace_activation_works_in_a_clean_interpreter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package_dir = Path(tmp) / "vggt-checkout" / "vggt"
+            model_dir = package_dir / "models"
+            model_dir.mkdir(parents=True)
+            (model_dir / "vggt.py").write_text("MODEL_SENTINEL = 'clean-interpreter'\n")
+            service_root = Path(stage2.__file__).resolve().parent
+            script = "\n".join((
+                "import importlib",
+                "import sys",
+                "from pathlib import Path",
+                f"sys.path.insert(0, {str(service_root)!r})",
+                "import stage2_service",
+                f"package_dir = Path({str(package_dir)!r})",
+                "stage2_service._activate_source_namespace('vggt', package_dir)",
+                "model = importlib.import_module('vggt.models.vggt')",
+                "assert model.MODEL_SENTINEL == 'clean-interpreter'",
+            ))
+            subprocess.run(
+                [sys.executable, "-I", "-S", "-c", script],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
 
     def test_concurrent_first_jobs_create_one_models_link(self):
         with tempfile.TemporaryDirectory() as tmp:
