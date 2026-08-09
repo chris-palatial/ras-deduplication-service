@@ -163,4 +163,8 @@ direct-to-R2 grants before enabling large debug artifacts in a deployment.
 ## Agent Lab
 
 Point `STAGE2_ENDPOINT_ID` at this endpoint. Lab already async-polls `/status`.
-Agent Lab accepts clips up to 6 MiB until a public object-store handoff is configured.
+Agent Lab passes uploaded clips through an expiring, exact-object signed HTTPS
+`video_url`. The worker streams that response to disk and independently enforces
+a 64 MiB limit using both `Content-Length` (when present) and the bytes actually
+received. Legacy callers may continue to use `video_b64`, which remains limited
+to 6 MiB; larger clips must use `video_url`.
