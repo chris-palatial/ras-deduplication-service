@@ -27,6 +27,11 @@ from artifact_upload import upload_artifact_file
 
 
 class Stage2ServiceTest(unittest.TestCase):
+    def test_sam3_model_builder_runtime_dependency_is_pinned(self):
+        requirements = (Path(__file__).resolve().parents[1] / "requirements.txt").read_text()
+
+        self.assertIn("pycocotools==2.0.11", requirements.splitlines())
+
     def test_endpoint_response_reports_exact_code_revision(self):
         revision = "0123456789abcdef0123456789abcdef01234567"
         with tempfile.TemporaryDirectory() as tmp:
