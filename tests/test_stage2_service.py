@@ -220,10 +220,15 @@ class Stage2ServiceTest(unittest.TestCase):
         ):
             root = Path(tmp)
             within_limit = DownloadResponse([b"ab", b"cd"], 4)
-            with patch("requests.get", return_value=within_limit):
+            with patch.dict(stage2.os.environ, {
+                "CF_ACCESS_CLIENT_ID": "must-not-leave-worker",
+                "CF_ACCESS_CLIENT_SECRET": "must-not-leave-worker",
+            }), patch("requests.get", return_value=within_limit) as get:
                 path = stage2._download_video("https://input.example/clip.mp4?token=secret", root / "exact")
             self.assertEqual(path.read_bytes(), b"abcd")
             self.assertEqual(within_limit.test_chunk_size, 1 << 20)
+            self.assertFalse(get.call_args.kwargs["allow_redirects"])
+            self.assertNotIn("headers", get.call_args.kwargs)
 
             declared_oversize = DownloadResponse([], 5)
             with patch("requests.get", return_value=declared_oversize), self.assertRaisesRegex(
@@ -250,6 +255,26 @@ class Stage2ServiceTest(unittest.TestCase):
             ):
                 stage2._download_video("https://input.example/empty.mp4", empty_dir)
             self.assertFalse((empty_dir / "input.mp4").exists())
+
+            redirected = DownloadResponse([])
+            redirected.status_code = 307
+            redirect_dir = root / "redirect"
+            with patch("requests.get", return_value=redirected) as get, self.assertRaisesRegex(
+                RuntimeError, "redirects are not allowed"
+            ):
+                stage2._download_video("https://input.example/redirect.mp4", redirect_dir)
+            self.assertFalse(get.call_args.kwargs["allow_redirects"])
+            self.assertFalse((redirect_dir / "input.mp4").exists())
+
+            for unsafe_url in (
+                "http://input.example/plaintext.mp4",
+                "https://user:password@input.example/credentials.mp4",
+            ):
+                with patch("requests.get") as get, self.assertRaisesRegex(
+                    RuntimeError, "credential-free HTTPS URL"
+                ):
+                    stage2._download_video(unsafe_url, root / "unsafe")
+                get.assert_not_called()
 
     def test_remote_video_download_does_not_leak_signed_query_in_errors(self):
         class FailedResponse:
@@ -288,6 +313,7 @@ class Stage2ServiceTest(unittest.TestCase):
             }
         )
         self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error"], "could not decode downloaded video")
 
     def test_ephemeral_geometry_skips_unusable_artifact_export(self):
         with tempfile.TemporaryDirectory() as tmp:
