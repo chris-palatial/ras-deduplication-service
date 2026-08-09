@@ -435,33 +435,39 @@ def _ensure_ras_on_path() -> Path:
 def _download_video(video_url: str, dest_dir: Path, timeout_s: int = 180) -> Path:
     import requests
 
+    parsed_url = urlparse(video_url)
+    if (
+        parsed_url.scheme.lower() != "https"
+        or not parsed_url.hostname
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+    ):
+        raise RuntimeError("video_url must be a credential-free HTTPS URL")
+
     dest_dir.mkdir(parents=True, exist_ok=True)
-    suffix = Path(urlparse(video_url).path).suffix.lower()
+    suffix = Path(parsed_url.path).suffix.lower()
     if suffix not in {".mp4", ".mov", ".webm", ".mkv", ".avi"}:
         suffix = ".mp4"
     dest = dest_dir / f"input{suffix}"
-    headers = {}
-    # Cloudflare Access service tokens (optional): allow RunPod to GET Access-protected media.
-    cid = os.environ.get("CF_ACCESS_CLIENT_ID") or os.environ.get("CF_Access_Client_Id")
-    csec = os.environ.get("CF_ACCESS_CLIENT_SECRET") or os.environ.get("CF_Access_Client_Secret")
-    if cid and csec:
-        headers["CF-Access-Client-Id"] = cid
-        headers["CF-Access-Client-Secret"] = csec
-    if not (video_url.startswith("http://") or video_url.startswith("https://")):
-        raise RuntimeError("refusing non-HTTP video_url")
-
     # This path is also callable outside Agent Lab, so enforce the worker's own
     # disk boundary instead of trusting the signed-URL issuer or response header.
     dest.unlink(missing_ok=True)
     try:
-        with requests.get(video_url, stream=True, timeout=timeout_s, headers=headers) as r:
-            if r.status_code in (401, 403, 302) or "cloudflareaccess" in (
-                r.headers.get("location") or ""
-            ).lower():
+        # Signed input URLs are exact-object capabilities. Following a redirect
+        # would silently hand that capability (and any future custom headers)
+        # to a different origin, so every 3xx is terminal.
+        with requests.get(
+            video_url,
+            stream=True,
+            timeout=timeout_s,
+            allow_redirects=False,
+        ) as r:
+            if 300 <= r.status_code < 400:
+                raise RuntimeError("video URL redirects are not allowed")
+            if r.status_code in (401, 403):
                 raise RuntimeError(
                     f"video URL blocked (HTTP {r.status_code}). "
-                    "Use an exact-object signed HTTPS URL accessible to the worker, "
-                    "or set CF_ACCESS_CLIENT_ID/SECRET on the endpoint."
+                    "Use an exact-object signed HTTPS URL accessible to the worker."
                 )
             r.raise_for_status()
             declared_raw = r.headers.get("content-length")
@@ -532,8 +538,6 @@ def _materialize_video(payload: dict[str, Any], work: Path) -> Path:
             "Redeploy/restart the endpoint worker, send up to 6 MiB through legacy video_b64, "
             "or provide an HTTPS video_url up to 64 MiB."
         )
-    if not (video_url.startswith("http://") or video_url.startswith("https://")):
-        raise RuntimeError("unsupported video_url scheme")
     return _download_video(video_url, work)
 
 
@@ -900,7 +904,7 @@ def run_stage2_dry(payload: dict[str, Any]) -> dict[str, Any]:
 
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
-            return {"status": "error", "error": f"could not open video: {video_url}", "mode": "dry_run"}
+            return {"status": "error", "error": "could not decode downloaded video", "mode": "dry_run"}
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0)
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
