@@ -149,11 +149,23 @@ aligned instead of merely sharing the same total duration.
 The GLB is a visualization-friendly colored **point cloud**, not a watertight or
 textured surface mesh. It defaults to at most 300,000 points and enforces a
 900,000-point hard cap so the GLB remains below its signed 16 MiB upload
-contract. Deployments may tune `STAGE2_POINT_CLOUD_MAX_POINTS` (10,000–900,000) and
-`STAGE2_POINT_CLOUD_CONFIDENCE_PERCENTILE` (0–100).
-The exporter also removes only the catastrophic tail beyond a generous robust
-scene radius and ignores implausibly distant camera poses, preventing one bad
-VGGT value from making the useful room appear microscopic in the viewer.
+contract. Deployments may tune `STAGE2_POINT_CLOUD_MAX_POINTS` (10,000–900,000).
+The preview consumes RAS's point cloud after its fixed 50th-percentile VGGT depth
+confidence cutoff. Keeping that same point/confidence branch avoids mixing
+depth-derived coordinates with point-map confidence. An unavailable or empty
+filtered cloud fails the required preview artifact instead of publishing an
+unfiltered or synthetic one-point result. The exporter then removes
+only the catastrophic tail beyond a generous robust scene radius and ignores
+implausibly distant camera poses. Geometry-mode files are aligned from VGGT's
+OpenCV coordinates into first-camera, glTF Y-up preview space; room-aligned full
+mode is converted from RAS Z-up into glTF Y-up only when RAS actually found a
+usable floor and wall. The result reports room alignment as requested versus
+applied; invalid or absent camera poses use a truthfully labeled axis-only
+fallback instead of claiming first-camera alignment. GLB metadata includes
+robust preview bounds, node roles, and whether confidence/camera alignment was
+applied. Source-frame sRGB colors are encoded with glTF's linear vertex-color
+semantics. Together these rules keep the useful room upright, correctly colored,
+and framed independently of camera helpers.
 
 Large compatibility outputs are disabled by default. Set
 `STAGE2_EXPORT_DEBUG_ARTIFACTS=1` only when the signed policy allows
