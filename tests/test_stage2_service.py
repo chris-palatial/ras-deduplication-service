@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import requests
 
 
 import stage2_service as stage2
@@ -175,15 +176,105 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertEqual(result["status"], "error")
 
     def test_inline_video_validation(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        self.assertEqual(stage2.MAX_INLINE_VIDEO_BYTES, 6 * 1024 * 1024)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            stage2, "MAX_INLINE_VIDEO_BYTES", 4
+        ):
             path = stage2._materialize_video(
-                {"video_b64": base64.b64encode(b"video").decode(), "media_type": "video/webm"},
+                {"video_b64": base64.b64encode(b"data").decode(), "media_type": "video/webm"},
                 Path(tmp),
             )
             self.assertEqual(path.name, "input.webm")
-            self.assertEqual(path.read_bytes(), b"video")
+            self.assertEqual(path.read_bytes(), b"data")
             with self.assertRaisesRegex(RuntimeError, "valid base64"):
                 stage2._materialize_video({"video_b64": "***"}, Path(tmp))
+            with self.assertRaisesRegex(RuntimeError, "inline video exceeds"):
+                stage2._materialize_video(
+                    {"video_b64": base64.b64encode(b"12345").decode()}, Path(tmp)
+                )
+
+    def test_remote_video_download_is_streamed_and_size_bounded(self):
+        class DownloadResponse:
+            status_code = 200
+
+            def __init__(self, chunks, content_length=None):
+                self._chunks = chunks
+                self.headers = {} if content_length is None else {"content-length": str(content_length)}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+            def iter_content(self, chunk_size):
+                self.test_chunk_size = chunk_size
+                yield from self._chunks
+
+        self.assertEqual(stage2.MAX_REMOTE_VIDEO_BYTES, 64 * 1024 * 1024)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            stage2, "MAX_REMOTE_VIDEO_BYTES", 4
+        ):
+            root = Path(tmp)
+            within_limit = DownloadResponse([b"ab", b"cd"], 4)
+            with patch("requests.get", return_value=within_limit):
+                path = stage2._download_video("https://input.example/clip.mp4?token=secret", root / "exact")
+            self.assertEqual(path.read_bytes(), b"abcd")
+            self.assertEqual(within_limit.test_chunk_size, 1 << 20)
+
+            declared_oversize = DownloadResponse([], 5)
+            with patch("requests.get", return_value=declared_oversize), self.assertRaisesRegex(
+                RuntimeError, "exceeds the .* service limit"
+            ):
+                stage2._download_video("https://input.example/declared.mp4", root / "declared")
+            self.assertFalse(hasattr(declared_oversize, "test_chunk_size"))
+
+            streamed_oversize = DownloadResponse([b"abc", b"de"])
+            oversize_dir = root / "streamed"
+            with patch("requests.get", return_value=streamed_oversize), self.assertRaisesRegex(
+                RuntimeError, "exceeds the .* service limit"
+            ):
+                stage2._download_video("https://input.example/streamed.mp4", oversize_dir)
+            self.assertFalse(
+                (oversize_dir / "input.mp4").exists(),
+                "a rejected partial download must be removed",
+            )
+
+            empty = DownloadResponse([])
+            empty_dir = root / "empty"
+            with patch("requests.get", return_value=empty), self.assertRaisesRegex(
+                RuntimeError, "empty file"
+            ):
+                stage2._download_video("https://input.example/empty.mp4", empty_dir)
+            self.assertFalse((empty_dir / "input.mp4").exists())
+
+    def test_remote_video_download_does_not_leak_signed_query_in_errors(self):
+        class FailedResponse:
+            status_code = 500
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def raise_for_status(self):
+                raise requests.HTTPError(
+                    "500 error for https://input.example/clip.mp4?token=do-not-leak"
+                )
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "requests.get", return_value=FailedResponse()
+        ), self.assertRaisesRegex(RuntimeError, r"video download failed \(HTTPError\)") as caught:
+            stage2._download_video(
+                "https://input.example/clip.mp4?token=do-not-leak", Path(tmp)
+            )
+
+        self.assertNotIn("do-not-leak", str(caught.exception))
 
     def test_dry_run_never_claims_synthetic_instances(self):
         # Invalid video is enough to prove errors stay explicit; the real video

@@ -34,6 +34,7 @@ RAS_REVISION = os.environ.get("RAS_REVISION", "671191457e7244d9337ef3faf558ee92b
 VGGT_REVISION = os.environ.get("VGGT_REVISION", "44b3afbd1869d8bde4894dd8ea1e293112dd5eba")
 SAM3_REVISION = os.environ.get("SAM3_REVISION", "bfbed072a07a6a52c8d5fdc75a7a186251a835b1")
 MAX_INLINE_VIDEO_BYTES = 6 * 1024 * 1024
+MAX_REMOTE_VIDEO_BYTES = 64 * 1024 * 1024
 DEFAULT_VGGT_MODEL_ID = "facebook/VGGT-1B"
 COMMERCIAL_VGGT_MODEL_ID = "facebook/VGGT-1B-Commercial"
 VGGT_MODEL_MARKER = ".stage2_model_id"
@@ -447,24 +448,61 @@ def _download_video(video_url: str, dest_dir: Path, timeout_s: int = 180) -> Pat
         headers["CF-Access-Client-Id"] = cid
         headers["CF-Access-Client-Secret"] = csec
     if not (video_url.startswith("http://") or video_url.startswith("https://")):
-        raise RuntimeError(f"refusing non-HTTP video_url: {video_url[:64]}")
-    with requests.get(video_url, stream=True, timeout=timeout_s, headers=headers) as r:
-        if r.status_code in (401, 403, 302) or "cloudflareaccess" in (r.headers.get("location") or "").lower():
-            raise RuntimeError(
-                f"video URL blocked (HTTP {r.status_code}). "
-                "If the file is on agents.palatial.cloud, Cloudflare Access is rejecting the GPU worker. "
-                "Use a public HTTPS URL, STAGE2_PUBLIC_MEDIA_BASE, or set CF_ACCESS_CLIENT_ID/SECRET on the endpoint."
-            )
-        r.raise_for_status()
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1 << 20):
-                if chunk:
+        raise RuntimeError("refusing non-HTTP video_url")
+
+    # This path is also callable outside Agent Lab, so enforce the worker's own
+    # disk boundary instead of trusting the signed-URL issuer or response header.
+    dest.unlink(missing_ok=True)
+    try:
+        with requests.get(video_url, stream=True, timeout=timeout_s, headers=headers) as r:
+            if r.status_code in (401, 403, 302) or "cloudflareaccess" in (
+                r.headers.get("location") or ""
+            ).lower():
+                raise RuntimeError(
+                    f"video URL blocked (HTTP {r.status_code}). "
+                    "Use an exact-object signed HTTPS URL accessible to the worker, "
+                    "or set CF_ACCESS_CLIENT_ID/SECRET on the endpoint."
+                )
+            r.raise_for_status()
+            declared_raw = r.headers.get("content-length")
+            if declared_raw is not None:
+                try:
+                    declared = int(declared_raw)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("video download returned an invalid Content-Length") from exc
+                if declared <= 0:
+                    raise RuntimeError("video download returned an empty file")
+                if declared > MAX_REMOTE_VIDEO_BYTES:
+                    raise RuntimeError(
+                        f"video download exceeds the {MAX_REMOTE_VIDEO_BYTES // 1024 // 1024} MiB service limit"
+                    )
+
+            written = 0
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1 << 20):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > MAX_REMOTE_VIDEO_BYTES:
+                        raise RuntimeError(
+                            f"video download exceeds the {MAX_REMOTE_VIDEO_BYTES // 1024 // 1024} MiB service limit"
+                        )
                     f.write(chunk)
+            if written == 0:
+                raise RuntimeError("video download returned an empty file")
+    except requests.RequestException as exc:
+        dest.unlink(missing_ok=True)
+        # Requests exceptions may contain the complete URL, including its
+        # signed query. Return only the exception class to the endpoint caller.
+        raise RuntimeError(f"video download failed ({type(exc).__name__})") from exc
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise
     return dest
 
 
 def _materialize_video(payload: dict[str, Any], work: Path) -> Path:
-    """Accept video_url and/or video_b64 (Lab may inline small uploads)."""
+    """Accept a bounded remote video or the legacy bounded inline payload."""
     b64 = payload.get("video_b64")
     video_url = str(payload.get("video_url") or "").strip()
 
@@ -477,7 +515,7 @@ def _materialize_video(payload: dict[str, Any], work: Path) -> Path:
         if not raw:
             raise RuntimeError("video_b64 decoded to an empty file")
         if len(raw) > MAX_INLINE_VIDEO_BYTES:
-            raise RuntimeError("inline video exceeds the 6 MB service limit")
+            raise RuntimeError("inline video exceeds the 6 MiB service limit")
         # sniff extension from media_type if provided
         mt = str(payload.get("media_type") or "video/mp4").lower()
         ext = ".webm" if "webm" in mt else ".mov" if "quicktime" in mt or "mov" in mt else ".mp4"
@@ -491,11 +529,11 @@ def _materialize_video(payload: dict[str, Any], work: Path) -> Path:
         raise RuntimeError(
             "received inline video_url without video_b64 "
             "(worker may be stale, or base64 was stripped as too large). "
-            "Redeploy/restart the endpoint worker and use a clip under ~6MB, "
-            "or configure STAGE2_PUBLIC_MEDIA_BASE / CF Access service tokens."
+            "Redeploy/restart the endpoint worker, send up to 6 MiB through legacy video_b64, "
+            "or provide an HTTPS video_url up to 64 MiB."
         )
     if not (video_url.startswith("http://") or video_url.startswith("https://")):
-        raise RuntimeError(f"unsupported video_url scheme: {video_url[:40]}")
+        raise RuntimeError("unsupported video_url scheme")
     return _download_video(video_url, work)
 
 

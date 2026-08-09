@@ -28,7 +28,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
-          python -m pip install "numpy>=1.26,<2" "opencv-python-headless>=4.10,<5"
+          python -m pip install "numpy>=1.26,<2" "opencv-python-headless>=4.10,<5" "requests>=2.31,<3"
       - name: Compile and test
         run: |
           python -m py_compile handler.py stage2_service.py artifact_upload.py point_cloud_glb.py
