@@ -138,58 +138,174 @@ def _models_dir(ras: Path | None = None) -> Path:
     return Path(os.environ.get("STAGE2_MODELS_DIR", ras / "models")).resolve()
 
 
-def _clone_if_missing(url: str, dest: Path, revision: str) -> None:
-    if dest.is_dir() and (dest / ".git").exists():
-        import subprocess
-
-        try:
-            head = subprocess.check_output(
-                ["git", "-C", str(dest), "rev-parse", "HEAD"],
-                text=True,
-                stderr=subprocess.DEVNULL,
-            ).strip()
-            clean = subprocess.call(
-                ["git", "-C", str(dest), "diff-index", "--quiet", "HEAD", "--"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ) == 0
-        except (OSError, subprocess.SubprocessError):
-            head = ""
-            clean = False
-        if head == revision and clean:
-            return
-        if clean:
-            _run(["git", "-C", str(dest), "fetch", "--depth", "1", "origin", revision])
-            _run(["git", "-C", str(dest), "checkout", "--detach", "FETCH_HEAD"])
-            return
-        # The revision alone is insufficient when tracked files changed in
-        # place. This checkout is runtime-owned, so recreate it fail-closed.
-        shutil.rmtree(dest, ignore_errors=True)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
-        shutil.rmtree(dest, ignore_errors=True)
-    _run(["git", "clone", "--filter=blob:none", "--no-checkout", url, str(dest)])
-    _run(["git", "-C", str(dest), "fetch", "--depth", "1", "origin", revision])
-    _run(["git", "-C", str(dest), "checkout", "--detach", "FETCH_HEAD"])
-
-
-def _verified_checkout_revision(dest: Path, expected_revision: str) -> str:
-    """Return the actual clean checkout revision or fail before claiming provenance."""
+def _checkout_state(dest: Path, *, ignore_submodules: bool = False) -> tuple[str, bool]:
+    """Return checkout HEAD and tracked-file cleanliness without trusting stderr."""
     import subprocess
 
+    if not dest.is_dir() or not (dest / ".git").exists():
+        return "", False
     try:
         head = subprocess.check_output(
             ["git", "-C", str(dest), "rev-parse", "HEAD"],
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
+        diff_cmd = ["git", "-C", str(dest), "diff-index", "--quiet"]
+        if ignore_submodules:
+            diff_cmd.append("--ignore-submodules=all")
+        diff_cmd.extend(["HEAD", "--"])
         clean = subprocess.call(
-            ["git", "-C", str(dest), "diff-index", "--quiet", "HEAD", "--"],
+            diff_cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         ) == 0
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError(f"could not verify source checkout at {dest}") from exc
+    except (OSError, subprocess.SubprocessError):
+        return "", False
+    return head, clean
+
+
+def _fetch_pinned_revision(repo: Path, revision: str, *, attempts: int = 3) -> None:
+    """Fetch one immutable public revision with bounded transient retries."""
+    import subprocess
+
+    command = [
+        "git",
+        "-C",
+        str(repo),
+        "fetch",
+        "--depth",
+        "1",
+        "origin",
+        revision,
+    ]
+    last_detail = ""
+    for attempt in range(1, attempts + 1):
+        print(f"[stage2] $ {' '.join(command)} (attempt {attempt}/{attempts})", flush=True)
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=120,
+                check=False,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            )
+            if result.returncode == 0:
+                return
+            detail_lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
+            last_detail = " | ".join(detail_lines[-4:])[-800:]
+        except subprocess.TimeoutExpired:
+            last_detail = "fetch timed out after 120 seconds"
+        except OSError as exc:
+            last_detail = f"{type(exc).__name__}: {exc}"
+        if attempt < attempts:
+            time.sleep(2 ** (attempt - 1))
+    suffix = f" Last error: {last_detail}" if last_detail else ""
+    raise RuntimeError(
+        f"git fetch of pinned revision failed after {attempts} attempts.{suffix}"
+    )
+
+
+def _build_pinned_checkout(url: str, dest: Path, revision: str) -> None:
+    """Build and verify a checkout in an otherwise empty staging directory."""
+    _run(["git", "init", "-q", str(dest)])
+    _run(["git", "-C", str(dest), "remote", "add", "origin", url])
+    _fetch_pinned_revision(dest, revision)
+    _run(["git", "-C", str(dest), "checkout", "--detach", "FETCH_HEAD"])
+    head, clean = _checkout_state(dest)
+    if head != revision or not clean:
+        raise RuntimeError(f"staged source checkout did not verify pinned revision {revision}")
+
+
+def _remove_runtime_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def _runtime_path_exists(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _recover_interrupted_checkout(dest: Path, backup: Path) -> None:
+    """Recover the old tree if a prior worker stopped between the two renames."""
+    if not _runtime_path_exists(backup):
+        return
+    if not _runtime_path_exists(dest):
+        os.replace(backup, dest)
+        return
+    try:
+        _remove_runtime_path(backup)
+    except OSError as exc:
+        print(
+            f"[stage2] warning: could not remove stale checkout backup ({type(exc).__name__})",
+            flush=True,
+        )
+
+
+def _clone_if_missing(
+    url: str,
+    dest: Path,
+    revision: str,
+    *,
+    ignore_submodules: bool = False,
+) -> None:
+    """Install an exact checkout without exposing the final path to partial clones."""
+    backup = dest.parent / f".{dest.name}.previous"
+    _recover_interrupted_checkout(dest, backup)
+    head, clean = _checkout_state(dest, ignore_submodules=ignore_submodules)
+    if head == revision and clean:
+        return
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staged = Path(
+        tempfile.mkdtemp(prefix=f".{dest.name}.checkout-", dir=str(dest.parent))
+    )
+    try:
+        _build_pinned_checkout(url, staged, revision)
+
+        # Another initializer may have completed while this checkout was being
+        # staged. Preserve its verified result rather than replacing live work.
+        head, clean = _checkout_state(dest, ignore_submodules=ignore_submodules)
+        if head == revision and clean:
+            return
+
+        # Network failures happen before this point. Publish through a
+        # recoverable sibling rename so even a local filesystem error restores
+        # the previous runtime, and a killed worker can recover it next time.
+        had_previous = _runtime_path_exists(dest)
+        if _runtime_path_exists(backup):
+            _remove_runtime_path(backup)
+        if had_previous:
+            os.replace(dest, backup)
+        try:
+            os.replace(staged, dest)
+        except BaseException:
+            if had_previous and not _runtime_path_exists(dest) and _runtime_path_exists(backup):
+                os.replace(backup, dest)
+            raise
+        if _runtime_path_exists(backup):
+            try:
+                _remove_runtime_path(backup)
+            except OSError as exc:
+                print(
+                    f"[stage2] warning: could not remove replaced checkout backup ({type(exc).__name__})",
+                    flush=True,
+                )
+    finally:
+        _remove_runtime_path(staged)
+
+
+def _verified_checkout_revision(
+    dest: Path,
+    expected_revision: str,
+    *,
+    ignore_submodules: bool = False,
+) -> str:
+    """Return the actual clean checkout revision or fail before claiming provenance."""
+    head, clean = _checkout_state(dest, ignore_submodules=ignore_submodules)
     if head != expected_revision or not clean:
         raise RuntimeError(
             f"source checkout at {dest} does not match clean revision {expected_revision}"
@@ -487,13 +603,25 @@ def _ensure_python_packages(ras: Path, *, require_sam3: bool) -> None:
     print(f"[stage2] python packages importable ({packages})", flush=True)
 
 
-def _ensure_ras_installed(*, require_sam3: bool = True) -> None:
+def _ensure_ras_installed(
+    *,
+    require_sam3: bool = True,
+    ensure_weights: bool = True,
+) -> None:
     """Install paper repo + packages + weights (first full call, then cached on volume)."""
     ras = _ras_root()
     models_dir = _models_dir(ras)
 
     with _stage2_initialization_lock(models_dir):
-        _clone_if_missing("https://github.com/xiac20/ReplicateAnyScene.git", ras, RAS_REVISION)
+        # VGGT and SAM3 are managed as separately verified pinned checkouts.
+        # Their intentional revisions must not make the parent RAS gitlinks
+        # look dirty and trigger a destructive parent re-clone on every job.
+        _clone_if_missing(
+            "https://github.com/xiac20/ReplicateAnyScene.git",
+            ras,
+            RAS_REVISION,
+            ignore_submodules=True,
+        )
         # Keep the exact upstream gitlinks used by the reviewed RAS revision.
         _clone_if_missing("https://github.com/facebookresearch/vggt.git", ras / "vggt", VGGT_REVISION)
         if require_sam3:
@@ -509,16 +637,16 @@ def _ensure_ras_installed(*, require_sam3: bool = True) -> None:
         if require_sam3:
             _verify_import_from_checkout("sam3.model_builder", ras / "sam3")
 
-        if not _vggt_weights_ok(models_dir / "VGGT", _vggt_model_id()):
+        if ensure_weights and not _vggt_weights_ok(models_dir / "VGGT", _vggt_model_id()):
             _download_vggt_weights(models_dir)
 
         # Older builds wrote .stage2_ready even when SAM3 download failed — ignore markers alone.
-        if require_sam3 and not _weights_ready(models_dir):
+        if ensure_weights and require_sam3 and not _weights_ready(models_dir):
             for marker in (models_dir / "VGGT" / ".stage2_ready", models_dir / "SAM3" / ".stage2_ready"):
                 if marker.exists():
                     marker.unlink()
             _download_sam3_weights(models_dir)
-        elif require_sam3:
+        elif ensure_weights and require_sam3:
             _ensure_sam3_pt_layout(models_dir)
 
 
@@ -986,7 +1114,7 @@ def _normalize_mask_video(
 
 
 def run_stage2_dry(payload: dict[str, Any]) -> dict[str, Any]:
-    """Wire-test path: download + frame sample only, no VGGT/SAM weights."""
+    """Validate video I/O and, for typed checks, all pinned source runtimes."""
     t0 = time.time()
     video_url = str(payload.get("video_url") or "").strip()
     categories = payload.get("categories") or []
@@ -1021,10 +1149,47 @@ def run_stage2_dry(payload: dict[str, Any]) -> dict[str, Any]:
             if ok:
                 frames_ok += 1
         cap.release()
-        return {
+        source_validation = None
+        source_bootstrap_ms = None
+        if payload.get("analysis_type") == "validation_v1":
+            source_started = time.time()
+            _ensure_ras_installed(require_sam3=True, ensure_weights=False)
+            ras = _ras_root()
+            source_validation = {
+                "ras_revision": _verified_checkout_revision(
+                    ras,
+                    RAS_REVISION,
+                    ignore_submodules=True,
+                ),
+                "vggt_revision": _verified_checkout_revision(ras / "vggt", VGGT_REVISION),
+                "sam3_revision": _verified_checkout_revision(ras / "sam3", SAM3_REVISION),
+                "sam3_required": True,
+                "weights_required": False,
+            }
+            source_bootstrap_ms = int((time.time() - source_started) * 1000)
+        pipeline = [
+            {"id": "intake", "name": "Video intake", "status": "ok"},
+            {"id": "sample_frames", "name": "Frame sampling", "status": "ok", "detail": {"frames_used": frames_ok}},
+            {"id": "vggt", "name": "VGGT", "status": "skipped_dry_run"},
+            {"id": "sam", "name": "SAM3", "status": "skipped_dry_run"},
+            {"id": "dedup", "name": "Spatial dedup", "status": "skipped_dry_run"},
+        ]
+        if source_validation:
+            pipeline.insert(2, {
+                "id": "source_bootstrap",
+                "name": "Pinned RAS + VGGT + SAM3 source bootstrap",
+                "status": "ok",
+                "ms": source_bootstrap_ms,
+            })
+        response = {
             "status": "ok",
             "mode": "dry_run",
-            "implementation": "ReplicateAnyScene input validation (video download and frame sampling only; no VGGT or SAM 3)",
+            "implementation": (
+                "ReplicateAnyScene input and pinned-source validation "
+                "(no model weights or inference)"
+                if source_validation
+                else "ReplicateAnyScene input validation (video download and frame sampling only)"
+            ),
             "upstream": "https://github.com/xiac20/ReplicateAnyScene",
             "frames_used": frames_ok,
             "source_frame_indices": idxs,
@@ -1033,15 +1198,12 @@ def run_stage2_dry(payload: dict[str, Any]) -> dict[str, Any]:
             "raw_track_count": 0,
             "instance_count": 0,
             "instances": [],
-            "pipeline": [
-                {"id": "intake", "name": "Video intake", "status": "ok"},
-                {"id": "sample_frames", "name": "Frame sampling", "status": "ok", "detail": {"frames_used": frames_ok}},
-                {"id": "vggt", "name": "VGGT", "status": "skipped_dry_run"},
-                {"id": "sam", "name": "SAM3", "status": "skipped_dry_run"},
-                {"id": "dedup", "name": "Spatial dedup", "status": "skipped_dry_run"},
-            ],
+            "pipeline": pipeline,
             "timings_ms": {"total": int((time.time() - t0) * 1000)},
         }
+        if source_validation:
+            response["source"] = source_validation
+        return response
     except Exception as e:
         return {
             "status": "error",
@@ -1717,14 +1879,14 @@ def _attach_success_provenance(
     mode: str,
     analysis_type: str | None,
 ) -> dict[str, Any]:
-    if result.get("status") != "ok":
-        return result
-
     # Legacy callers predate versioned analysis types. Preserve their response
     # shape, but never manufacture provenance for the typed contract: the
     # model runner must report what it actually loaded and we verify it here.
     if analysis_type is None:
         return result
+    enriched = {**result, "analysis_type": analysis_type}
+    if result.get("status") != "ok":
+        return enriched
 
     def provenance_error(component: str) -> dict[str, Any]:
         return {
@@ -1737,6 +1899,16 @@ def _attach_success_provenance(
             ),
         }
 
+    if analysis_type == "validation_v1":
+        source = result.get("source")
+        if not isinstance(source, dict) or (
+            source.get("ras_revision") != RAS_REVISION
+            or source.get("vggt_revision") != DEFAULT_VGGT_REVISION
+            or source.get("sam3_revision") != DEFAULT_SAM3_REVISION
+            or source.get("sam3_required") is not True
+            or source.get("weights_required") is not False
+        ):
+            return provenance_error("source bootstrap")
     if analysis_type in VGGT_1B_ANALYSIS_TYPES:
         geometry = result.get("geometry")
         if not isinstance(geometry, dict) or (
@@ -1752,7 +1924,6 @@ def _attach_success_provenance(
         ):
             return provenance_error("SAM 3")
 
-    enriched = {**result, "analysis_type": analysis_type}
     return enriched
 
 
@@ -1768,18 +1939,25 @@ def run_stage2(payload: dict[str, Any]) -> dict[str, Any]:
             "analysis_type": analysis_type,
             "error": analysis_error,
         }
+
+    def input_error(message: str) -> dict[str, Any]:
+        result = {"status": "error", "mode": mode, "error": message}
+        if analysis_type is not None:
+            result["analysis_type"] = analysis_type
+        return result
+
     try:
         max_frames = int(payload.get("max_frames") or (24 if mode == "dry_run" else 48))
     except (TypeError, ValueError):
-        return {"status": "error", "mode": mode, "error": "max_frames must be an integer from 2 to 160"}
+        return input_error("max_frames must be an integer from 2 to 160")
     categories = payload.get("categories") or []
     if isinstance(categories, str):
         categories = [c.strip() for c in categories.split(",") if c.strip()]
     categories = list(dict.fromkeys(str(c).strip() for c in categories if str(c).strip()))
     if not categories or len(categories) > 8 or any(len(c) > 64 for c in categories):
-        return {"status": "error", "mode": mode, "error": "use 1-8 categories, each at most 64 characters"}
+        return input_error("use 1-8 categories, each at most 64 characters")
     if max_frames < 2 or max_frames > 160:
-        return {"status": "error", "mode": mode, "error": "max_frames must be an integer from 2 to 160"}
+        return input_error("max_frames must be an integer from 2 to 160")
     payload = {**payload, "mode": mode, "max_frames": max_frames, "categories": categories}
     if mode == "dry_run":
         result = run_stage2_dry(payload)

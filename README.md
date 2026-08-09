@@ -21,15 +21,17 @@ Those live in:
 
 ## Modes
 
-- `dry_run` — download video + sample frames; no model weights
+- `dry_run` — download video + sample frames; typed validation also verifies
+  pinned RAS/VGGT/SAM3 source bootstrap, but downloads no model weights
 - `geometry` — run real VGGT geometry; deliberately skip SAM3 and dedup
 - `full` — exact RAS Stage 2 path (stops before Stage 3 mesh generation)
 
 New Agent Lab requests also carry a stable `analysis_type`. This worker owns
 `validation_v1`, `geometry_vggt_1b`, and `dedup_ras_vggt_sam3`; it rejects fal
 mask types and `geometry_vggt_omega_1b` because those belong to separate
-backends. Typed VGGT results echo the analysis id, checkpoint repository, and
-exact source revision. Legacy requests without `analysis_type` remain supported.
+backends. Typed results preserve the analysis id on both success and failure;
+VGGT results also echo the checkpoint repository and exact source revision.
+Legacy requests without `analysis_type` remain supported.
 
 ## Weights
 
@@ -87,7 +89,11 @@ runtimes without lease metadata are left for manual inspection.
 Lazy RAS/VGGT/SAM3 source installation and shared checkpoint downloads use one
 cross-worker file lock under `STAGE2_MODELS_DIR`. Both the wrapper checkout and
 the upstream source checkouts verify their commit and tracked-file cleanliness
-before reuse; a dirty runtime-owned checkout is rebuilt.
+before reuse. RAS's separately verified VGGT/SAM3 gitlinks are excluded from the
+parent cleanliness check so intentional child revision upgrades remain
+idempotent. A missing or dirty checkout is fetched into a verified sibling
+staging directory with bounded retries and is published only after success, so
+a transient GitHub failure cannot delete the last usable runtime.
 
 Prebuilt images must pass
 `--build-arg STAGE2_BUILD_REVISION="$(git rev-parse HEAD)"`. The handler reports
@@ -107,7 +113,10 @@ After a successful template update, deployment waits for the endpoint version to
 advance and for every live worker reported by RunPod to carry that version. It
 then submits a bounded real `dry_run` to endpoint `sp2oyuum48vk0j` (override with
 `STAGE2_ENDPOINT_ID`), polls its async status, and requires the response's
-`stage2_code_revision` to equal the deployed commit. Fleet convergence has a
+`stage2_code_revision` to equal the deployed commit. This typed validation also
+stages and verifies the pinned RAS, VGGT, and SAM3 source checkouts without downloading
+model weights or running inference, so a release cannot pass while lazy source
+bootstrap is broken. Fleet convergence has a
 2,700-second release budget (longer than the 2,100-second worker execution
 window), while dry smoke is independently capped at 900 seconds and must also
 fit inside the remaining release budget. Transient safe reads are retried, but

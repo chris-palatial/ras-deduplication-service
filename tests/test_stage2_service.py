@@ -85,7 +85,7 @@ class Stage2ServiceTest(unittest.TestCase):
             yield
             events.append("lock_exit")
 
-        def cloned(_url, dest, _revision):
+        def cloned(_url, dest, _revision, **_kwargs):
             events.append(f"clone:{Path(dest).name}")
 
         with patch.object(stage2, "_ras_root", return_value=Path("/tmp/ras")), patch.object(
@@ -216,7 +216,91 @@ class Stage2ServiceTest(unittest.TestCase):
             self.assertTrue((ras / "models").is_symlink())
             self.assertEqual((ras / "models").resolve(), models.resolve())
 
-    def test_dirty_pinned_checkout_is_recreated_instead_of_trusted(self):
+    def test_managed_submodule_revision_does_not_reclone_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            child_source = root / "child-source"
+            child_source.mkdir()
+            subprocess.run(["git", "init", "-q", str(child_source)], check=True)
+            subprocess.run(
+                ["git", "-C", str(child_source), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(child_source), "config", "user.name", "Test"],
+                check=True,
+            )
+            child_file = child_source / "model.py"
+            child_file.write_text("version = 1\n")
+            subprocess.run(["git", "-C", str(child_source), "add", "model.py"], check=True)
+            subprocess.run(
+                ["git", "-C", str(child_source), "commit", "-q", "-m", "child v1"],
+                check=True,
+            )
+
+            parent = root / "parent"
+            parent.mkdir()
+            subprocess.run(["git", "init", "-q", str(parent)], check=True)
+            subprocess.run(
+                ["git", "-C", str(parent), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(parent), "config", "user.name", "Test"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "protocol.file.allow=always",
+                    "-C",
+                    str(parent),
+                    "submodule",
+                    "add",
+                    "-q",
+                    str(child_source),
+                    "vggt",
+                ],
+                check=True,
+            )
+            subprocess.run(["git", "-C", str(parent), "commit", "-q", "-am", "parent"], check=True)
+            parent_revision = subprocess.check_output(
+                ["git", "-C", str(parent), "rev-parse", "HEAD"], text=True
+            ).strip()
+
+            managed_child = parent / "vggt"
+            subprocess.run(
+                ["git", "-C", str(managed_child), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(managed_child), "config", "user.name", "Test"],
+                check=True,
+            )
+            (managed_child / "model.py").write_text("version = 2\n")
+            subprocess.run(["git", "-C", str(managed_child), "commit", "-q", "-am", "child v2"], check=True)
+
+            self.assertNotEqual(
+                subprocess.run(
+                    ["git", "-C", str(parent), "diff-index", "--quiet", "HEAD", "--"],
+                    check=False,
+                ).returncode,
+                0,
+            )
+            with patch.object(
+                stage2,
+                "_build_pinned_checkout",
+                side_effect=AssertionError("verified parent must not be rebuilt"),
+            ):
+                stage2._clone_if_missing(
+                    "https://example.test/parent.git",
+                    parent,
+                    parent_revision,
+                    ignore_submodules=True,
+                )
+
+    def test_dirty_pinned_checkout_is_recreated_from_verified_staging(self):
         with tempfile.TemporaryDirectory() as tmp:
             checkout = Path(tmp) / "checkout"
             checkout.mkdir()
@@ -230,14 +314,133 @@ class Stage2ServiceTest(unittest.TestCase):
             revision = subprocess.check_output(
                 ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True
             ).strip()
+            remote = Path(tmp) / "remote.git"
+            subprocess.run(["git", "clone", "-q", "--bare", str(checkout), str(remote)], check=True)
             tracked.write_text("dirty\n")
 
-            commands = []
-            with patch.object(stage2, "_run", side_effect=lambda command, **_kwargs: commands.append(command)):
-                stage2._clone_if_missing("https://example.test/repo.git", checkout, revision)
+            stage2._clone_if_missing(str(remote), checkout, revision)
 
-            self.assertFalse(checkout.exists())
-            self.assertEqual(commands[0][:2], ["git", "clone"])
+            self.assertEqual(tracked.read_text(), "clean\n")
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True
+                ).strip(),
+                revision,
+            )
+            self.assertFalse(list(Path(tmp).glob(".checkout.checkout-*")))
+
+    def test_failed_staged_checkout_preserves_existing_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = Path(tmp) / "checkout"
+            checkout.mkdir()
+            (checkout / ".git").mkdir()
+            sentinel = checkout / "keep.txt"
+            sentinel.write_text("existing runtime\n")
+
+            with patch.object(
+                stage2,
+                "_build_pinned_checkout",
+                side_effect=RuntimeError("temporary GitHub failure"),
+            ), self.assertRaisesRegex(RuntimeError, "temporary GitHub failure"):
+                stage2._clone_if_missing(
+                    "https://example.test/repo.git",
+                    checkout,
+                    "0" * 40,
+                )
+
+            self.assertEqual(sentinel.read_text(), "existing runtime\n")
+            self.assertFalse(list(Path(tmp).glob(".checkout.checkout-*")))
+
+    def test_publish_failure_rolls_back_the_previous_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = Path(tmp) / "checkout"
+            checkout.mkdir()
+            (checkout / ".git").mkdir()
+            sentinel = checkout / "keep.txt"
+            sentinel.write_text("existing runtime\n")
+            real_replace = stage2.os.replace
+
+            def build(_url, staged, _revision):
+                (staged / ".git").mkdir()
+                (staged / "new.txt").write_text("staged runtime\n")
+
+            def replace(source, destination):
+                source_path = Path(source)
+                destination_path = Path(destination)
+                if (
+                    destination_path == checkout
+                    and source_path.name.startswith(".checkout.checkout-")
+                ):
+                    raise OSError("simulated publish failure")
+                return real_replace(source, destination)
+
+            with patch.object(stage2, "_build_pinned_checkout", side_effect=build), patch.object(
+                stage2.os, "replace", side_effect=replace
+            ), self.assertRaisesRegex(OSError, "simulated publish failure"):
+                stage2._clone_if_missing(
+                    "https://example.test/repo.git",
+                    checkout,
+                    "0" * 40,
+                )
+
+            self.assertEqual(sentinel.read_text(), "existing runtime\n")
+            self.assertFalse((Path(tmp) / ".checkout.previous").exists())
+            self.assertFalse(list(Path(tmp).glob(".checkout.checkout-*")))
+
+    def test_interrupted_publish_recovers_the_previous_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = Path(tmp) / "checkout"
+            backup = Path(tmp) / ".checkout.previous"
+            backup.mkdir()
+            sentinel = backup / "keep.txt"
+            sentinel.write_text("previous runtime\n")
+
+            stage2._recover_interrupted_checkout(checkout, backup)
+
+            self.assertEqual((checkout / "keep.txt").read_text(), "previous runtime\n")
+            self.assertFalse(backup.exists())
+
+    def test_source_only_bootstrap_never_downloads_model_weights(self):
+        @contextmanager
+        def unlocked(_models_dir):
+            yield
+
+        with patch.object(stage2, "_ras_root", return_value=Path("/tmp/ras")), patch.object(
+            stage2, "_models_dir", return_value=Path("/tmp/models")
+        ), patch.object(stage2, "_stage2_initialization_lock", side_effect=unlocked), patch.object(
+            stage2, "_clone_if_missing"
+        ) as clone, patch.object(stage2, "_prefer_source_checkouts"), patch.object(
+            stage2, "_ensure_python_packages"
+        ), patch.object(stage2, "_verify_import_from_checkout"), patch.object(
+            stage2, "_download_vggt_weights"
+        ) as download_vggt, patch.object(
+            stage2, "_download_sam3_weights"
+        ) as download_sam3:
+            stage2._ensure_ras_installed(require_sam3=True, ensure_weights=False)
+
+        self.assertEqual(clone.call_count, 3)
+        download_vggt.assert_not_called()
+        download_sam3.assert_not_called()
+
+    def test_pinned_fetch_retries_a_transient_failure(self):
+        failed = types.SimpleNamespace(returncode=128, stderr="fatal: temporary network error\n")
+        succeeded = types.SimpleNamespace(returncode=0, stderr="")
+        with patch.object(subprocess, "run", side_effect=[failed, succeeded]) as run, patch.object(
+            stage2.time, "sleep"
+        ) as sleep:
+            stage2._fetch_pinned_revision(Path("/tmp/checkout"), "1" * 40)
+
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_pinned_fetch_reports_the_last_git_error(self):
+        failed = types.SimpleNamespace(returncode=128, stderr="fatal: repository unavailable\n")
+        with patch.object(subprocess, "run", return_value=failed), patch.object(
+            stage2.time, "sleep"
+        ) as sleep, self.assertRaisesRegex(RuntimeError, "fatal: repository unavailable"):
+            stage2._fetch_pinned_revision(Path("/tmp/checkout"), "1" * 40)
+
+        self.assertEqual(sleep.call_count, 2)
 
     def test_source_indices_match_upstream_uniform_sampling(self):
         frames = {
@@ -278,6 +481,14 @@ class Stage2ServiceTest(unittest.TestCase):
         )
         for analysis_type, mode, runner_name in cases:
             runner_result = {"status": "ok", "mode": mode}
+            if mode == "dry_run":
+                runner_result["source"] = {
+                    "ras_revision": stage2.RAS_REVISION,
+                    "vggt_revision": stage2.DEFAULT_VGGT_REVISION,
+                    "sam3_revision": stage2.DEFAULT_SAM3_REVISION,
+                    "sam3_required": True,
+                    "weights_required": False,
+                }
             if mode in {"geometry", "full"}:
                 runner_result["geometry"] = {
                     "backend": "vggt",
@@ -311,6 +522,79 @@ class Stage2ServiceTest(unittest.TestCase):
                 self.assertEqual(result["sam"]["model_id"], stage2.SAM3_MODEL_ID)
                 self.assertEqual(result["sam"]["source_revision"], stage2.DEFAULT_SAM3_REVISION)
             runner.assert_called_once()
+
+    def test_typed_validation_bootstraps_pinned_sources_without_weights(self):
+        class FakeCapture:
+            def isOpened(self):
+                return True
+
+            def get(self, prop):
+                import cv2
+
+                return {
+                    cv2.CAP_PROP_FRAME_COUNT: 2,
+                    cv2.CAP_PROP_FPS: 24,
+                    cv2.CAP_PROP_FRAME_WIDTH: 16,
+                    cv2.CAP_PROP_FRAME_HEIGHT: 16,
+                }.get(prop, 0)
+
+            def set(self, _prop, _value):
+                return True
+
+            def read(self):
+                return True, np.zeros((16, 16, 3), dtype=np.uint8)
+
+            def release(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            stage2,
+            "_materialize_video",
+            return_value=Path(tmp) / "input.mp4",
+        ), patch("cv2.VideoCapture", return_value=FakeCapture()), patch.object(
+            stage2, "_ensure_ras_installed"
+        ) as ensure, patch.object(
+            stage2, "_ras_root", return_value=Path(tmp) / "ras"
+        ), patch.object(
+            stage2,
+            "_verified_checkout_revision",
+            side_effect=[
+                stage2.RAS_REVISION,
+                stage2.DEFAULT_VGGT_REVISION,
+                stage2.DEFAULT_SAM3_REVISION,
+            ],
+        ):
+            result = stage2.run_stage2({
+                "analysis_type": "validation_v1",
+                "mode": "dry_run",
+                "video_b64": "ignored-by-materializer-mock",
+                "categories": ["deployment-smoke"],
+                "max_frames": 2,
+            })
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["analysis_type"], "validation_v1")
+        self.assertEqual(result["source"]["ras_revision"], stage2.RAS_REVISION)
+        self.assertEqual(result["source"]["vggt_revision"], stage2.DEFAULT_VGGT_REVISION)
+        self.assertEqual(result["source"]["sam3_revision"], stage2.DEFAULT_SAM3_REVISION)
+        ensure.assert_called_once_with(require_sam3=True, ensure_weights=False)
+
+    def test_typed_runner_error_preserves_analysis_identity(self):
+        with patch.object(
+            stage2,
+            "run_stage2_geometry",
+            return_value={"status": "error", "mode": "geometry", "error": "git fetch failed"},
+        ):
+            result = stage2.run_stage2({
+                "analysis_type": "geometry_vggt_1b",
+                "mode": "geometry",
+                "categories": ["chair"],
+                "max_frames": 8,
+            })
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["analysis_type"], "geometry_vggt_1b")
+        self.assertEqual(result["error"], "git fetch failed")
 
     def test_typed_analysis_rejects_runner_provenance_instead_of_rewriting_it(self):
         cases = (

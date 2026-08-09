@@ -21,6 +21,9 @@ GITHUB_BRANCH = "main"
 DEFAULT_TEMPLATE_ID = "inapyg0va0"
 DEFAULT_ENDPOINT_ID = "sp2oyuum48vk0j"
 INVOKE_API_ROOT = "https://api.runpod.ai/v2"
+EXPECTED_RAS_REVISION = "671191457e7244d9337ef3faf558ee92bbf9bf73"
+EXPECTED_VGGT_REVISION = "9e4fa662a8893ed348d048e8b57816c12593448b"
+EXPECTED_SAM3_REVISION = "bfbed072a07a6a52c8d5fdc75a7a186251a835b1"
 SMOKE_VIDEO_B64 = (
     "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAMrbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAA+gAAQAA"
     "AQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAlV0"
@@ -329,6 +332,14 @@ def run_post_deploy_smoke(
             or output.get("analysis_type") != "validation_v1"
         ):
             raise RuntimeError("RunPod post-deploy dry_run returned a non-ok result")
+        elif not isinstance(output.get("source"), dict) or (
+            output["source"].get("ras_revision") != EXPECTED_RAS_REVISION
+            or output["source"].get("vggt_revision") != EXPECTED_VGGT_REVISION
+            or output["source"].get("sam3_revision") != EXPECTED_SAM3_REVISION
+            or output["source"].get("sam3_required") is not True
+            or output["source"].get("weights_required") is not False
+        ):
+            raise RuntimeError("RunPod post-deploy dry_run did not verify pinned source bootstrap")
         else:
             return {
                 "status": "passed",
