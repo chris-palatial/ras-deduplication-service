@@ -1,420 +1,201 @@
 # RAS Deduplication Service
 
-Thin RunPod / HTTP wrapper around the **public ReplicateAnyScene (RAS) Stage 2**
-physical-object deduplication pipeline, plus a geometry-only adapter for Meta's
-official VGGT-Omega Hugging Face Space.
+RunPod worker for the Agent Lab deduplication research page. It wraps pinned
+public ReplicateAnyScene (RAS) geometry and spatial-deduplication code, local
+VGGT geometry, and Meta's hosted VGGT-Omega demo.
 
-This repository is the service wrapper. It does **not** fork or reimplement
-VGGT, SAM3, or RAS spatial deduplication. At image-build or worker-bootstrap
-time, it clones and verifies exact commits from:
+This service is **Agent-Lab-only**. It is not a Scene Parse production service.
+The retired `scene_parse_catalog_v1` profile and the old monolithic
+`dedup_ras_vggt_sam3` profile fail closed at the request router.
 
-- https://github.com/xiac20/ReplicateAnyScene (`main.py` Stage 2 block + `src/*`)
-- https://github.com/facebookresearch/vggt
-- https://github.com/facebookresearch/sam3
+## Runtime ownership
 
-Those checkouts are pinned runtime dependencies, not Git submodules of this
-wrapper repository. The public product and repository name is **RAS
-Deduplication Service**. Existing `STAGE2_*` environment variables,
-`stage2_code_revision`, and internal module names remain stable compatibility
-contracts.
+The worker verifies exact revisions of:
 
-## What we add
+- [ReplicateAnyScene](https://github.com/xiac20/ReplicateAnyScene) for geometry
+  utilities and the original self/cross-category 3D deduplication functions.
+- [VGGT](https://github.com/facebookresearch/vggt) for local geometry.
 
-| File | Role |
-| --- | --- |
-| `stage2_service.py` | Calls RAS Stage 2; provides model-free, local VGGT, and hosted VGGT-Omega geometry modes |
-| `object_catalog.py` | Builds a bounded, versioned catalog and JPEG crop atlas from Full RAS masks |
-| `scene_parse_catalog.py` | Builds the bounded inline Scene Parse catalog and conservatively retains brief object hypotheses |
-| `point_cloud_glb.py` | Exports bounded colored VGGT points + camera frustums as glTF 2.0 GLB |
-| `artifact_upload.py` | Uses Agent Lab upload tickets to deliver files to R2 and return receipts |
-| `handler.py` | RunPod Serverless entry |
-| `scripts/download_weights.sh` | One-time HF weight download (build or volume) |
-| `Dockerfile` | Installs RAS + submodules + wrapper |
+They are pinned runtime dependencies, not Git submodules. The image does not
+clone, install, load, or download SAM. Agent Lab runs SAM through fal and hands
+the resulting object tracks to this worker.
 
-## Modes
+Existing `STAGE2_*` environment names and `stage2_code_revision` remain
+compatibility contracts even though the product name is Deduplication.
 
-- `dry_run` — download video + sample frames; typed validation also verifies
-  pinned RAS/VGGT/SAM3 source bootstrap, but downloads no model weights
-- `geometry`: run real VGGT geometry; deliberately skip SAM3 and dedup
-- `full`: exact RAS Stage 2 path (stops before Stage 3 mesh generation)
+## Supported analysis types
 
-Local VGGT 1B geometry and Full RAS accept signed remote sources up to a
-500 MiB worker hard limit and 60 seconds. The slightly larger binary worker
-limit intentionally accepts the Agent Lab caller limit of 500,000,000 decimal
-bytes. New callers may provide `source_size_bytes` and `source_sha256`; when
-present, both are verified against the downloaded bytes before runtime
-bootstrap or model work. Legacy callers may omit either field.
+| Analysis type | Mode | Result |
+| --- | --- | --- |
+| `validation_v1` | `dry_run` | Input plus pinned RAS/VGGT source validation; no weights or inference |
+| `validation_object_catalog_transport_v1` | `dry_run` | Privileged synthetic R2 artifact transport canary |
+| `geometry_vggt_1b` | `geometry` | Local VGGT point-cloud GLB |
+| `geometry_vggt_omega_1b` | `geometry` | Hosted VGGT-Omega point-cloud GLB |
+| `best_view_geometry_v1` | `geometry` | Exact model-frame clip, reusable geometry inputs, and point-cloud GLB |
+| `best_view_score_v1` | `full` | Weights-free best-view scoring over external fal masks |
+| `dedup_ras_finalize_v1` | `full` | Weights-free RAS 3D identity dedup over external fal object tracks |
 
-Before model bootstrap, these two modes count and validate the complete decoded
-stream, enforce an 8,192-pixel edge limit, a
-16,777,216-pixel frame limit, and a 14,400 decoded-frame limit. They then use the
-caller's 2–160 frame budget to select uniformly across the full decoded timeline
-and materialize only those frames as scaled JPEGs, with a 256 MiB sampled-file limit. They no
-longer call the upstream helper that first expands every source frame to PNG.
-Validation-only and hosted VGGT-Omega retain the existing 64 MiB remote-source
-boundary; the Omega adapter itself is unchanged.
+`mask_sam3` and `mask_sam31` belong to the Agent Lab fal adapters and are
+rejected here. The same is true of the retired local-SAM Full RAS and Scene
+Parse analysis IDs; the worker never silently falls back to Hugging Face.
 
-New Agent Lab requests also carry a stable `analysis_type`. This worker owns
-`validation_v1`, the internal `validation_object_catalog_transport_v1` canary,
-`geometry_vggt_1b`, `geometry_vggt_omega_1b`, `dedup_ras_vggt_sam3`, and
-`scene_parse_catalog_v1`; it
-rejects fal mask types because those belong to a separate backend. Typed
-results preserve the analysis id on both success and failure and verify the
-model runner's provenance instead of rewriting it. Legacy requests without
-`analysis_type` remain supported.
+## Full 3D deduplication
 
-### Scene Parse catalog profile
+Full RAS is a bounded three-leg composite:
 
-`scene_parse_catalog_v1` is a closed, video-only production contract. It keeps
-the VGGT world points and SAM tracks inside the worker and returns only bounded
-catalog metadata; it never generates or uploads a point-cloud GLB, mask video,
-crop atlas, or other Agent Lab artifact.
+1. RunPod `best_view_geometry_v1` samples the exact VGGT model frames and
+   returns `geometry_inputs.npz`, `sampled_clip.mp4`, and `point_cloud.glb`.
+2. Agent Lab calls `fal-ai/sam-3/video-rle-objects` once per requested category
+   on that sampled clip and stores each exact JSON result durably.
+3. RunPod `dedup_ras_finalize_v1` reconstructs the VGGT point maps, validates
+   and decodes the fal tracks, and runs the original RAS self/cross-category
+   spatial deduplication.
+
+Leg C does not regenerate, require, or upload a GLB. Agent Lab merges the
+already-verified leg-A `point_cloud.glb` with these required leg-C artifacts:
+
+- `instance_masks.mp4`
+- `object_catalog.json`
+- `object_crops.jpg`
+
+Room wall/floor segmentation is intentionally skipped. RAS overlap-based
+identity matching is invariant to a rigid scene transform, so the finalizer
+reports `coordinate_system: vggt_first_camera`,
+`room_alignment_applied: false`, and
+`room_alignment_reason: semantic_room_alignment_skipped_external_masks`.
+
+### Finalizer request
 
 ```json
 {
-  "analysis_type": "scene_parse_catalog_v1",
+  "analysis_type": "dedup_ras_finalize_v1",
   "mode": "full",
-  "video_url": "https://objects.example/exact-source.mp4?signature=redacted",
-  "source_sha256": "<64 lowercase hex characters>",
-  "source_size_bytes": 8421104,
-  "category_prompts": ["chair", "table"]
-}
-```
-
-`source_size_bytes` is optional; when present it must match both a declared
-Content-Length and the streamed byte count. The digest, actual byte count, and
-video duration are verified before model bootstrap. This profile accepts a
-streamed source of at most 2 GiB and 60 seconds, independently of the separate
-Agent Lab research-mode source limits. Inline/base64 sources are not accepted.
-Unknown fields are rejected, including caller-controlled model, frame-count,
-room-alignment, upload, artifact, and object-catalog options. Category prompts
-are 1–32 trimmed strings of at most 64 characters and are unique after case
-folding.
-
-Frame sampling is service-owned policy
-`uniform_2fps_min24_cap96_prompt_budget768_v1`: target two uniformly spaced
-frames per second, clamp to 24–96, then reduce toward 24 as needed to keep at
-most 768 prompt-frame tracking operations. Duration is canonicalized once to
-the returned integer `source.duration_ms`; the frame target is exactly
-`ceil(duration_ms * 2 / 1000)`, so producers and consumers cannot disagree at
-sub-millisecond boundaries. The decoder first verifies one
-bounded stream (maximum 14,400 decoded frames, 8,192 on either dimension, and
-16,777,216 pixels per frame), then materializes only the selected frames as
-scaled JPEGs. It never expands the whole video to an image sequence. The
-sampling decision and reported duration use this verified decoded-frame
-timeline rather than container metadata. The response records the budget,
-requested and actual frame counts, and exact source-frame indices and
-timestamps. Up to 128 deterministic, result-scoped
-object hypotheses are returned inline. Every object contains all non-empty
-mask evidence across the bounded sample, an exact normalized mask box, mask
-area, a track-relative view-quality score, and a best-evidence index. Object
-keys are stable for identical source bytes, ordered prompts, profile, and model
-result; they are not cross-model or cross-profile global identities.
-
-Public RAS normally removes hypotheses visible in fewer than three sampled
-frames. This profile conservatively restores short tracks that do not overlap
-an already-returned 3D object, clusters overlapping short tracks before adding
-them, labels each object `single_frame`, `limited`, or `supported`, and emits a
-warning for low-support results. Existing Agent Lab deduplication keeps the
-original RAS behavior unchanged.
-
-Production VGGT weights live under the isolated
-`STAGE2_MODELS_DIR/SceneParse` tree and are pinned to the commercially licensed
-`facebook/VGGT-1B-Commercial` repository revision reported in every response.
-The worker constructs the architecture from the pinned VGGT source and loads
-the exact safetensors checkpoint strictly, so no mutable remote config is used.
-Each worker process recomputes the checkpoint digest before caching an
-unchanged-file attestation; size or filesystem metadata changes force another
-digest check.
-The verified default segmentation backend remains pinned `facebook/sam3` in
-the canonical Python 3.11 / PyTorch 2.4 / CUDA 12.4 image. A separately built
-compatible worker may set `STAGE2_SCENE_PARSE_SAM_BACKEND=sam3.1_multiplex`,
-but the caller cannot select a model. That backend fails preflight unless its
-pinned checkpoint is mounted and the runtime meets SAM 3.1's Python 3.12,
-PyTorch 2.7, and CUDA 12.6 minimums; a worker never claims SAM 3.1 provenance
-without loading that explicit backend.
-
-### Negotiated object catalog
-
-Full RAS callers can explicitly request `palatial.object_catalog.v1` with this
-exact input combination:
-
-```json
-{
-  "mode": "full",
-  "analysis_type": "dedup_ras_vggt_sam3",
-  "object_catalog_version": 1
-}
-```
-
-The version is a JSON integer; strings, booleans, unknown versions, untyped
-requests, and non-full modes fail before video materialization or model work.
-Omitting the field keeps the legacy response and artifact contract unchanged.
-
-A negotiated run adds two required, fixed-name artifacts:
-
-- `object_catalog.json` (`application/json`, at most 512 KiB) records up to 128
-  spatial-deduplicated instance hypotheses for the caller's requested
-  categories. It explicitly reports `scope: requested_categories` and
-  `exhaustive: false`; it is not an open-vocabulary inventory or ground truth.
-- `object_crops.jpg` (`image/jpeg`, at most 8 MiB) is a deterministic 224-pixel
-  tile atlas. JSON tile coordinates map each catalog row to its crop, and the
-  JSON mirrors the atlas SHA-256 so the edge can bind the verified artifacts.
-
-The representative view reuses RAS's public Stage-3 surface-area scorer on a
-deterministic shortlist of at most 16 sampled views and at most 25,000 mask
-pixels per score. If geometry cannot produce a positive finite score, the
-largest visible mask wins, with the earliest sampled frame as the tie-breaker.
-This small selector is the only Stage-3 code path reused: the service still
-does not run SAM3D asset generation or claim a mesh result.
-
-The deployment transport can be checked without provider access through the
-privileged internal `validation_object_catalog_transport_v1` dry-run. It
-requires `object_catalog_transport_canary: true`, the exact fixed category
-`synthetic_transport_canary`, no video or `object_catalog_version`, and a valid
-Agent Lab upload ticket. It passes an empty catalog through the real generator
-and uploader, producing only the two catalog artifacts. The RunPod response
-carries `synthetic_transport_canary: true`; the catalog remains an ordinary
-closed-schema zero-object v1 document. `instance_count` is zero, and no
-representative or physical-object claim is present. The response marker is a
-transport canary, never a user-visible analysis result.
-
-### Hosted VGGT-Omega geometry
-
-`geometry_vggt_omega_1b` is genuine VGGT-Omega inference through Meta's
-official [`facebook/vggt-omega`](https://huggingface.co/spaces/facebook/vggt-omega)
-Space. RunPod still owns input validation, exact frame extraction, orchestration,
-artifact validation, and durable Agent Lab delivery. This path does not clone
-or load local VGGT/SAM3/RAS model code and does not bypass the gated
-VGGT-Omega checkpoint. It is geometry-only: it returns a point-cloud GLB and
-never claims SAM masks, physical-object deduplication, or the complete RAS
-pipeline.
-
-The adapter is fail-closed around the reviewed contract:
-
-- The Space repository and running replica must both report revision
-  `2597ec6a276ea34d26206087a511f517e2a0024f` before and after inference.
-- At most 24 uniformly spaced decoded source frames are JPEG-encoded in exact
-  index order and uploaded as images. The Space receives no input video and
-  therefore cannot silently choose a different FPS sample.
-- The official `update_gallery_on_upload` call runs first, followed by
-  `gradio_demo` with the 50th-percentile confidence setting and a requested
-  maximum of 500,000 points.
-- The returned file must use HTTPS on the exact
-  `facebook-vggt-omega.hf.space` Gradio artifact host. Redirects, credentials,
-  alternate ports, non-Gradio paths, files over 16 MiB, and invalid glTF 2.0
-  GLB containers or mandatory JSON chunks are rejected before durable
-  publication.
-- One monotonic result deadline covers both stateful Gradio calls. SSE
-  heartbeats cannot extend that deadline and keep the paid RunPod worker alive.
-- Inference starts only when an upload ticket or persistent artifact root can
-  outlive the worker. `STAGE2_KEEP_WORK=1` alone is a debug aid, not durable
-  delivery.
-- Temporary Space URLs, replica-local handles, credentials, and worker paths
-  are never included in result JSON. The normal artifact manifest contains
-  only Agent Lab R2 receipts.
-
-Successful results report model id `facebook/VGGT-Omega`, the pinned Space
-revision above, audited upstream GitHub revision
-`39a0cb8af88554f15ddcb5354cd52bde588fa014`, audited model-repository revision
-`05654241adc2f218dfb089c373a011f8a7040576`, checkpoint filename
-`vggt_omega_1b_512.pt`, backend `huggingface_space`, and provenance level
-`hosted_unattested`. The last label is intentional: the reviewed Space source
-downloads that checkpoint without passing a revision to `hf_hub_download`, so
-the worker can attest the Space code it called but cannot cryptographically
-attest which checkpoint bytes its remote replica loaded.
-
-This integration is suitable for internal research comparison, not a
-production availability promise. It adds a second hosted queue with its own
-ZeroGPU quota, cold starts, and no service-level guarantee. Queue exhaustion,
-revision drift, malformed responses, timeouts, and artifact-delivery failures
-remain explicit job failures; the worker never substitutes local VGGT-1B or a
-synthetic result.
-
-## Weights
-
-Same as their README (not in git):
-
-```bash
-export STAGE2_MODELS_DIR=/models   # or /workspace/models on RunPod volumes
-bash scripts/download_weights.sh
-```
-
-The internal demo currently defaults to `facebook/VGGT-1B`, whose license is
-research/non-commercial. Every result reports the exact `geometry.model_id`
-and `geometry.license_scope`; do not represent this default as a commercially
-licensed output. Cache misses for this public checkpoint download anonymously,
-so pending SAM3 approval or a missing/revoked Hugging Face token cannot block
-geometry mode. SAM3 and the Commercial VGGT checkpoint still require an
-explicit approved `HF_TOKEN`.
-
-**Before any production/commercial release**, obtain checkpoint access and set
-`VGGT_MODEL_ID=facebook/VGGT-1B-Commercial` on the endpoint, then run the real
-geometry smoke test. The selected repo id is recorded beside newly downloaded
-weights. Marker-less existing volumes remain compatible with the original
-research checkpoint instead of being needlessly re-downloaded.
-
-While SAM3 access is pending, pre-seed only the public VGGT weights:
-
-```bash
-STAGE2_DOWNLOAD_SAM3=0 bash scripts/download_weights.sh
-```
-
-The reviewed source revisions are pinned in the wrapper and Dockerfile. VGGT is
-pinned to Meta's official inference-memory fix
-[`9e4fa662a8893ed348d048e8b57816c12593448b`](https://github.com/facebookresearch/vggt/commit/9e4fa662a8893ed348d048e8b57816c12593448b),
-which retains the `facebook/VGGT-1B` checkpoint and prediction contract while
-avoiding redundant intermediate-tensor caching. The official SAM3 checkpoint is
-gated by Meta on Hugging Face; the service does not fall back to unofficial
-mirrors or bypass its license approval.
-
-## RunPod
-
-Prefer a **prebuilt image** or **volume with weights already present**.
-Do not reinstall the world on every cold start.
-
-The thin stock-image bootstrap is fail-closed: `STAGE2_CODE_REV` must be an
-explicit 40-character commit SHA and every package/clone/install step must
-succeed. It never falls back to a moving branch. Each commit uses a separate,
-marked runtime checkout and virtual environment, and its pinned VGGT/SAM3 source
-paths take precedence over base-image packages. A bounded number of recent
-runtimes is retained so rolling workers do not share mutable Python code. Every
-worker holds a shared runtime lease until it exits; cleanup requires an exclusive
-lease and a minimum age greater than `STAGE2_MAX_EXECUTION_SECONDS` (2100 seconds
-by default), so active or recently used runtimes are never removed. Legacy
-runtimes without lease metadata are left for manual inspection.
-
-Lazy RAS/VGGT/SAM3 source installation and shared checkpoint downloads use one
-cross-worker file lock under `STAGE2_MODELS_DIR`. Both the wrapper checkout and
-the upstream source checkouts verify their commit and tracked-file cleanliness
-before reuse. RAS's separately verified VGGT/SAM3 gitlinks are excluded from the
-parent cleanliness check so intentional child revision upgrades remain
-idempotent. A missing or dirty checkout is fetched into a verified sibling
-staging directory with bounded retries and is published only after success, so
-a transient GitHub failure cannot delete the last usable runtime.
-
-Prebuilt images must pass
-`--build-arg STAGE2_BUILD_REVISION="$(git rev-parse HEAD)"`. The handler reports
-only that baked marker or the actual runtime Git checkout; it never treats an
-environment variable alone as revision proof. If weights are baked, pass the
-Hugging Face credential as a BuildKit secret (`--secret
-id=hf_token,env=HF_TOKEN`), never as a build argument.
-
-`scripts/deploy_revision.py` performs that two-field pin in one RunPod template
-update. CI runs it after a green push to `main`; the repository
-`RUNPOD_API_KEY` secret must be configured. The script verifies the returned
-template without printing any environment values or credentials. The complete
-test→deploy workflow is serialized per Git ref, and immediately before the
-RunPod mutation the deploy script checks the authoritative GitHub `main` head.
-An out-of-order stale workflow exits without changing the endpoint.
-After a successful template update, deployment waits for the endpoint's live
-fleet to reach the target state instead of waiting to observe a transition.
-When the update actually changed the pins, the endpoint version must advance
-and every live worker reported by RunPod must carry that version. When the
-template already held this commit's pins, the update is a no-op, RunPod issues
-no new version, and the fleet is measured against the current one, so
-re-running a deployment converges promptly rather than waiting out a transition
-that can never happen. The emitted JSON reports `converged`,
-`already_converged`, or `fleet_not_converged` so the workflow log stays honest
-about which of those it was.
-
-Deployment then submits a bounded real `dry_run` to endpoint `sp2oyuum48vk0j`
-(override with `STAGE2_ENDPOINT_ID`), polls its async status, and requires the
-response's `stage2_code_revision` to equal the deployed commit. This typed
-validation also stages and verifies the pinned RAS, VGGT, and SAM3 source checkouts
-without downloading model weights or running inference, so a release cannot pass
-while lazy source bootstrap is broken. That smoke is the only direct observation
-of the deployed revision, so its 900-second budget is reserved out of the
-2,700-second release budget (which stays longer than the 2,100-second worker
-execution window) and the live fleet gets the remainder. A fleet that has not
-finished draining is reported and logged rather than failed: the template is
-pinned, so every worker started from then on runs the target revision, and the
-smoke still has to observe that revision serving traffic before the deployment
-succeeds. Transient safe reads are retried, but template updates and paid job
-submissions are never replayed. CI fails without printing request credentials or
-endpoint output when verification does not pass.
-
-```json
-{
-  "input": {
-    "analysis_type": "geometry_vggt_omega_1b",
-    "expected_geometry_model_id": "facebook/VGGT-Omega",
-    "expected_geometry_source_revision": "2597ec6a276ea34d26206087a511f517e2a0024f",
-    "video_url": "https://…/clip.mp4",
-    "categories": ["chair", "table"],
-    "max_frames": 24,
-    "mode": "geometry",
-    "upload": {
-      "base": "https://agent-lab-public-upload-origin.example",
-      "runId": "stage2-…",
-      "token": "<short-lived HMAC ticket>",
-      "exp": 1780000000000,
-      "policy": {
-        "outputs": [
-          {"name": "point_cloud.glb", "mediaType": "model/gltf-binary", "maxBytes": 16777216}
-        ]
-      }
+  "geometry_inputs_url": "https://artifact-gateway.example/inputs/geometry_inputs.npz",
+  "sampled_clip_url": "https://artifact-gateway.example/inputs/sampled_clip.mp4",
+  "expected_frames_used": 24,
+  "expected_model_frame_width": 518,
+  "expected_model_frame_height": 294,
+  "expected_geometry_model_id": "facebook/VGGT-1B",
+  "expected_geometry_source_revision": "9e4fa662a8893ed348d048e8b57816c12593448b",
+  "categories": ["chair", "table"],
+  "sam_model": "fal-ai/sam-3/video-rle-objects",
+  "room_align": false,
+  "object_catalog_version": 1,
+  "masks": [
+    {
+      "category": "chair",
+      "request_id": "fal-queue-request-id",
+      "url": "https://artifact-gateway.example/inputs/chair.json",
+      "sha256": "<64 lowercase hex characters>",
+      "bytes": 12345
+    },
+    {
+      "category": "table",
+      "request_id": "fal-queue-request-id",
+      "url": "https://artifact-gateway.example/inputs/table.json",
+      "sha256": "<64 lowercase hex characters>",
+      "bytes": 12345
     }
+  ],
+  "upload": {
+    "base": "https://artifact-gateway.example",
+    "runId": "dedup-…",
+    "token": "<short-lived ticket>"
   }
 }
 ```
 
-Agent Lab supplies `upload`; callers should not mint it themselves. A geometry
-job must durably receipt `point_cloud.glb`; a legacy full job must durably
-receipt `point_cloud.glb` and `instance_masks.mp4`. A negotiated object-catalog
-run additionally requires both `object_catalog.json` and `object_crops.jpg`.
-Missing or failed required uploads make the job explicitly fail with
-`artifact_delivery_failed` instead of returning a partial `status: ok`. Its
-JSON contains digest receipts only. Agent Lab verifies each receipt against R2
-before exposing `/media/*` URLs; no signed PUT URL, file bytes, base64 output,
-or temporary worker path is returned.
-Every failed PUT is checked for an already-stored object first. When a retry is
-safe, the uploader obtains a fresh short-lived grant instead of replaying its
-old presigned URL; explicit 4xx/409 rejections are verified once but never
-retried when the object is absent. Results and worker logs retain only the
-failure phase, HTTP status, retryability, and attempt count, never a ticket or
-signed URL.
+Each downloaded fal result must be the official normalized object document:
 
-Before upload, the full-mode mask visualization is normalized to browser-safe
-H.264/yuv420p MP4 with fast-start metadata. Each sampled mask frame keeps the
-presentation timestamp of its corresponding source frame, including
-variable-frame-rate clips, so Agent Lab's original/mask linked playback remains
-aligned instead of merely sharing the same total duration.
+```json
+{
+  "width": 518,
+  "height": 294,
+  "num_frames": 24,
+  "frames": [
+    {
+      "frame_index": 0,
+      "objects": [{"track_id": 1, "rle": "0 12 4 9 …"}]
+    }
+  ]
+}
+```
 
-The GLB is a visualization-friendly colored **point cloud**, not a watertight or
-textured surface mesh. It defaults to at most 300,000 points and enforces a
-900,000-point hard cap so the GLB remains below its signed 16 MiB upload
-contract. Deployments may tune `STAGE2_POINT_CLOUD_MAX_POINTS` (10,000–900,000).
-The preview consumes RAS's point cloud after its fixed 50th-percentile VGGT depth
-confidence cutoff. Keeping that same point/confidence branch avoids mixing
-depth-derived coordinates with point-map confidence. An unavailable or empty
-filtered cloud fails the required preview artifact instead of publishing an
-unfiltered or synthetic one-point result. The exporter then removes
-only the catastrophic tail beyond a generous robust scene radius and ignores
-implausibly distant camera poses. Geometry-mode files are aligned from VGGT's
-OpenCV coordinates into first-camera, glTF Y-up preview space; room-aligned full
-mode is converted from RAS Z-up into glTF Y-up only when RAS actually found a
-usable floor and wall. The result reports room alignment as requested versus
-applied; invalid or absent camera poses use a truthfully labeled axis-only
-fallback instead of claiming first-camera alignment. GLB metadata includes
-robust preview bounds, node roles, and whether confidence/camera alignment was
-applied. Source-frame sRGB colors are encoded with glTF's linear vertex-color
-semantics. Together these rules keep the useful room upright, correctly colored,
-and framed independently of camera helpers.
+The finalizer fails closed unless:
 
-Large compatibility outputs are disabled by default. Set
-`STAGE2_EXPORT_DEBUG_ARTIFACTS=1` only when the signed policy allows
-`point_cloud.ply` and `camera_intrinsics.json`. The Python uploader hashes and
-uploads one whole file at a time, and an artifact gateway without
-`R2_S3_ACCOUNT_ID`, `R2_S3_ACCESS_KEY_ID`, and `R2_S3_SECRET_ACCESS_KEY` must
-proxy those bytes through the Worker. Configure those S3 credentials for
-direct-to-R2 grants before enabling large debug artifacts in a deployment.
+- categories and mask documents are one-to-one and in exact request order;
+- every URL uses the upload ticket's credential-free gateway origin;
+- document byte count and SHA-256 match their receipts;
+- width, height, frame count, and contiguous frame indices exactly match the
+  sampled clip and geometry inputs;
+- every decoded RLE contains exactly `width * height` binary pixels;
+- track IDs are non-negative integers and unique within a frame.
 
-## Agent Lab
+Track identity is scoped to `(category index, track_id)`, because fal track IDs
+are local to one category request. Missing visibility frames split a track into
+separate RAS track segments. Masks are never resized, truncated, or shifted.
 
-Point `STAGE2_ENDPOINT_ID` at this endpoint. Lab already async-polls `/status`.
-Agent Lab passes uploaded clips through an expiring, exact-object signed HTTPS
-`video_url`. The worker streams that response to disk and independently enforces
-a 64 MiB limit using both `Content-Length` (when present) and the bytes actually
-received. Legacy callers may continue to use `video_b64`, which remains limited
-to 6 MiB; larger clips must use `video_url`.
+The official fal endpoint currently providing separable object tracks is SAM 3
+`video-rle-objects`. SAM 3.1 remains available as an Agent Lab mask preview,
+but it is not labeled as Full RAS until fal publishes an equivalent object-RLE
+contract.
+
+## Geometry and weights
+
+Local geometry accepts a bounded video, uniformly samples frames across
+the full decoded timeline, and exports a visualization-oriented point cloud,
+not a watertight mesh. Geometry leg A also exports float16 depth and confidence,
+camera matrices, exact source-frame evidence, and source duration for the
+weights-free finalizer.
+
+The shared `best_view_geometry_v1` → `dedup_ras_finalize_v1` composite uses
+2–24 frames. Both legs enforce the same cap; the edge must not silently submit
+or relabel a larger frame budget.
+
+Only VGGT weights are stored locally:
+
+```bash
+export STAGE2_MODELS_DIR=/models
+bash scripts/download_weights.sh
+```
+
+The default `facebook/VGGT-1B` checkpoint is public and is downloaded
+anonymously. An explicitly selected gated/commercial VGGT checkpoint still
+requires its own approved token. There is no SAM checkpoint directory,
+`facebook/sam3` download, or `STAGE2_DOWNLOAD_SAM3` switch.
+
+VGGT-Omega is a research-only hosted comparison through Meta's reviewed Space.
+It is capped at 24 frames and reports hosted, unattested model provenance; it
+never claims local VGGT or RAS dedup execution.
+
+## Artifact delivery
+
+Paid analysis requires a privileged Agent Lab upload ticket. Required output
+files are uploaded first and verified through durable receipts. Missing or
+failed required uploads return `artifact_delivery_failed`; responses never
+contain signed PUT URLs, worker paths, or inline file bytes.
+
+The mask visualization is normalized to browser-safe H.264/yuv420p with
+fast-start metadata and retains the original source timeline represented by the
+sampled frames. Catalog output is bounded to 128 result-scoped physical-object
+hypotheses and a fixed JPEG crop atlas.
+
+## RunPod and verification
+
+`scripts/start_serverless.sh` bootstraps an exact 40-character wrapper revision.
+`scripts/deploy_revision.py` pins the RunPod template and verifies the deployed
+`validation_v1` response reports the requested wrapper revision, pinned RAS and
+VGGT revisions, `sam_provider: fal`, `sam3_required: false`, and
+`weights_required: false`.
+
+Run deterministic tests without provider calls:
+
+```bash
+python -m unittest discover -s tests -v
+bash -n scripts/download_weights.sh scripts/start_serverless.sh
+python -m py_compile *.py scripts/*.py tests/*.py
+```
+
+A release still needs one authorized real fal + RunPod E2E. That acceptance
+run must capture a real fal RLE document, verify the encoding against the strict
+decoder, and confirm Agent Lab merges leg A's GLB with leg C's three receipts.
