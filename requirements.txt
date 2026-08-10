@@ -1,4 +1,4 @@
-# Thin host wrapper only. RAS / vggt / sam3 install from their trees on first full job.
+# Thin host wrapper only. RAS / VGGT install from pinned trees; SAM runs on fal.
 runpod>=1.7.0
 requests>=2.31
 numpy>=1.26,<2
@@ -6,6 +6,3 @@ opencv-python-headless>=4.9
 Pillow>=10.0
 huggingface_hub>=0.23
 safetensors>=0.4
-# SAM3's model_builder reaches its COCO mask helpers during import, while the
-# upstream base dependency set declares this package only in optional extras.
-pycocotools==2.0.11

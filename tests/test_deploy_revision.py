@@ -22,8 +22,8 @@ NEWER_REVISION = "89abcdef0123456789abcdef0123456789abcdef"
 SOURCE_EVIDENCE = {
     "ras_revision": deploy_revision.EXPECTED_RAS_REVISION,
     "vggt_revision": deploy_revision.EXPECTED_VGGT_REVISION,
-    "sam3_revision": deploy_revision.EXPECTED_SAM3_REVISION,
-    "sam3_required": True,
+    "sam_provider": "fal",
+    "sam3_required": False,
     "weights_required": False,
 }
 
@@ -70,7 +70,6 @@ class DeployRevisionTests(unittest.TestCase):
     def test_deploy_source_smoke_pins_match_worker_contract(self):
         self.assertEqual(deploy_revision.EXPECTED_RAS_REVISION, stage2.RAS_REVISION)
         self.assertEqual(deploy_revision.EXPECTED_VGGT_REVISION, stage2.DEFAULT_VGGT_REVISION)
-        self.assertEqual(deploy_revision.EXPECTED_SAM3_REVISION, stage2.DEFAULT_SAM3_REVISION)
 
     def test_docker_build_uses_a_secret_mount_for_hugging_face_credentials(self):
         dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text()
@@ -956,7 +955,8 @@ class DeployRevisionTests(unittest.TestCase):
         self.assertIn('runtime_dir="$STAGE2_RUNTIME_ROOT/$STAGE2_CODE_REV"', script)
         self.assertIn('export STAGE2_VENV="$runtime_dir/venv"', script)
         self.assertIn('export RAS_ROOT="$runtime_dir/ReplicateAnyScene"', script)
-        self.assertIn('export PYTHONPATH="$RAS_ROOT/vggt:$RAS_ROOT/sam3', script)
+        self.assertIn('export PYTHONPATH="$RAS_ROOT/vggt', script)
+        self.assertNotIn('$RAS_ROOT/sam3', script)
         self.assertIn('.stage2_code_revision', script)
         self.assertIn('flock -s 8', script)
         self.assertLess(script.index('flock -n 7'), script.index('rm -rf -- "$runtime_dir"'))

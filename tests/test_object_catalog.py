@@ -312,40 +312,7 @@ class ObjectCatalogArtifactTest(unittest.TestCase):
 class ObjectCatalogNegotiationTest(unittest.TestCase):
     @staticmethod
     def _full_success():
-        return {
-            "status": "ok",
-            "mode": "full",
-            "geometry": {
-                "backend": "vggt",
-                "model_id": stage2.DEFAULT_VGGT_MODEL_ID,
-                "source_revision": stage2.DEFAULT_VGGT_REVISION,
-            },
-            "sam": {
-                "backend": "sam3_video",
-                "model_id": stage2.SAM3_MODEL_ID,
-                "source_revision": stage2.DEFAULT_SAM3_REVISION,
-            },
-            "frames_used": 2,
-            "source_frame_indices": [0, 10],
-            "source_frame_timestamps": [0.0, 1.0],
-            "object_catalog": {
-                "schema_version": "palatial.object_catalog.v1",
-                "total_count": 0,
-                "returned_count": 0,
-                "truncated": False,
-                "artifact_name": catalog.OBJECT_CATALOG_JSON_NAME,
-                "atlas_artifact_name": catalog.OBJECT_CROPS_ATLAS_NAME,
-            },
-            "artifacts": {
-                "complete": True,
-                "required_files": [
-                    "point_cloud.glb",
-                    "instance_masks.mp4",
-                    catalog.OBJECT_CATALOG_JSON_NAME,
-                    catalog.OBJECT_CROPS_ATLAS_NAME,
-                ],
-            },
-        }
+        return {"status": "ok", "mode": "full"}
 
     def test_negotiation_requires_exact_integer_one_before_runner_or_materialization(self):
         invalid_versions = (0, 2, "1", True, None, 1.0, {}, [])
@@ -363,7 +330,7 @@ class ObjectCatalogNegotiationTest(unittest.TestCase):
                 })
 
             self.assertEqual(result["status"], "error")
-            self.assertIn("integer 1", result["error"])
+            self.assertIn("not owned by this RunPod worker", result["error"])
             runner.assert_not_called()
             materialize.assert_not_called()
 
@@ -398,7 +365,7 @@ class ObjectCatalogNegotiationTest(unittest.TestCase):
             geometry_runner.assert_not_called()
             materialize.assert_not_called()
 
-    def test_valid_negotiation_reaches_full_runner_without_coercion(self):
+    def test_retired_monolithic_negotiation_never_reaches_full_runner(self):
         with patch.object(
             stage2,
             "run_stage2_full",
@@ -412,147 +379,10 @@ class ObjectCatalogNegotiationTest(unittest.TestCase):
                 "max_frames": 8,
             })
 
-        self.assertEqual(result["status"], "ok", result)
-        runner.assert_called_once()
-        called_payload = runner.call_args.args[0]
-        self.assertIs(type(called_payload["object_catalog_version"]), int)
-        self.assertEqual(called_payload["object_catalog_version"], 1)
+        self.assertEqual(result["status"], "error", result)
+        self.assertIn("RAS finalizer composite", result["error"])
+        runner.assert_not_called()
 
-    def test_full_runner_wires_real_catalog_and_sample_timeline_before_delivery(self):
-        class Frames:
-            shape = (2, 8, 8, 3)
-
-            def to(self, _device):
-                return self
-
-        class Model:
-            def to(self, _device):
-                return self
-
-        class SamVideo:
-            def handle_request(self, request):
-                self.request = request
-                return {"session_id": "session"}
-
-        colors = np.zeros((2, 8, 8, 3), dtype=np.uint8)
-        colors[..., 1] = 200
-        points = _world_points(2, 8, 8)
-        mask = np.zeros((8, 8), dtype=bool)
-        mask[2:6, 2:6] = True
-        track = [
-            {"frame_id": 0, "mask": mask},
-            {"frame_id": 1, "mask": mask},
-        ]
-        prediction = {
-            "colors": colors,
-            "world_points": points,
-            "world_points_conf": np.ones((2, 8, 8), dtype=np.float32),
-        }
-        captured_catalog = {}
-
-        src = types.ModuleType("src")
-        src.__path__ = []
-        models = types.ModuleType("src.models")
-        models.load_sam3_image_model = lambda: Model()
-        models.load_sam3_video_model = lambda: SamVideo()
-        models.load_vggt_model = lambda: Model()
-        models.unload_model = lambda _model: None
-        utils = types.ModuleType("src.utils")
-        utils.vis_instance_masks = lambda _colors, _masks, path: Path(path).write_bytes(b"mp4")
-        geometry = types.ModuleType("src.geometry_utils")
-        geometry.align_to_room_coordinate_system = lambda *_args: (np.eye(3), np.zeros(3))
-        geometry.align_vggt_predictions = lambda value, *_args: value
-        geometry.compute_surface_area_from_pointmap = (
-            lambda pointmap, value: float(np.count_nonzero(value) + pointmap[0, 0, 2])
-        )
-        prediction_module = types.ModuleType("src.vggt_predict")
-        prediction_module.vggt_predict = lambda _frames, _model: prediction
-        segmentation = types.ModuleType("src.object_segmentation")
-        segmentation.segment_and_track = lambda _category, _model, _session: track
-        segmentation.segment_wall_and_floor = lambda *_args: ([], [])
-        dedup = types.ModuleType("src.sg_deduplication")
-        dedup.self_category_deduplicate = lambda value, *_args: [value]
-        dedup.cross_category_deduplicate = lambda value, *_args: value
-        torch = types.ModuleType("torch")
-        torch.cuda = types.SimpleNamespace(is_available=lambda: False)
-        modules = {
-            "torch": torch,
-            "src": src,
-            "src.models": models,
-            "src.utils": utils,
-            "src.geometry_utils": geometry,
-            "src.vggt_predict": prediction_module,
-            "src.object_segmentation": segmentation,
-            "src.sg_deduplication": dedup,
-        }
-
-        def manifest(out_dir, _work, payload):
-            captured_catalog.update(
-                json.loads((out_dir / catalog.OBJECT_CATALOG_JSON_NAME).read_bytes())
-            )
-            return {
-                "durable": True,
-                "complete": True,
-                "files": list(stage2._required_artifacts(payload)),
-                "required_files": list(stage2._required_artifacts(payload)),
-                "missing_required": [],
-                "receipts": [],
-                "errors": [],
-            }
-
-        payload = {
-            "mode": "full",
-            "analysis_type": "dedup_ras_vggt_sam3",
-            "object_catalog_version": 1,
-            "categories": ["chair"],
-            "max_frames": 8,
-            "video_b64": "fixture",
-            "room_align": False,
-            "upload": {"ticket": "fixture"},
-        }
-        with patch.dict(sys.modules, modules), patch.object(
-            stage2,
-            "_materialize_standard_video",
-            return_value=Path("source.mp4"),
-        ), patch.object(
-            stage2,
-            "_prepare_standard_vggt_sample",
-            return_value=(
-                [Path("frame-000001.jpg"), Path("frame-000002.jpg")],
-                [5, 9],
-                [0.0, 0.033367],
-                0.066734,
-            ),
-        ), patch.object(
-            stage2,
-            "_load_preprocessed_sampled_images",
-            return_value=Frames(),
-        ), patch.object(stage2, "_ensure_ras_installed"), patch.object(
-            stage2,
-            "_ensure_ras_on_path",
-            return_value=Path("/verified/ras"),
-        ), patch.object(
-            stage2,
-            "_verified_checkout_revision",
-            side_effect=[stage2.DEFAULT_VGGT_REVISION, stage2.DEFAULT_SAM3_REVISION],
-        ), patch.object(stage2, "_link_models_dir"), patch.object(
-            stage2, "_export_vggt_artifacts", return_value={}
-        ), patch.object(
-            stage2,
-            "_normalize_mask_video",
-            return_value={"codec": "h264"},
-        ), patch.object(stage2, "_artifact_manifest", side_effect=manifest):
-            result = stage2.run_stage2_full(payload)
-
-        self.assertEqual(result["status"], "ok", result)
-        self.assertEqual(result["source_frame_indices"], [5, 9])
-        self.assertEqual(result["source_frame_timestamps"], [0.0, 0.033367])
-        self.assertEqual(result["object_catalog"]["returned_count"], 1)
-        representative = captured_catalog["objects"][0]["representative"]
-        self.assertEqual(representative["sampled_frame_id"], 1)
-        self.assertEqual(representative["source_frame_index"], 9)
-        self.assertEqual(representative["source_timestamp_s"], 0.033367)
-        self.assertIn("object_catalog", [step["id"] for step in result["pipeline"]])
 
     def test_direct_full_runner_rejects_bad_negotiation_before_materialization(self):
         with patch.object(stage2, "_materialize_standard_video") as materialize:
@@ -564,7 +394,7 @@ class ObjectCatalogNegotiationTest(unittest.TestCase):
             })
 
         self.assertEqual(result["status"], "error")
-        self.assertIn("requires analysis_type", result["error"])
+        self.assertIn("monolithic local-SAM Full RAS path is retired", result["error"])
         materialize.assert_not_called()
 
     def test_legacy_full_manifest_ignores_stray_catalog_files(self):
@@ -612,22 +442,17 @@ class ObjectCatalogNegotiationTest(unittest.TestCase):
         self.assertNotIn(catalog.OBJECT_CATALOG_JSON_NAME, manifest["files"])
         self.assertNotIn(catalog.OBJECT_CROPS_ATLAS_NAME, manifest["files"])
 
-    def test_negotiated_manifest_requires_and_delivers_exactly_four_artifacts(self):
+    def test_finalizer_manifest_requires_and_delivers_exactly_three_artifacts(self):
         upload = {
             "base": "https://edge.example",
             "runId": "catalog-run",
             "token": "secret",
             "exp": 9_999_999_999_999,
         }
-        required = [
-            "point_cloud.glb",
-            "instance_masks.mp4",
-            catalog.OBJECT_CATALOG_JSON_NAME,
-            catalog.OBJECT_CROPS_ATLAS_NAME,
-        ]
+        required = list(stage2.FULL_DEDUP_FINAL_ARTIFACTS)
         payload = {
             "mode": "full",
-            "analysis_type": "dedup_ras_vggt_sam3",
+            "analysis_type": stage2.FULL_DEDUP_FINALIZE_ANALYSIS_TYPE,
             "object_catalog_version": 1,
             "upload": upload,
         }
@@ -655,8 +480,9 @@ class ObjectCatalogNegotiationTest(unittest.TestCase):
         self.assertEqual([receipt["name"] for receipt in manifest["receipts"]], required)
         self.assertEqual(
             [receipt["mediaType"] for receipt in manifest["receipts"]],
-            ["model/gltf-binary", "video/mp4", "application/json", "image/jpeg"],
+            ["video/mp4", "application/json", "image/jpeg"],
         )
+        self.assertNotIn("point_cloud.glb", manifest["files"])
         self.assertNotIn("not-allowlisted.txt", manifest["files"])
 
     def test_missing_either_negotiated_catalog_artifact_fails_delivery(self):
@@ -668,16 +494,11 @@ class ObjectCatalogNegotiationTest(unittest.TestCase):
         }
         payload = {
             "mode": "full",
-            "analysis_type": "dedup_ras_vggt_sam3",
+            "analysis_type": stage2.FULL_DEDUP_FINALIZE_ANALYSIS_TYPE,
             "object_catalog_version": 1,
             "upload": upload,
         }
-        required = {
-            "point_cloud.glb",
-            "instance_masks.mp4",
-            catalog.OBJECT_CATALOG_JSON_NAME,
-            catalog.OBJECT_CROPS_ATLAS_NAME,
-        }
+        required = set(stage2.FULL_DEDUP_FINAL_ARTIFACTS)
         for missing in catalog.OBJECT_CATALOG_JSON_NAME, catalog.OBJECT_CROPS_ATLAS_NAME:
             with self.subTest(missing=missing), tempfile.TemporaryDirectory() as tmp:
                 work = Path(tmp)

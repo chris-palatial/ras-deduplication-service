@@ -150,6 +150,41 @@ def decode_rle(rle: Any, height: Any, width: Any) -> Any:
     return np.reshape(flat, (rows, columns), order="F")
 
 
+def decode_rle_unambiguous(rle: Any, height: Any, width: Any) -> Any:
+    """Decode only when COCO/Kaggle interpretations cannot disagree.
+
+    fal currently describes the string only as Kaggle/COCO order. The Full RAS
+    finalizer cannot guess when one token sequence is valid in both grammars
+    but maps to different pixels, because that would attach masks to the wrong
+    3D points. Best-view keeps its established compatibility decoder; the
+    identity-dedup boundary uses this stricter variant.
+    """
+    rows = _positive_int(height)
+    columns = _positive_int(width)
+    if rows is None or columns is None:
+        raise ValueError("best view mask dimensions must be positive integers")
+    total = rows * columns
+    if total > BEST_VIEW_MAX_MASK_PIXELS:
+        raise ValueError("best view mask exceeds the supported pixel bound")
+
+    import numpy as np
+
+    counts = _rle_tokens(rle)
+    coco = _decode_coco_counts(counts, total)
+    kaggle = _decode_kaggle_pairs(counts, total)
+    if coco is not None and kaggle is not None and not np.array_equal(coco, kaggle):
+        raise ValueError(
+            "mask RLE is ambiguous between COCO run counts and Kaggle start/length pairs"
+        )
+    flat = coco if coco is not None else kaggle
+    if flat is None:
+        raise ValueError(
+            "best view mask RLE is neither a COCO run-count nor a Kaggle "
+            f"start/length encoding of {rows}x{columns} pixels"
+        )
+    return np.reshape(flat, (rows, columns), order="F")
+
+
 def derive_max_triangle_size(pointmap: Any, mask: Any) -> tuple[float, float]:
     """Return ``(median_adjacent_spacing, max_triangle_size)`` for one candidate.
 

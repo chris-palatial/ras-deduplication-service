@@ -1,8 +1,9 @@
 """
 Core runner for the RAS Deduplication Service.
 
-This module does NOT reimplement VGGT/SAM/dedup. It calls the public
-ReplicateAnyScene Stage 2 path (same sequence as their main.py Stage 2 block).
+This module wraps pinned VGGT geometry and ReplicateAnyScene's original
+self/cross-category 3D deduplication functions. Segmentation is supplied as
+validated external fal object tracks; this worker has no local SAM runtime.
 
 Upstream: https://github.com/xiac20/ReplicateAnyScene
 """
@@ -41,19 +42,13 @@ from best_view import (
     BEST_VIEW_SCHEMA,
     build_best_view_report,
     decode_rle,
+    decode_rle_unambiguous,
 )
 from object_catalog import (
     OBJECT_CATALOG_JSON_NAME,
     OBJECT_CATALOG_VERSION,
     OBJECT_CROPS_ATLAS_NAME,
     build_object_catalog,
-)
-from scene_parse_catalog import (
-    SCENE_PARSE_CATALOG_MAX_OBJECTS,
-    SCENE_PARSE_CATALOG_SCHEMA,
-    bound_scene_parse_response,
-    build_scene_parse_objects,
-    preserve_short_scene_parse_tracks,
 )
 
 # Resolve the pinned upstream checkout. Standalone wrapper layout:
@@ -64,8 +59,6 @@ RAS_ROOT = Path(os.environ.get("RAS_ROOT", Path(__file__).resolve().parent / "ve
 RAS_REVISION = os.environ.get("RAS_REVISION", "671191457e7244d9337ef3faf558ee92bbf9bf73")
 DEFAULT_VGGT_REVISION = "9e4fa662a8893ed348d048e8b57816c12593448b"
 VGGT_REVISION = os.environ.get("VGGT_REVISION", DEFAULT_VGGT_REVISION)
-DEFAULT_SAM3_REVISION = "bfbed072a07a6a52c8d5fdc75a7a186251a835b1"
-SAM3_REVISION = os.environ.get("SAM3_REVISION", DEFAULT_SAM3_REVISION)
 MAX_INLINE_VIDEO_BYTES = 6 * 1024 * 1024
 MAX_REMOTE_VIDEO_BYTES = 64 * 1024 * 1024
 STANDARD_MAX_REMOTE_VIDEO_BYTES = 500 * 1024 * 1024
@@ -76,38 +69,14 @@ STANDARD_MAX_SOURCE_DIMENSION = 8_192
 STANDARD_MAX_SOURCE_PIXELS = 16_777_216
 STANDARD_DECODE_MAX_LONG_EDGE = 1_036
 STANDARD_MAX_SAMPLED_DISK_BYTES = 256 * 1024 * 1024
-SCENE_PARSE_MAX_REMOTE_VIDEO_BYTES = 2 * 1024 * 1024 * 1024
-SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS = 60.0
 DEFAULT_VGGT_MODEL_ID = "facebook/VGGT-1B"
 COMMERCIAL_VGGT_MODEL_ID = "facebook/VGGT-1B-Commercial"
 COMMERCIAL_VGGT_MODEL_REVISION = "ebb29a532abe92960eeb6903a5530f16990ef4ab"
 COMMERCIAL_VGGT_CHECKPOINT = "model.safetensors"
 COMMERCIAL_VGGT_CHECKPOINT_SHA256 = "2b766b284359bc47ce26be107254621f685b758a0282082ff109f3ff02788b53"
 COMMERCIAL_VGGT_CHECKPOINT_BYTES = 5_026_367_224
-SAM3_MODEL_ID = "facebook/sam3"
-SAM3_MODEL_REVISION = "3c879f39826c281e95690f02c7821c4de09afae7"
-SAM3_CHECKPOINT_SHA256 = "9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e"
-SAM3_CHECKPOINT_BYTES = 3_450_062_241
-SAM31_MODEL_ID = "facebook/sam3.1"
-SAM31_MODEL_REVISION = "daa63191845a41281374e725f4c9e51c7a824460"
-SAM31_CHECKPOINT = "sam3.1_multiplex.pt"
-SAM31_CHECKPOINT_SHA256 = "0567debeec80ba4ac6369540c6c248025283cb3ff2b92827509e57e2b3541cb6"
-SAM31_CHECKPOINT_BYTES = 3_502_755_717
 VGGT_MODEL_MARKER = ".stage2_model_id"
-SCENE_PARSE_MODEL_MANIFEST = ".palatial_model.json"
 SCENE_PARSE_CATALOG_ANALYSIS_TYPE = "scene_parse_catalog_v1"
-SCENE_PARSE_SAMPLING_POLICY = "uniform_2fps_min24_cap96_prompt_budget768_v1"
-SCENE_PARSE_SAMPLING_TARGET_FPS = 2.0
-SCENE_PARSE_SAMPLING_MIN_FRAMES = 24
-SCENE_PARSE_SAMPLING_MAX_FRAMES = 96
-SCENE_PARSE_PROMPT_FRAME_BUDGET = 768
-SCENE_PARSE_MAX_DECODED_FRAMES = 14_400
-SCENE_PARSE_MAX_SOURCE_DIMENSION = 8_192
-SCENE_PARSE_MAX_SOURCE_PIXELS = 16_777_216
-SCENE_PARSE_DECODE_MAX_LONG_EDGE = 1_036
-SCENE_PARSE_MAX_SAMPLED_DISK_BYTES = 256 * 1024 * 1024
-SCENE_PARSE_MAX_CATEGORY_PROMPTS = 32
-SCENE_PARSE_MAX_CATEGORY_PROMPT_CHARS = 64
 VGGT_OMEGA_ANALYSIS_TYPE = "geometry_vggt_omega_1b"
 VGGT_OMEGA_MODEL_ID = "facebook/VGGT-Omega"
 VGGT_OMEGA_SPACE_ID = "facebook/vggt-omega"
@@ -128,6 +97,9 @@ _GLB_JSON_CHUNK = 0x4E4F534A
 # The geometry leg exports what the scorer needs; the score leg is CPU-only.
 BEST_VIEW_GEOMETRY_ANALYSIS_TYPE = "best_view_geometry_v1"
 BEST_VIEW_SCORE_ANALYSIS_TYPE = "best_view_score_v1"
+FULL_DEDUP_FINALIZE_ANALYSIS_TYPE = "dedup_ras_finalize_v1"
+FAL_SAM3_RLE_OBJECTS_MODEL_ID = "fal-ai/sam-3/video-rle-objects"
+FAL_SAM_TRACK_DOCUMENT_SCHEMA = "fal_sam_video_rle_objects_v1"
 BEST_VIEW_MAX_FRAMES = BEST_VIEW_MAX_CANDIDATE_FRAMES
 BEST_VIEW_GEOMETRY_INPUTS_NAME = "geometry_inputs.npz"
 BEST_VIEW_GEOMETRY_INPUTS_SCHEMA = "palatial.geometry_inputs.v1"
@@ -150,6 +122,8 @@ BEST_VIEW_MAX_OBJECTS_PER_FRAME = 64
 BEST_VIEW_MAX_TRACKS_PER_CATEGORY = 256
 BEST_VIEW_MAX_MODEL_FRAME_DIMENSION = 4_096
 BEST_VIEW_MAX_MODEL_FRAME_PIXELS = 1_048_576
+FULL_DEDUP_MAX_SAMPLED_CLIP_BYTES = 64 * 1024 * 1024
+FULL_DEDUP_MAX_DECODED_MASK_BYTES = 512 * 1024 * 1024
 # float16 depth quantization alone perturbs the point map by roughly 0.05%.
 # Anything past 2% means the exported arrays are not a faithful stand-in for
 # the model's own world points and the scores would not be the model's scores.
@@ -174,6 +148,10 @@ OBJECT_CATALOG_ARTIFACTS = (
     OBJECT_CATALOG_JSON_NAME,
     OBJECT_CROPS_ATLAS_NAME,
 )
+FULL_DEDUP_FINAL_ARTIFACTS = (
+    "instance_masks.mp4",
+    *OBJECT_CATALOG_ARTIFACTS,
+)
 OBJECT_CATALOG_TRANSPORT_CANARY_ANALYSIS_TYPE = "validation_object_catalog_transport_v1"
 OBJECT_CATALOG_TRANSPORT_CANARY_CATEGORY = "synthetic_transport_canary"
 RUNPOD_ANALYSIS_TYPE_MODES = {
@@ -182,29 +160,26 @@ RUNPOD_ANALYSIS_TYPE_MODES = {
     "geometry_vggt_1b": "geometry",
     VGGT_OMEGA_ANALYSIS_TYPE: "geometry",
     BEST_VIEW_GEOMETRY_ANALYSIS_TYPE: "geometry",
-    "dedup_ras_vggt_sam3": "full",
-    SCENE_PARSE_CATALOG_ANALYSIS_TYPE: "full",
     BEST_VIEW_SCORE_ANALYSIS_TYPE: "full",
+    FULL_DEDUP_FINALIZE_ANALYSIS_TYPE: "full",
 }
 NON_RUNPOD_ANALYSIS_TYPES = {
     "mask_sam3": "route it to the fal SAM 3 adapter",
     "mask_sam31": "route it to the fal SAM 3.1 adapter",
+    "dedup_ras_vggt_sam3": (
+        "route it through the Agent Lab VGGT → fal SAM 3 tracks → RAS finalizer composite"
+    ),
+    SCENE_PARSE_CATALOG_ANALYSIS_TYPE: (
+        "the legacy local-SAM profile is retired; route Scene Parse through its owning service"
+    ),
 }
 VGGT_1B_ANALYSIS_TYPES = frozenset({
     "geometry_vggt_1b",
-    "dedup_ras_vggt_sam3",
     BEST_VIEW_GEOMETRY_ANALYSIS_TYPE,
+    FULL_DEDUP_FINALIZE_ANALYSIS_TYPE,
 })
 _PROCESS_INITIALIZATION_LOCK = threading.Lock()
 _VERIFIED_MODEL_FILE_CACHE: dict[str, tuple[Any, ...]] = {}
-
-
-class SceneParseCatalogError(RuntimeError):
-    """Safe typed failure for the production Scene Parse profile."""
-
-    def __init__(self, code: str, message: str):
-        super().__init__(message)
-        self.code = code
 
 
 def _source_frame_plan(
@@ -470,7 +445,7 @@ def _verified_checkout_revision(
 
 def _prefer_source_checkouts(ras: Path) -> None:
     """Make the verified runtime-owned source trees win over stale site packages."""
-    for source_root in (ras / "sam3", ras / "vggt", ras):
+    for source_root in (ras / "vggt", ras):
         if not source_root.is_dir():
             continue
         value = str(source_root)
@@ -541,18 +516,6 @@ def _stage2_initialization_lock(models_dir: Path):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _find_sam3_pt(sam_dir: Path) -> Path | None:
-    direct = sam_dir / "sam3.pt"
-    if direct.is_file() and direct.stat().st_size > 1_000_000:
-        return direct
-    if not sam_dir.is_dir():
-        return None
-    for p in sorted(sam_dir.rglob("sam3.pt")):
-        if p.is_file() and p.stat().st_size > 1_000_000:
-            return p
-    return None
-
-
 def _vggt_model_id() -> str:
     """Research checkpoint by default; production must explicitly select Commercial."""
     return os.environ.get("VGGT_MODEL_ID", DEFAULT_VGGT_MODEL_ID).strip() or DEFAULT_VGGT_MODEL_ID
@@ -570,301 +533,12 @@ def _hugging_face_token() -> str | None:
     return None
 
 
-def _scene_parse_models_root(ras: Path | None = None) -> Path:
-    return _models_dir(ras) / "SceneParse"
-
-
-def _scene_parse_vggt_dir(ras: Path | None = None) -> Path:
-    return _scene_parse_models_root(ras) / "VGGT-1B-Commercial"
-
-
-def _scene_parse_sam_backend() -> str:
-    value = os.environ.get("STAGE2_SCENE_PARSE_SAM_BACKEND", "sam3").strip().lower()
-    if value not in {"sam3", "sam3.1_multiplex"}:
-        raise SceneParseCatalogError(
-            "model_unavailable",
-            "STAGE2_SCENE_PARSE_SAM_BACKEND must be sam3 or sam3.1_multiplex.",
-        )
-    return value
-
-
-def _scene_parse_sam_dir(ras: Path | None = None, backend: str | None = None) -> Path:
-    selected = backend or _scene_parse_sam_backend()
-    name = "SAM3.1" if selected == "sam3.1_multiplex" else "SAM3"
-    return _scene_parse_models_root(ras) / name
-
-
-def _scene_parse_sam_checkpoint(
-    ras: Path | None = None,
-    backend: str | None = None,
-) -> Path:
-    selected = backend or _scene_parse_sam_backend()
-    filename = SAM31_CHECKPOINT if selected == "sam3.1_multiplex" else "sam3.pt"
-    return _scene_parse_sam_dir(ras, selected) / filename
-
-
-def _version_tuple(value: Any) -> tuple[int, int]:
-    match = re.match(r"^(\d+)\.(\d+)", str(value or ""))
-    return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
-
-
-def _preflight_scene_parse_sam_backend(ras: Path | None = None) -> str:
-    """Reject an unavailable SAM3.1 runtime before download or model work."""
-    backend = _scene_parse_sam_backend()
-    if backend != "sam3.1_multiplex":
-        return backend
-    checkpoint = _scene_parse_sam_checkpoint(ras, backend)
-    if not checkpoint.is_file() or checkpoint.stat().st_size <= 1_000_000:
-        raise SceneParseCatalogError(
-            "model_unavailable",
-            "SAM 3.1 multiplex checkpoint is missing; expected "
-            "STAGE2_MODELS_DIR/SceneParse/SAM3.1/sam3.1_multiplex.pt.",
-        )
-    if sys.version_info < (3, 12):
-        raise SceneParseCatalogError(
-            "model_unavailable",
-            "SAM 3.1 multiplex requires Python 3.12 or newer; this worker image is incompatible.",
-        )
-    try:
-        import torch
-    except Exception as exc:
-        raise SceneParseCatalogError(
-            "model_unavailable",
-            f"SAM 3.1 multiplex runtime could not import PyTorch ({type(exc).__name__}).",
-        ) from exc
-    if _version_tuple(getattr(torch, "__version__", "")) < (2, 7):
-        raise SceneParseCatalogError(
-            "model_unavailable",
-            "SAM 3.1 multiplex requires PyTorch 2.7 or newer; this worker image is incompatible.",
-        )
-    if _version_tuple(getattr(getattr(torch, "version", None), "cuda", "")) < (12, 6):
-        raise SceneParseCatalogError(
-            "model_unavailable",
-            "SAM 3.1 multiplex requires CUDA 12.6 or newer; this worker image is incompatible.",
-        )
-    return backend
-
-
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _checkpoint_digest_matches(path: Path, expected_sha256: str) -> bool:
-    """Re-attest each checkpoint once per worker process and after any change."""
-    try:
-        stat = path.stat()
-    except OSError:
-        return False
-    signature = (
-        expected_sha256,
-        stat.st_dev,
-        stat.st_ino,
-        stat.st_size,
-        stat.st_mtime_ns,
-        stat.st_ctime_ns,
-    )
-    cache_key = str(path.resolve())
-    if _VERIFIED_MODEL_FILE_CACHE.get(cache_key) == signature:
-        return True
-    if not hmac.compare_digest(_sha256_file(path), expected_sha256):
-        _VERIFIED_MODEL_FILE_CACHE.pop(cache_key, None)
-        return False
-    _VERIFIED_MODEL_FILE_CACHE[cache_key] = signature
-    return True
-
-
-def _pinned_model_ready(
-    directory: Path,
-    *,
-    model_id: str,
-    revision: str,
-    checkpoint_name: str,
-    checkpoint_sha256: str,
-    checkpoint_bytes: int,
-) -> bool:
-    checkpoint = directory / checkpoint_name
-    manifest_path = directory / SCENE_PARSE_MODEL_MANIFEST
-    if not checkpoint.is_file() or checkpoint.stat().st_size != checkpoint_bytes:
-        return False
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    return manifest == {
-        "checkpoint_bytes": checkpoint_bytes,
-        "checkpoint_filename": checkpoint_name,
-        "checkpoint_sha256": checkpoint_sha256,
-        "model_id": model_id,
-        "model_revision": revision,
-    } and _checkpoint_digest_matches(checkpoint, checkpoint_sha256)
-
-
-def _write_pinned_model_manifest(
-    directory: Path,
-    *,
-    model_id: str,
-    revision: str,
-    checkpoint_name: str,
-    checkpoint_sha256: str,
-    checkpoint_bytes: int,
-) -> None:
-    checkpoint = directory / checkpoint_name
-    if not checkpoint.is_file() or checkpoint.stat().st_size != checkpoint_bytes:
-        raise SceneParseCatalogError(
-            "model_unavailable",
-            f"Pinned checkpoint {checkpoint_name} has an unexpected size.",
-        )
-    if not _checkpoint_digest_matches(checkpoint, checkpoint_sha256):
-        raise SceneParseCatalogError(
-            "model_unavailable",
-            f"Pinned checkpoint {checkpoint_name} failed SHA-256 verification.",
-        )
-    manifest = {
-        "checkpoint_bytes": checkpoint_bytes,
-        "checkpoint_filename": checkpoint_name,
-        "checkpoint_sha256": checkpoint_sha256,
-        "model_id": model_id,
-        "model_revision": revision,
-    }
-    directory.mkdir(parents=True, exist_ok=True)
-    temporary = directory / f".{SCENE_PARSE_MODEL_MANIFEST}.tmp"
-    temporary.write_text(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, directory / SCENE_PARSE_MODEL_MANIFEST)
-
-
-def _download_scene_parse_snapshot(
-    directory: Path,
-    *,
-    model_id: str,
-    revision: str,
-    allow_patterns: list[str],
-) -> None:
-    token = _hugging_face_token()
-    if token is None:
-        raise SceneParseCatalogError(
-            "model_unavailable",
-            f"{model_id} requires an approved Hugging Face token in HF_TOKEN.",
-        )
-    from huggingface_hub import snapshot_download
-
-    directory.mkdir(parents=True, exist_ok=True)
-    print(f"[stage2] downloading pinned {model_id}@{revision} ...", flush=True)
-    try:
-        snapshot_download(
-            repo_id=model_id,
-            revision=revision,
-            local_dir=str(directory),
-            allow_patterns=allow_patterns,
-            token=token,
-        )
-    except Exception as exc:
-        raise SceneParseCatalogError(
-            "model_unavailable",
-            f"Pinned model download failed for {model_id} ({type(exc).__name__}).",
-        ) from exc
-
-
-def _ensure_scene_parse_model_weights(ras: Path) -> dict[str, str]:
-    """Prepare production weights in isolated paths without changing Agent Lab."""
-    backend = _preflight_scene_parse_sam_backend(ras)
-    models_dir = _models_dir(ras)
-    with _stage2_initialization_lock(models_dir):
-        vggt_dir = _scene_parse_vggt_dir(ras)
-        if not _pinned_model_ready(
-            vggt_dir,
-            model_id=COMMERCIAL_VGGT_MODEL_ID,
-            revision=COMMERCIAL_VGGT_MODEL_REVISION,
-            checkpoint_name=COMMERCIAL_VGGT_CHECKPOINT,
-            checkpoint_sha256=COMMERCIAL_VGGT_CHECKPOINT_SHA256,
-            checkpoint_bytes=COMMERCIAL_VGGT_CHECKPOINT_BYTES,
-        ):
-            _download_scene_parse_snapshot(
-                vggt_dir,
-                model_id=COMMERCIAL_VGGT_MODEL_ID,
-                revision=COMMERCIAL_VGGT_MODEL_REVISION,
-                allow_patterns=[COMMERCIAL_VGGT_CHECKPOINT],
-            )
-            _write_pinned_model_manifest(
-                vggt_dir,
-                model_id=COMMERCIAL_VGGT_MODEL_ID,
-                revision=COMMERCIAL_VGGT_MODEL_REVISION,
-                checkpoint_name=COMMERCIAL_VGGT_CHECKPOINT,
-                checkpoint_sha256=COMMERCIAL_VGGT_CHECKPOINT_SHA256,
-                checkpoint_bytes=COMMERCIAL_VGGT_CHECKPOINT_BYTES,
-            )
-
-        sam_dir = _scene_parse_sam_dir(ras, backend)
-        if backend == "sam3":
-            if not _pinned_model_ready(
-                sam_dir,
-                model_id=SAM3_MODEL_ID,
-                revision=SAM3_MODEL_REVISION,
-                checkpoint_name="sam3.pt",
-                checkpoint_sha256=SAM3_CHECKPOINT_SHA256,
-                checkpoint_bytes=SAM3_CHECKPOINT_BYTES,
-            ):
-                _download_scene_parse_snapshot(
-                    sam_dir,
-                    model_id=SAM3_MODEL_ID,
-                    revision=SAM3_MODEL_REVISION,
-                    allow_patterns=["sam3.pt"],
-                )
-                _write_pinned_model_manifest(
-                    sam_dir,
-                    model_id=SAM3_MODEL_ID,
-                    revision=SAM3_MODEL_REVISION,
-                    checkpoint_name="sam3.pt",
-                    checkpoint_sha256=SAM3_CHECKPOINT_SHA256,
-                    checkpoint_bytes=SAM3_CHECKPOINT_BYTES,
-                )
-        elif not _pinned_model_ready(
-            sam_dir,
-            model_id=SAM31_MODEL_ID,
-            revision=SAM31_MODEL_REVISION,
-            checkpoint_name=SAM31_CHECKPOINT,
-            checkpoint_sha256=SAM31_CHECKPOINT_SHA256,
-            checkpoint_bytes=SAM31_CHECKPOINT_BYTES,
-        ):
-            # SAM3.1 is intentionally not auto-downloaded into the current
-            # incompatible image. A separately built worker must mount the
-            # reviewed checkpoint, then this first call verifies it once.
-            _write_pinned_model_manifest(
-                sam_dir,
-                model_id=SAM31_MODEL_ID,
-                revision=SAM31_MODEL_REVISION,
-                checkpoint_name=SAM31_CHECKPOINT,
-                checkpoint_sha256=SAM31_CHECKPOINT_SHA256,
-                checkpoint_bytes=SAM31_CHECKPOINT_BYTES,
-            )
-    return _scene_parse_model_identity(backend)
-
-
-def _scene_parse_model_identity(backend: str | None = None) -> dict[str, str]:
-    selected = backend or _scene_parse_sam_backend()
-    if selected == "sam3.1_multiplex":
-        return {
-            "backend": selected,
-            "model_id": SAM31_MODEL_ID,
-            "model_revision": SAM31_MODEL_REVISION,
-            "checkpoint_filename": SAM31_CHECKPOINT,
-            "checkpoint_sha256": SAM31_CHECKPOINT_SHA256,
-            "loader": "build_sam3_multiplex_video_predictor",
-        }
-    return {
-        "backend": "sam3_video",
-        "model_id": SAM3_MODEL_ID,
-        "model_revision": SAM3_MODEL_REVISION,
-        "checkpoint_filename": "sam3.pt",
-        "checkpoint_sha256": SAM3_CHECKPOINT_SHA256,
-        "loader": "build_sam3_video_predictor",
-    }
 
 
 def _vggt_weights_ok(vggt_dir: Path, expected_model_id: str | None = None) -> bool:
@@ -894,34 +568,6 @@ def _vggt_weights_ok(vggt_dir: Path, expected_model_id: str | None = None) -> bo
     return False
 
 
-def _weights_ready(models_dir: Path) -> bool:
-    vggt_ok = _vggt_weights_ok(models_dir / "VGGT", _vggt_model_id())
-    sam_pt = _find_sam3_pt(models_dir / "SAM3")
-    return bool(vggt_ok and sam_pt)
-
-
-def _ensure_sam3_pt_layout(models_dir: Path) -> Path:
-    """RAS models.py expects ./models/SAM3/sam3.pt."""
-    sam_dir = models_dir / "SAM3"
-    sam_dir.mkdir(parents=True, exist_ok=True)
-    found = _find_sam3_pt(sam_dir)
-    if found is None:
-        raise RuntimeError(
-            "SAM3 weights missing: expected sam3.pt under STAGE2_MODELS_DIR/SAM3. "
-            "Accept the facebook/sam3 license on Hugging Face with the endpoint HF_TOKEN, "
-            "then re-run full mode so weights can download."
-        )
-    target = sam_dir / "sam3.pt"
-    if found.resolve() != target.resolve():
-        if target.is_symlink() or target.exists():
-            target.unlink()
-        try:
-            target.symlink_to(found.resolve())
-        except OSError:
-            shutil.copy2(found, target)
-    return target
-
-
 def _download_vggt_weights(models_dir: Path) -> None:
     models_dir.mkdir(parents=True, exist_ok=True)
     vggt_dir = models_dir / "VGGT"
@@ -947,59 +593,12 @@ def _download_vggt_weights(models_dir: Path) -> None:
         (vggt_dir / VGGT_MODEL_MARKER).write_text(model_id + "\n")
 
 
-def _download_sam3_weights(models_dir: Path) -> None:
-    vggt_dir = models_dir / "VGGT"
-    sam_dir = models_dir / "SAM3"
-    if not _find_sam3_pt(sam_dir):
-        token = _hugging_face_token()
-        if token is None:
-            raise RuntimeError(
-                "SAM3 weights are gated and require an approved Hugging Face token in HF_TOKEN"
-            )
-        from huggingface_hub import snapshot_download
-
-        print("[stage2] downloading facebook/sam3 ...", flush=True)
-        try:
-            snapshot_download(
-                repo_id="facebook/sam3",
-                local_dir=str(sam_dir),
-                token=token,
-            )
-        except Exception as e:
-            # clear false ready markers from older builds
-            for marker in (vggt_dir / ".stage2_ready", sam_dir / ".stage2_ready"):
-                if marker.exists():
-                    marker.unlink()
-            raise RuntimeError(
-                "Failed to download facebook/sam3 (gated). "
-                "Log into Hugging Face with the same token as HF_TOKEN on the endpoint, "
-                f"accept the SAM3 license at https://huggingface.co/facebook/sam3, then retry. Detail: {e}"
-            ) from e
-
-    if not _weights_ready(models_dir):
-        for marker in (vggt_dir / ".stage2_ready", sam_dir / ".stage2_ready"):
-            if marker.exists():
-                marker.unlink()
-        raise RuntimeError(
-            f"Required model weights are incomplete under {models_dir}. "
-            f"VGGT ok={_vggt_weights_ok(vggt_dir, _vggt_model_id())} "
-            f"model={_vggt_model_id()} SAM3 pt={_find_sam3_pt(sam_dir)}"
-        )
-
-    _ensure_sam3_pt_layout(models_dir)
-    (vggt_dir / ".stage2_ready").touch()
-    (sam_dir / ".stage2_ready").touch()
-    print("[stage2] weights ready", flush=True)
-
-
-def _ensure_python_packages(ras: Path, *, require_sam3: bool) -> None:
-    """Clone is not enough: RAS imports require pip-installed vggt + sam3 packages."""
+def _ensure_python_packages(ras: Path) -> None:
+    """Install the public geometry/dedup dependencies used by this worker."""
     import importlib.util
 
     # Host deps used by RAS Stage-2 modules (not Stage-3 sam-3d-objects).
-    common_modules = ("einops", "safetensors", "scipy", "trimesh", "colorcet", "matplotlib", "omegaconf", "hydra", "transformers", "timm", "ftfy", "regex", "iopath", "huggingface_hub", "PIL")
-    if require_sam3:
-        common_modules += ("open3d",)
+    common_modules = ("einops", "safetensors", "scipy", "trimesh", "open3d", "colorcet", "matplotlib", "omegaconf", "hydra", "transformers", "timm", "ftfy", "regex", "iopath", "huggingface_hub", "PIL")
     # Use find_spec instead of importing optional packages before installation.
     # huggingface_hub caches optional dependency availability when imported;
     # importing it before safetensors exists makes first-job from_pretrained fail.
@@ -1009,16 +608,13 @@ def _ensure_python_packages(ras: Path, *, require_sam3: bool) -> None:
             "numpy<2", "einops", "safetensors", "scipy", "trimesh", "colorcet",
             "matplotlib", "omegaconf", "hydra-core", "transformers", "timm>=1.0.17",
             "ftfy==6.1.1", "regex", "iopath>=0.1.10", "huggingface_hub>=0.23",
-            "Pillow", *(("open3d",) if require_sam3 else ()),
+            "Pillow", "open3d",
         )
 
-    # Install source packages so `import vggt` / `import sam3` resolve.
+    # Install the source package so `import vggt` resolves.
     vggt_py = ras / "vggt" / "pyproject.toml"
-    sam_py = ras / "sam3" / "pyproject.toml"
     if not vggt_py.is_file():
         raise RuntimeError(f"vggt tree missing pyproject at {vggt_py}")
-    if require_sam3 and not sam_py.is_file():
-        raise RuntimeError(f"sam3 tree missing pyproject at {sam_py}")
 
     def _import_error(mod: str) -> str | None:
         try:
@@ -1034,39 +630,26 @@ def _ensure_python_packages(ras: Path, *, require_sam3: bool) -> None:
         # import VGGT immediately after first-time bootstrap.
         _pip_install(str(ras / "vggt"))
         _activate_source_namespace("vggt", ras / "vggt" / "vggt")
-    if require_sam3 and _import_error("sam3.model_builder"):
-        print("[stage2] pip install sam3 ...", flush=True)
-        # non-editable install is more reliable on network volumes
-        _pip_install(str(ras / "sam3"))
-
     vggt_error = _import_error("vggt.models.vggt")
     if vggt_error:
         raise RuntimeError(
             "vggt package still not importable after pip install. "
             f"Check {ras / 'vggt'} layout (expected package dir vggt/vggt). Detail: {vggt_error}"
         )
-    sam3_error = _import_error("sam3.model_builder") if require_sam3 else None
-    if sam3_error:
-        raise RuntimeError(
-            "sam3 package still not importable after pip install. "
-            f"Check {ras / 'sam3'} layout. Detail: {sam3_error}"
-        )
-    packages = "vggt + sam3" if require_sam3 else "vggt"
-    print(f"[stage2] python packages importable ({packages})", flush=True)
+    print("[stage2] python packages importable (vggt + RAS dedup)", flush=True)
 
 
 def _ensure_ras_installed(
     *,
-    require_sam3: bool = True,
     ensure_weights: bool = True,
 ) -> None:
-    """Install paper repo + packages + weights (first full call, then cached on volume)."""
+    """Install the RAS geometry/dedup runtime without a local SAM model."""
     ras = _ras_root()
     models_dir = _models_dir(ras)
 
     with _stage2_initialization_lock(models_dir):
-        # VGGT and SAM3 are managed as separately verified pinned checkouts.
-        # Their intentional revisions must not make the parent RAS gitlinks
+        # VGGT is managed as a separately verified pinned checkout. Its
+        # intentional revision must not make the parent RAS gitlink
         # look dirty and trigger a destructive parent re-clone on every job.
         _clone_if_missing(
             "https://github.com/xiac20/ReplicateAnyScene.git",
@@ -1076,30 +659,17 @@ def _ensure_ras_installed(
         )
         # Keep the exact upstream gitlinks used by the reviewed RAS revision.
         _clone_if_missing("https://github.com/facebookresearch/vggt.git", ras / "vggt", VGGT_REVISION)
-        if require_sam3:
-            _clone_if_missing("https://github.com/facebookresearch/sam3.git", ras / "sam3", SAM3_REVISION)
-
         _prefer_source_checkouts(ras)
 
         # Install dependencies before importing huggingface_hub to download weights.
-        _ensure_python_packages(ras, require_sam3=require_sam3)
+        _ensure_python_packages(ras)
         # VGGT's top-level `vggt` is a PEP 420 namespace package and has no
         # __file__. Verify the concrete model modules that inference imports.
         _verify_import_from_checkout("vggt.models.vggt", ras / "vggt")
-        if require_sam3:
-            _verify_import_from_checkout("sam3.model_builder", ras / "sam3")
 
         if ensure_weights and not _vggt_weights_ok(models_dir / "VGGT", _vggt_model_id()):
             _download_vggt_weights(models_dir)
 
-        # Older builds wrote .stage2_ready even when SAM3 download failed — ignore markers alone.
-        if ensure_weights and require_sam3 and not _weights_ready(models_dir):
-            for marker in (models_dir / "VGGT" / ".stage2_ready", models_dir / "SAM3" / ".stage2_ready"):
-                if marker.exists():
-                    marker.unlink()
-            _download_sam3_weights(models_dir)
-        elif ensure_weights and require_sam3:
-            _ensure_sam3_pt_layout(models_dir)
 
 
 def _ensure_ras_on_path() -> Path:
@@ -1107,10 +677,10 @@ def _ensure_ras_on_path() -> Path:
     if not ras.is_dir() or not (ras / "main.py").is_file():
         raise RuntimeError(
             f"ReplicateAnyScene checkout not found at {ras}. "
-            "Clone https://github.com/xiac20/ReplicateAnyScene and install vggt+sam3 packages."
+            "Clone https://github.com/xiac20/ReplicateAnyScene and install the VGGT package."
         )
     _prefer_source_checkouts(ras)
-    # Models loader expects cwd-relative ./models and ./sam3 paths.
+    # VGGT loads its checkpoint from the checkout-relative ./models path.
     os.chdir(ras)
     return ras
 
@@ -1327,101 +897,6 @@ def _materialize_standard_video(payload: dict[str, Any], work: Path) -> Path:
         expected_size_bytes=_optional_source_size_bytes(payload),
         expected_sha256=_optional_source_sha256(payload),
     )
-
-
-def _validate_scene_parse_catalog_request(
-    payload: dict[str, Any],
-) -> tuple[dict[str, Any] | None, str | None]:
-    """Validate the closed production request without JSON coercions."""
-    allowed = {
-        "analysis_type",
-        "mode",
-        "video_url",
-        "source_sha256",
-        "source_size_bytes",
-        "category_prompts",
-    }
-    unknown = sorted(set(payload) - allowed)
-    if unknown:
-        return None, f"scene_parse_catalog_v1 does not accept fields: {', '.join(unknown)}"
-    if payload.get("analysis_type") != SCENE_PARSE_CATALOG_ANALYSIS_TYPE:
-        return None, f"analysis_type must be {SCENE_PARSE_CATALOG_ANALYSIS_TYPE}"
-    if payload.get("mode") != "full":
-        return None, f"analysis_type {SCENE_PARSE_CATALOG_ANALYSIS_TYPE} requires mode full"
-    video_url = payload.get("video_url")
-    if not isinstance(video_url, str) or not video_url or video_url.strip() != video_url:
-        return None, "video_url must be one trimmed HTTPS URL"
-    source_sha256 = payload.get("source_sha256")
-    if not isinstance(source_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
-        return None, "source_sha256 must be 64 lowercase hexadecimal characters"
-    source_size_bytes = payload.get("source_size_bytes")
-    if source_size_bytes is not None and (
-        type(source_size_bytes) is not int
-        or source_size_bytes < 1
-        or source_size_bytes > SCENE_PARSE_MAX_REMOTE_VIDEO_BYTES
-    ):
-        return None, (
-            "source_size_bytes must be an integer from 1 through "
-            f"{SCENE_PARSE_MAX_REMOTE_VIDEO_BYTES}"
-        )
-    category_prompts = payload.get("category_prompts")
-    if not isinstance(category_prompts, list) or not (
-        1 <= len(category_prompts) <= SCENE_PARSE_MAX_CATEGORY_PROMPTS
-    ):
-        return None, "category_prompts must contain 1-32 unique strings"
-    normalized_keys: set[str] = set()
-    for prompt in category_prompts:
-        if (
-            not isinstance(prompt, str)
-            or prompt.strip() != prompt
-            or not 1 <= len(prompt) <= SCENE_PARSE_MAX_CATEGORY_PROMPT_CHARS
-            or any(ord(character) < 32 or ord(character) == 127 for character in prompt)
-        ):
-            return None, "each category prompt must be a trimmed 1-64 character string"
-        key = prompt.casefold()
-        if key in normalized_keys:
-            return None, "category_prompts must be unique after case folding"
-        normalized_keys.add(key)
-    return {
-        "analysis_type": SCENE_PARSE_CATALOG_ANALYSIS_TYPE,
-        "mode": "full",
-        "video_url": video_url,
-        "source_sha256": source_sha256,
-        "category_prompts": list(category_prompts),
-        **(
-            {"source_size_bytes": source_size_bytes}
-            if source_size_bytes is not None
-            else {}
-        ),
-    }, None
-
-
-def _materialize_scene_parse_video(payload: dict[str, Any], work: Path) -> tuple[Path, int]:
-    expected_size = payload.get("source_size_bytes")
-    try:
-        video_path = _download_video(
-            payload["video_url"],
-            work,
-            max_bytes=SCENE_PARSE_MAX_REMOTE_VIDEO_BYTES,
-            expected_size_bytes=expected_size,
-        )
-    except RuntimeError as exc:
-        detail = str(exc)
-        code = "source_size_mismatch" if "source_size_bytes" in detail else "source_download_failed"
-        raise SceneParseCatalogError(code, detail) from exc
-    actual_size = video_path.stat().st_size
-    if expected_size is not None and actual_size != expected_size:
-        raise SceneParseCatalogError(
-            "source_size_mismatch",
-            "Downloaded video size does not match source_size_bytes.",
-        )
-    actual_sha256 = _sha256_file(video_path)
-    if not hmac.compare_digest(actual_sha256, payload["source_sha256"]):
-        raise SceneParseCatalogError(
-            "source_sha256_mismatch",
-            "Downloaded video SHA-256 does not match source_sha256.",
-        )
-    return video_path, actual_size
 
 
 class VggtOmegaSpaceError(RuntimeError):
@@ -2293,48 +1768,6 @@ def _probe_video_frame_count(path: Path) -> int | None:
     return None
 
 
-def _scene_parse_requested_frames(
-    duration_ms: int,
-    category_prompt_count: int,
-) -> int:
-    if (
-        type(duration_ms) is not int
-        or duration_ms <= 0
-    ):
-        raise SceneParseCatalogError(
-            "source_video_invalid",
-            "Source video duration could not be established.",
-        )
-    if duration_ms > int(SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS * 1000):
-        raise SceneParseCatalogError(
-            "source_video_invalid",
-            f"Source video exceeds the {int(SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS)} second limit.",
-        )
-    if (
-        type(category_prompt_count) is not int
-        or not 1 <= category_prompt_count <= SCENE_PARSE_MAX_CATEGORY_PROMPTS
-    ):
-        raise SceneParseCatalogError(
-            "invalid_scene_parse_request",
-            "Scene Parse category prompt count is outside the production contract.",
-        )
-    target = min(
-        SCENE_PARSE_SAMPLING_MAX_FRAMES,
-        max(
-            SCENE_PARSE_SAMPLING_MIN_FRAMES,
-            (
-                duration_ms * int(SCENE_PARSE_SAMPLING_TARGET_FPS) + 999
-            )
-            // 1000,
-        ),
-    )
-    prompt_budget_cap = SCENE_PARSE_PROMPT_FRAME_BUDGET // category_prompt_count
-    return max(
-        SCENE_PARSE_SAMPLING_MIN_FRAMES,
-        min(target, prompt_budget_cap),
-    )
-
-
 def _probe_bounded_decoded_stream(
     path: Path,
     *,
@@ -2431,18 +1864,6 @@ def _probe_bounded_decoded_stream(
     return decoded_frames, width, height
 
 
-def _probe_scene_parse_decoded_stream(path: Path) -> tuple[int, int, int]:
-    try:
-        return _probe_bounded_decoded_stream(
-            path,
-            max_decoded_frames=SCENE_PARSE_MAX_DECODED_FRAMES,
-            max_source_dimension=SCENE_PARSE_MAX_SOURCE_DIMENSION,
-            max_source_pixels=SCENE_PARSE_MAX_SOURCE_PIXELS,
-        )
-    except RuntimeError as exc:
-        raise SceneParseCatalogError("source_video_invalid", str(exc)) from exc
-
-
 def _bounded_decoded_timeline(
     video_path: Path,
     *,
@@ -2524,22 +1945,6 @@ def _bounded_decoded_timeline(
     return normalized_timestamps, decoded_duration
 
 
-def _scene_parse_decoded_timeline(
-    video_path: Path,
-    *,
-    decoded_frame_count: int,
-) -> tuple[list[float], float]:
-    try:
-        return _bounded_decoded_timeline(
-            video_path,
-            decoded_frame_count=decoded_frame_count,
-            max_source_pixels=SCENE_PARSE_MAX_SOURCE_PIXELS,
-            max_duration_seconds=SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS,
-        )
-    except RuntimeError as exc:
-        raise SceneParseCatalogError("source_video_invalid", str(exc)) from exc
-
-
 def _uniform_decoded_frame_plan(
     source_frame_timestamps: list[float],
     sampled_count: int,
@@ -2565,16 +1970,6 @@ def _uniform_decoded_frame_plan(
             "Source video sampled-frame timeline is invalid."
         )
     return indices, canonical_timestamps
-
-
-def _scene_parse_uniform_frame_plan(
-    source_frame_timestamps: list[float],
-    sampled_count: int,
-) -> tuple[list[int], list[float]]:
-    try:
-        return _uniform_decoded_frame_plan(source_frame_timestamps, sampled_count)
-    except RuntimeError as exc:
-        raise SceneParseCatalogError("source_video_invalid", str(exc)) from exc
 
 
 def _upstream_uniform_decoded_frame_plan(
@@ -2680,27 +2075,6 @@ def _load_preprocessed_sampled_images(image_paths: list[Path]) -> Any:
     return load_and_preprocess_images([str(path) for path in image_paths])
 
 
-def _load_scene_parse_sampled_frames(
-    video_path: Path,
-    work: Path,
-    source_frame_indices: list[int],
-) -> Any:
-    """Decode only selected, scaled JPEGs instead of materializing every frame."""
-    try:
-        image_paths = _extract_bounded_sampled_images(
-            video_path,
-            work,
-            source_frame_indices,
-            max_frames=SCENE_PARSE_SAMPLING_MAX_FRAMES,
-            max_source_pixels=SCENE_PARSE_MAX_SOURCE_PIXELS,
-            decode_max_long_edge=SCENE_PARSE_DECODE_MAX_LONG_EDGE,
-            max_sampled_disk_bytes=SCENE_PARSE_MAX_SAMPLED_DISK_BYTES,
-        )
-    except RuntimeError as exc:
-        raise SceneParseCatalogError("source_video_invalid", str(exc)) from exc
-    return _load_preprocessed_sampled_images(image_paths)
-
-
 def _prepare_standard_vggt_sample(
     video_path: Path,
     work: Path,
@@ -2755,13 +2129,19 @@ def _normalize_mask_video(
     source_video: Path,
     source_frame_indices: list[int] | None = None,
     source_frame_timestamps: list[float] | None = None,
+    *,
+    source_duration_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Produce browser-safe H.264 and preserve the source playback timeline."""
     import subprocess
 
     if not mask_video.is_file() or mask_video.stat().st_size <= 0:
         raise RuntimeError("SAM3 mask visualization did not produce a video")
-    source_duration = _probe_video_duration(source_video)
+    source_duration = (
+        _finite_number(source_duration_seconds)
+        if source_duration_seconds is not None
+        else _probe_video_duration(source_video)
+    )
     if source_duration is None:
         raise RuntimeError(
             "source video timeline could not be established; refusing to publish an unsynchronized mask video"
@@ -2932,7 +2312,7 @@ def run_stage2_dry(payload: dict[str, Any]) -> dict[str, Any]:
         source_bootstrap_ms = None
         if payload.get("analysis_type") == "validation_v1":
             source_started = time.time()
-            _ensure_ras_installed(require_sam3=True, ensure_weights=False)
+            _ensure_ras_installed(ensure_weights=False)
             ras = _ras_root()
             source_validation = {
                 "ras_revision": _verified_checkout_revision(
@@ -2941,8 +2321,8 @@ def run_stage2_dry(payload: dict[str, Any]) -> dict[str, Any]:
                     ignore_submodules=True,
                 ),
                 "vggt_revision": _verified_checkout_revision(ras / "vggt", VGGT_REVISION),
-                "sam3_revision": _verified_checkout_revision(ras / "sam3", SAM3_REVISION),
-                "sam3_required": True,
+                "sam3_required": False,
+                "sam_provider": "fal",
                 "weights_required": False,
             }
             source_bootstrap_ms = int((time.time() - source_started) * 1000)
@@ -2956,7 +2336,7 @@ def run_stage2_dry(payload: dict[str, Any]) -> dict[str, Any]:
         if source_validation:
             pipeline.insert(2, {
                 "id": "source_bootstrap",
-                "name": "Pinned RAS + VGGT + SAM3 source bootstrap",
+                "name": "Pinned RAS + VGGT source bootstrap",
                 "status": "ok",
                 "ms": source_bootstrap_ms,
             })
@@ -3031,10 +2411,9 @@ def _resolve_object_catalog_version(
         return None, "object_catalog_version must be the integer 1"
     if mode != "full":
         return None, "object_catalog_version 1 is supported only for full mode"
-    if payload.get("analysis_type") != "dedup_ras_vggt_sam3":
+    if payload.get("analysis_type") != FULL_DEDUP_FINALIZE_ANALYSIS_TYPE:
         return None, (
-            "object_catalog_version 1 requires analysis_type "
-            "dedup_ras_vggt_sam3"
+            "object_catalog_version 1 requires the Full RAS product or finalizer"
         )
     return version, None
 
@@ -3046,7 +2425,7 @@ def _object_catalog_negotiated(payload: dict[str, Any] | None) -> bool:
         str(payload.get("mode") or "").lower() == "full"
         and type(payload.get("object_catalog_version")) is int
         and payload.get("object_catalog_version") == OBJECT_CATALOG_VERSION
-        and payload.get("analysis_type") == "dedup_ras_vggt_sam3"
+        and payload.get("analysis_type") == FULL_DEDUP_FINALIZE_ANALYSIS_TYPE
     )
 
 
@@ -3111,6 +2490,8 @@ def _required_artifacts(payload: dict[str, Any] | None) -> tuple[str, ...]:
         return BEST_VIEW_GEOMETRY_REQUIRED_ARTIFACTS
     if analysis_type == BEST_VIEW_SCORE_ANALYSIS_TYPE:
         return BEST_VIEW_SCORE_ARTIFACT_NAMES
+    if analysis_type == FULL_DEDUP_FINALIZE_ANALYSIS_TYPE:
+        return FULL_DEDUP_FINAL_ARTIFACTS
     mode = str((payload or {}).get("mode") or "")
     required = REQUIRED_ARTIFACTS.get(mode, ())
     if _object_catalog_negotiated(payload):
@@ -3132,6 +2513,10 @@ def _artifact_manifest(out_dir: Path, work: Path, payload: dict[str, Any] | None
         allowed_artifacts.difference_update(BEST_VIEW_GEOMETRY_ARTIFACT_NAMES)
     if analysis_type != BEST_VIEW_SCORE_ANALYSIS_TYPE:
         allowed_artifacts.difference_update(BEST_VIEW_SCORE_ARTIFACT_NAMES)
+    if analysis_type == FULL_DEDUP_FINALIZE_ANALYSIS_TYPE:
+        # Leg A already owns and durably delivered the point cloud.  Leg C
+        # must not create a second geometry artifact with ambiguous lineage.
+        allowed_artifacts.intersection_update(FULL_DEDUP_FINAL_ARTIFACTS)
     files = sorted(
         p.name
         for p in out_dir.iterdir()
@@ -3500,11 +2885,11 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
             sampled_image_paths,
             source_frame_indices,
             source_frame_timestamps,
-            _source_duration_seconds,
+            source_duration_seconds,
         ) = _prepare_standard_vggt_sample(video_path, work, max_frames)
         timings["sample"] = int((time.time() - t0) * 1000)
 
-        _ensure_ras_installed(require_sam3=False)
+        _ensure_ras_installed()
         ras_root = _ensure_ras_on_path()
         vggt_source_revision = _verified_checkout_revision(ras_root / "vggt", VGGT_REVISION)
         _link_models_dir(ras_root)
@@ -3651,6 +3036,7 @@ def _export_best_view_geometry_inputs(
     *,
     source_frame_indices: list[int],
     source_frame_timestamps: list[float],
+    source_duration_seconds: float,
     unproject_fn: Any,
 ) -> dict[str, Any]:
     """Write the compact scorer inputs and prove they rebuild the model points.
@@ -3718,17 +3104,30 @@ def _export_best_view_geometry_inputs(
             f"{BEST_VIEW_RECONSTRUCTION_TOLERANCE:.3f} relative RMS"
         )
 
+    confidence = np.asarray(pred["world_points_conf"], dtype=np.float32)
+    if confidence.ndim == 4 and confidence.shape[-1] == 1:
+        confidence = confidence[..., 0]
+    if confidence.shape != (frame_count, height, width):
+        raise RuntimeError("VGGT point confidence does not match the exported depth maps")
+    if not np.isfinite(confidence).all():
+        raise RuntimeError("VGGT point confidence contains non-finite values")
+    duration = _finite_number(source_duration_seconds)
+    if duration is None or duration <= source_frame_timestamps[-1]:
+        raise RuntimeError("Source video duration does not contain the sampled timeline")
+
     temporary = destination.with_name(f".{destination.stem}.tmp.npz")
     temporary.unlink(missing_ok=True)
     try:
         np.savez_compressed(
             temporary,
             depth=quantized,
+            confidence=confidence.astype(np.float16),
             intrinsics=intrinsics,
             extrinsics=extrinsics,
             source_frame_indices=np.asarray(source_frame_indices, dtype=np.int64),
             source_frame_timestamps=np.asarray(source_frame_timestamps, dtype=np.float64),
             model_frame_hw=np.asarray([height, width], dtype=np.int64),
+            source_duration_seconds=np.asarray(duration, dtype=np.float64),
             schema=np.array(BEST_VIEW_GEOMETRY_INPUTS_SCHEMA.encode("ascii")),
         )
         os.replace(temporary, destination)
@@ -3741,7 +3140,9 @@ def _export_best_view_geometry_inputs(
         "model_frame_width": width,
         "model_frame_height": height,
         "depth_dtype": "float16",
+        "confidence_dtype": "float16",
         "camera_dtype": "float32",
+        "source_duration_seconds": float(duration),
         "size_bytes": destination.stat().st_size,
         "reconstruction": reconstruction,
     }
@@ -3880,11 +3281,11 @@ def run_best_view_geometry(payload: dict[str, Any]) -> dict[str, Any]:
             sampled_image_paths,
             source_frame_indices,
             source_frame_timestamps,
-            _source_duration_seconds,
+            source_duration_seconds,
         ) = _prepare_standard_vggt_sample(video_path, work, max_frames)
         timings["sample"] = int((time.time() - t0) * 1000)
 
-        _ensure_ras_installed(require_sam3=False)
+        _ensure_ras_installed()
         ras_root = _ensure_ras_on_path()
         vggt_source_revision = _verified_checkout_revision(ras_root / "vggt", VGGT_REVISION)
         _link_models_dir(ras_root)
@@ -3930,6 +3331,7 @@ def run_best_view_geometry(payload: dict[str, Any]) -> dict[str, Any]:
             out_dir / BEST_VIEW_GEOMETRY_INPUTS_NAME,
             source_frame_indices=source_frame_indices,
             source_frame_timestamps=source_frame_timestamps,
+            source_duration_seconds=source_duration_seconds,
             unproject_fn=unproject_depth_map_to_point_map,
         )
         timings["artifact_export"] = int((time.time() - t0) * 1000)
@@ -4160,6 +3562,185 @@ def _validate_best_view_score_request(
     }, None
 
 
+def _validate_full_dedup_finalize_request(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Validate the weights-free Full RAS finalizer contract.
+
+    Geometry and the sampled clip must come from the first RunPod leg.  The
+    edge runs one fal object-tracking request per category against that exact
+    clip and stores each bounded JSON result behind its artifact gateway.
+    """
+    allowed = {
+        "analysis_type",
+        "mode",
+        "geometry_inputs_url",
+        "sampled_clip_url",
+        "masks",
+        "expected_frames_used",
+        "expected_model_frame_width",
+        "expected_model_frame_height",
+        "expected_geometry_model_id",
+        "expected_geometry_source_revision",
+        "categories",
+        "sam_model",
+        "room_align",
+        "object_catalog_version",
+        "upload",
+    }
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        return None, (
+            f"{FULL_DEDUP_FINALIZE_ANALYSIS_TYPE} does not accept fields: "
+            + ", ".join(unknown)
+        )
+    if payload.get("analysis_type") != FULL_DEDUP_FINALIZE_ANALYSIS_TYPE:
+        return None, f"analysis_type must be {FULL_DEDUP_FINALIZE_ANALYSIS_TYPE}"
+    if str(payload.get("mode") or "").lower() != "full":
+        return None, (
+            f"analysis_type {FULL_DEDUP_FINALIZE_ANALYSIS_TYPE} requires mode full"
+        )
+    if payload.get("room_align") is not False:
+        return None, (
+            "room_align must be false; Full RAS identity matching is rigid-transform "
+            "invariant and this fal-backed path never runs semantic room SAM"
+        )
+    if payload.get("sam_model") != FAL_SAM3_RLE_OBJECTS_MODEL_ID:
+        return None, f"sam_model must be {FAL_SAM3_RLE_OBJECTS_MODEL_ID}"
+    if payload.get("object_catalog_version") != OBJECT_CATALOG_VERSION or type(
+        payload.get("object_catalog_version")
+    ) is not int:
+        return None, "object_catalog_version must be the integer 1"
+    if payload.get("expected_geometry_model_id") not in {
+        None,
+        DEFAULT_VGGT_MODEL_ID,
+    }:
+        return None, f"expected_geometry_model_id must be {DEFAULT_VGGT_MODEL_ID}"
+    if payload.get("expected_geometry_source_revision") not in {
+        None,
+        DEFAULT_VGGT_REVISION,
+    }:
+        return None, (
+            f"expected_geometry_source_revision must be {DEFAULT_VGGT_REVISION}"
+        )
+
+    upload = _upload_ticket(payload)
+    if not upload:
+        return None, (
+            f"{FULL_DEDUP_FINALIZE_ANALYSIS_TYPE} requires a privileged artifact upload ticket"
+        )
+    origin = _gateway_origin(upload.get("base"))
+    if origin is None:
+        return None, "the upload ticket base must be a credential-free HTTP(S) origin"
+    for name in ("geometry_inputs_url", "sampled_clip_url"):
+        if _gateway_origin(payload.get(name)) != origin:
+            return None, f"{name} must be served by the artifact gateway origin"
+
+    categories = payload.get("categories")
+    if (
+        not isinstance(categories, list)
+        or not 1 <= len(categories) <= 8
+        or any(
+            not isinstance(category, str)
+            or not 1 <= len(category) <= 64
+            or category.strip() != category
+            for category in categories
+        )
+        or len(set(categories)) != len(categories)
+    ):
+        return None, "use 1-8 unique trimmed categories, each at most 64 characters"
+
+    raw_masks = payload.get("masks")
+    if not isinstance(raw_masks, list) or len(raw_masks) != len(categories):
+        return None, "masks must contain exactly one fal result document per category"
+    masks: list[dict[str, Any]] = []
+    for index, entry in enumerate(raw_masks):
+        if not isinstance(entry, dict) or set(entry) != {
+            "category",
+            "url",
+            "sha256",
+            "bytes",
+            "request_id",
+        }:
+            return None, (
+                "each masks entry must have exactly category, request_id, url, sha256, and bytes"
+            )
+        if entry["category"] != categories[index]:
+            return None, "mask documents must follow the requested category order"
+        if _gateway_origin(entry["url"]) != origin:
+            return None, "mask URLs must be served by the artifact gateway origin"
+        if not isinstance(entry["request_id"], str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]{6,128}", entry["request_id"]
+        ):
+            return None, "mask request_id must be a valid fal queue request id"
+        if not isinstance(entry["sha256"], str) or not re.fullmatch(
+            r"[0-9a-f]{64}", entry["sha256"]
+        ):
+            return None, "mask document sha256 must be 64 lowercase hexadecimal characters"
+        if (
+            type(entry["bytes"]) is not int
+            or not 1 <= entry["bytes"] <= BEST_VIEW_MAX_MASK_DOCUMENT_BYTES
+        ):
+            return None, (
+                "mask document bytes must be a positive integer within the service limit"
+            )
+        masks.append(
+            {
+                "category": entry["category"],
+                "request_id": entry["request_id"],
+                "url": entry["url"],
+                "sha256": entry["sha256"],
+                "bytes": entry["bytes"],
+            }
+        )
+
+    frames_used = payload.get("expected_frames_used")
+    if (
+        type(frames_used) is not int
+        or not 2 <= frames_used <= BEST_VIEW_MAX_FRAMES
+    ):
+        return None, (
+            f"expected_frames_used must be an integer from 2 to {BEST_VIEW_MAX_FRAMES}"
+        )
+    width = payload.get("expected_model_frame_width")
+    height = payload.get("expected_model_frame_height")
+    for name, value in (
+        ("expected_model_frame_width", width),
+        ("expected_model_frame_height", height),
+    ):
+        if (
+            type(value) is not int
+            or not 0 < value <= BEST_VIEW_MAX_MODEL_FRAME_DIMENSION
+        ):
+            return None, (
+                f"{name} must be an integer from 1 to "
+                f"{BEST_VIEW_MAX_MODEL_FRAME_DIMENSION}"
+            )
+    if width * height > BEST_VIEW_MAX_MODEL_FRAME_PIXELS:
+        return None, (
+            "expected model frames exceed "
+            f"{BEST_VIEW_MAX_MODEL_FRAME_PIXELS} pixels"
+        )
+
+    return {
+        "analysis_type": FULL_DEDUP_FINALIZE_ANALYSIS_TYPE,
+        "mode": "full",
+        "geometry_inputs_url": payload["geometry_inputs_url"],
+        "sampled_clip_url": payload["sampled_clip_url"],
+        "masks": masks,
+        "expected_frames_used": frames_used,
+        "expected_model_frame_width": width,
+        "expected_model_frame_height": height,
+        "expected_geometry_model_id": DEFAULT_VGGT_MODEL_ID,
+        "expected_geometry_source_revision": DEFAULT_VGGT_REVISION,
+        "categories": list(categories),
+        "sam_model": FAL_SAM3_RLE_OBJECTS_MODEL_ID,
+        "room_align": False,
+        "object_catalog_version": OBJECT_CATALOG_VERSION,
+        "upload": upload,
+    }, None
+
+
 def _download_gateway_artifact(
     url: str,
     destination: Path,
@@ -4252,11 +3833,9 @@ def _load_best_view_geometry_inputs(
         depth = np.asarray(data["depth"])
         intrinsics = np.asarray(data["intrinsics"], dtype=np.float32)
         extrinsics = np.asarray(data["extrinsics"], dtype=np.float32)
-        model_frame_hw = np.asarray(data["model_frame_hw"]).reshape(-1).tolist()
-        source_frame_indices = np.asarray(data["source_frame_indices"]).reshape(-1).tolist()
-        source_frame_timestamps = (
-            np.asarray(data["source_frame_timestamps"]).reshape(-1).tolist()
-        )
+        model_frame_hw_array = np.asarray(data["model_frame_hw"])
+        source_frame_indices_array = np.asarray(data["source_frame_indices"])
+        source_frame_timestamps_array = np.asarray(data["source_frame_timestamps"])
 
     try:
         schema_value = schema.item()
@@ -4266,6 +3845,41 @@ def _load_best_view_geometry_inputs(
         raise RuntimeError(
             f"geometry inputs schema must be {BEST_VIEW_GEOMETRY_INPUTS_SCHEMA}"
         )
+    if (
+        model_frame_hw_array.shape != (2,)
+        or not np.issubdtype(model_frame_hw_array.dtype, np.integer)
+    ):
+        raise RuntimeError("geometry inputs model_frame_hw must be two integers")
+    if (
+        source_frame_indices_array.shape != (expected_frames,)
+        or not np.issubdtype(source_frame_indices_array.dtype, np.integer)
+    ):
+        raise RuntimeError("geometry inputs source_frame_indices must be one integer per frame")
+    if (
+        source_frame_timestamps_array.shape != (expected_frames,)
+        or not np.issubdtype(source_frame_timestamps_array.dtype, np.number)
+    ):
+        raise RuntimeError("geometry inputs source_frame_timestamps must be one number per frame")
+    model_frame_hw = model_frame_hw_array.tolist()
+    source_frame_indices = source_frame_indices_array.tolist()
+    source_frame_timestamps = source_frame_timestamps_array.astype(np.float64).tolist()
+    if (
+        any(value < 0 for value in source_frame_indices)
+        or any(
+            right <= left
+            for left, right in zip(source_frame_indices, source_frame_indices[1:])
+        )
+    ):
+        raise RuntimeError("geometry inputs source_frame_indices must be non-negative and increasing")
+    if (
+        not np.isfinite(source_frame_timestamps_array).all()
+        or any(value < 0 for value in source_frame_timestamps)
+        or any(
+            right <= left
+            for left, right in zip(source_frame_timestamps, source_frame_timestamps[1:])
+        )
+    ):
+        raise RuntimeError("geometry inputs source_frame_timestamps must be finite and increasing")
 
     if depth.ndim == 4 and depth.shape[-1] == 1:
         depth = depth[..., 0]
@@ -4303,6 +3917,84 @@ def _load_best_view_geometry_inputs(
         [int(value) for value in source_frame_indices],
         [float(value) for value in source_frame_timestamps],
     )
+
+
+def _load_full_dedup_geometry_inputs(
+    path: Path,
+    *,
+    expected_frames: int,
+    expected_width: int,
+    expected_height: int,
+) -> tuple[Any, Any, Any, Any, list[int], list[float], float]:
+    """Load leg-A geometry plus the confidence required by RAS deduplication."""
+    import numpy as np
+
+    depth, extrinsics, intrinsics, indices, timestamps = (
+        _load_best_view_geometry_inputs(
+            path,
+            expected_frames=expected_frames,
+            expected_width=expected_width,
+            expected_height=expected_height,
+        )
+    )
+    with np.load(path, allow_pickle=False) as data:
+        missing = [
+            name
+            for name in ("confidence", "source_duration_seconds")
+            if name not in data.files
+        ]
+        if missing:
+            raise RuntimeError(
+                "geometry inputs are missing Full RAS arrays: " + ", ".join(missing)
+            )
+        confidence = np.asarray(data["confidence"], dtype=np.float32)
+        duration_raw = np.asarray(data["source_duration_seconds"]).reshape(-1).tolist()
+    if confidence.ndim == 4 and confidence.shape[-1] == 1:
+        confidence = confidence[..., 0]
+    if confidence.shape != (expected_frames, expected_height, expected_width):
+        raise RuntimeError("geometry confidence does not match the model frames")
+    if not np.isfinite(confidence).all():
+        raise RuntimeError("geometry confidence contains non-finite values")
+    if len(duration_raw) != 1:
+        raise RuntimeError("geometry source duration must be one scalar")
+    duration = _finite_number(duration_raw[0])
+    if (
+        duration is None
+        or duration <= timestamps[-1]
+        or duration > STANDARD_MAX_VIDEO_DURATION_SECONDS + 0.001
+    ):
+        raise RuntimeError("geometry source duration does not contain the sampled timeline")
+    return depth, confidence, extrinsics, intrinsics, indices, timestamps, float(duration)
+
+
+def _load_sampled_clip_colors(
+    path: Path,
+    *,
+    expected_frames: int,
+    expected_width: int,
+    expected_height: int,
+) -> Any:
+    """Decode the exact model-frame clip and reject any frame/canvas drift."""
+    import cv2
+    import numpy as np
+
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise RuntimeError("sampled clip could not be decoded")
+    frames: list[Any] = []
+    try:
+        while len(frames) <= expected_frames:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            if frame.shape[:2] != (expected_height, expected_width):
+                raise RuntimeError("sampled clip canvas does not match the model frame")
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    finally:
+        capture.release()
+    if len(frames) != expected_frames:
+        raise RuntimeError("sampled clip frame count does not match the geometry inputs")
+    return np.stack(frames, axis=0).astype(np.uint8, copy=False)
 
 
 def _best_view_mask_frames(document: Any) -> list[Any]:
@@ -4412,6 +4104,112 @@ def _best_view_instances_from_masks(
     return instances, len(grouped)
 
 
+def _full_dedup_tracks_from_masks(
+    documents: list[tuple[str, Any]],
+    *,
+    frames_used: int,
+    height: int,
+    width: int,
+) -> dict[str, list[list[dict[str, Any]]]]:
+    """Convert exact fal object documents into upstream RAS track segments.
+
+    fal track ids are scoped to one category request.  Each category therefore
+    gets its own grouping namespace, and a visibility gap splits a track in the
+    same way as RAS's local ``segment_and_track`` implementation.
+    """
+    result: dict[str, list[list[dict[str, Any]]]] = {}
+    decoded_mask_bytes = 0
+    for category, document in documents:
+        if category in result:
+            raise RuntimeError("fal mask categories must be unique")
+        if not isinstance(document, dict) or set(document) != {
+            "width",
+            "height",
+            "num_frames",
+            "frames",
+        }:
+            raise RuntimeError(
+                f"fal mask document for {category} must contain exactly "
+                "width, height, num_frames, and frames"
+            )
+        if (
+            type(document["width"]) is not int
+            or type(document["height"]) is not int
+            or type(document["num_frames"]) is not int
+            or document["width"] != width
+            or document["height"] != height
+            or document["num_frames"] != frames_used
+        ):
+            raise RuntimeError(
+                f"fal mask document for {category} does not match the sampled clip"
+            )
+        frames = document["frames"]
+        if not isinstance(frames, list) or len(frames) != frames_used:
+            raise RuntimeError(
+                f"fal mask document for {category} must report every sampled frame"
+            )
+
+        by_track: dict[int, list[tuple[int, Any]]] = {}
+        for expected_index, frame in enumerate(frames):
+            if not isinstance(frame, dict) or set(frame) != {"frame_index", "objects"}:
+                raise RuntimeError("fal mask frame entries have an unexpected shape")
+            if type(frame["frame_index"]) is not int or frame["frame_index"] != expected_index:
+                raise RuntimeError("fal mask frames must be complete and ordered from zero")
+            objects = frame["objects"]
+            if not isinstance(objects, list):
+                raise RuntimeError("fal mask frame objects must be a list")
+            if len(objects) > BEST_VIEW_MAX_OBJECTS_PER_FRAME:
+                raise RuntimeError("fal mask frame reports more objects than the supported bound")
+            seen_track_ids: set[int] = set()
+            for entry in objects:
+                if not isinstance(entry, dict) or set(entry) != {"track_id", "rle"}:
+                    raise RuntimeError("fal mask objects must contain exactly track_id and rle")
+                track_id = entry["track_id"]
+                if (
+                    type(track_id) is not int
+                    or track_id < 0
+                    or track_id > 2**63 - 1
+                ):
+                    raise RuntimeError("fal mask track_id must be a non-negative integer")
+                if track_id in seen_track_ids:
+                    raise RuntimeError("fal mask frame repeats a track_id")
+                seen_track_ids.add(track_id)
+                try:
+                    mask = decode_rle_unambiguous(entry["rle"], height, width)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"fal mask RLE for {category} track {track_id} is invalid"
+                    ) from exc
+                if not mask.any():
+                    continue
+                decoded_mask_bytes += int(mask.nbytes)
+                if decoded_mask_bytes > FULL_DEDUP_MAX_DECODED_MASK_BYTES:
+                    raise RuntimeError(
+                        "decoded fal masks exceed the Full RAS memory bound"
+                    )
+                by_track.setdefault(track_id, []).append((expected_index, mask))
+                if len(by_track) > BEST_VIEW_MAX_TRACKS_PER_CATEGORY:
+                    raise RuntimeError(
+                        "fal mask document reports more tracks than the supported bound"
+                    )
+
+        tracks: list[list[dict[str, Any]]] = []
+        for track_id in sorted(by_track):
+            segment: list[dict[str, Any]] = []
+            previous: int | None = None
+            for frame_id, mask in by_track[track_id]:
+                if previous is not None and frame_id != previous + 1:
+                    if segment:
+                        tracks.append(segment)
+                    segment = []
+                segment.append({"frame_id": frame_id, "mask": mask})
+                previous = frame_id
+            if segment:
+                tracks.append(segment)
+        result[category] = tracks
+    return result
+
+
 def run_best_view_score(payload: dict[str, Any]) -> dict[str, Any]:
     """Best-view leg C: weights-free, CPU-only scoring of the fal tracks."""
     t_all = time.time()
@@ -4453,7 +4251,7 @@ def run_best_view_score(payload: dict[str, Any]) -> dict[str, Any]:
         # Upstream code only: this leg never loads a checkpoint and never
         # touches CUDA, so it can run on the cheapest available worker.
         t0 = time.time()
-        _ensure_ras_installed(require_sam3=False, ensure_weights=False)
+        _ensure_ras_installed(ensure_weights=False)
         ras_root = _ensure_ras_on_path()
         vggt_source_revision = _verified_checkout_revision(ras_root / "vggt", VGGT_REVISION)
         from src.geometry_utils import compute_surface_area_from_pointmap
@@ -4578,6 +4376,261 @@ def run_best_view_score(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "status": "error",
             "mode": "full",
+            "error": str(exc),
+            "timings_ms": timings,
+        }
+    finally:
+        if os.environ.get("STAGE2_KEEP_WORK") != "1":
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def run_full_dedup_finalize(payload: dict[str, Any]) -> dict[str, Any]:
+    """Weights-free Full RAS leg C over VGGT geometry and fal object tracks."""
+    t_all = time.time()
+    work = Path(tempfile.mkdtemp(prefix="ras-full-dedup-finalize-"))
+    out_dir = work / "output"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timings: dict[str, int] = {}
+    frames_used = int(payload["expected_frames_used"])
+    width = int(payload["expected_model_frame_width"])
+    height = int(payload["expected_model_frame_height"])
+    try:
+        import numpy as np
+
+        t0 = time.time()
+        geometry_archive = work / BEST_VIEW_GEOMETRY_INPUTS_NAME
+        sampled_clip = work / BEST_VIEW_SAMPLED_CLIP_NAME
+        _download_gateway_artifact(
+            payload["geometry_inputs_url"],
+            geometry_archive,
+            BEST_VIEW_MAX_GEOMETRY_INPUT_BYTES,
+        )
+        _download_gateway_artifact(
+            payload["sampled_clip_url"],
+            sampled_clip,
+            FULL_DEDUP_MAX_SAMPLED_CLIP_BYTES,
+        )
+        documents: list[tuple[str, Any]] = []
+        for index, entry in enumerate(payload["masks"]):
+            destination = work / f"masks-{index}.json"
+            downloaded_bytes = _download_gateway_artifact(
+                entry["url"],
+                destination,
+                BEST_VIEW_MAX_MASK_DOCUMENT_BYTES,
+            )
+            if downloaded_bytes != entry["bytes"]:
+                raise RuntimeError(
+                    f"fal mask document size for {entry['category']} did not match its receipt"
+                )
+            if not hmac.compare_digest(
+                _sha256_file(destination),
+                entry["sha256"],
+            ):
+                raise RuntimeError(
+                    f"fal mask document digest for {entry['category']} did not match its receipt"
+                )
+            try:
+                documents.append(
+                    (entry["category"], json.loads(destination.read_text("utf-8")))
+                )
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"fal mask document for {entry['category']} is not valid JSON"
+                ) from exc
+        timings["download"] = int((time.time() - t0) * 1000)
+
+        # This leg imports only public geometry/dedup utilities. It does not
+        # clone, import, load, or download a local SAM runtime or checkpoint.
+        t0 = time.time()
+        _ensure_ras_installed(ensure_weights=False)
+        ras_root = _ensure_ras_on_path()
+        vggt_source_revision = _verified_checkout_revision(
+            ras_root / "vggt", VGGT_REVISION
+        )
+        from src.geometry_utils import compute_surface_area_from_pointmap
+        from src.sg_deduplication import (
+            cross_category_deduplicate,
+            self_category_deduplicate,
+        )
+        from src.utils import vis_instance_masks
+        from vggt.utils.geometry import unproject_depth_map_to_point_map
+
+        timings["bootstrap"] = int((time.time() - t0) * 1000)
+
+        t0 = time.time()
+        (
+            depth,
+            confidence,
+            extrinsics,
+            intrinsics,
+            source_frame_indices,
+            source_frame_timestamps,
+            source_duration_seconds,
+        ) = _load_full_dedup_geometry_inputs(
+            geometry_archive,
+            expected_frames=frames_used,
+            expected_width=width,
+            expected_height=height,
+        )
+        world_points = np.asarray(
+            unproject_depth_map_to_point_map(depth[..., None], extrinsics, intrinsics),
+            dtype=np.float32,
+        )
+        if world_points.shape != (frames_used, height, width, 3):
+            raise RuntimeError("reconstructed point map does not match the model frames")
+        colors = _load_sampled_clip_colors(
+            sampled_clip,
+            expected_frames=frames_used,
+            expected_width=width,
+            expected_height=height,
+        )
+        timings["geometry"] = int((time.time() - t0) * 1000)
+
+        t0 = time.time()
+        category_masks = _full_dedup_tracks_from_masks(
+            documents,
+            frames_used=frames_used,
+            height=height,
+            width=width,
+        )
+        raw_track_count = sum(len(tracks) for tracks in category_masks.values())
+        all_masks: dict[str, list] = {}
+        for category in payload["categories"]:
+            all_masks[category] = self_category_deduplicate(
+                category_masks.get(category, []),
+                world_points,
+                confidence,
+            )
+        deduped = cross_category_deduplicate(
+            all_masks,
+            world_points,
+            confidence,
+        )
+        timings["dedup"] = int((time.time() - t0) * 1000)
+
+        t0 = time.time()
+        mask_video = out_dir / "instance_masks.mp4"
+        vis_instance_masks(colors, deduped, str(mask_video))
+        mask_video_meta = _normalize_mask_video(
+            mask_video,
+            sampled_clip,
+            source_frame_indices,
+            source_frame_timestamps,
+            source_duration_seconds=source_duration_seconds,
+        )
+        timings["visualization"] = int((time.time() - t0) * 1000)
+
+        t0 = time.time()
+        catalog = build_object_catalog(
+            all_masks=deduped,
+            colors=colors,
+            world_points=world_points,
+            requested_categories=payload["categories"],
+            source_frame_indices=source_frame_indices,
+            source_frame_timestamps=source_frame_timestamps,
+            surface_area_fn=compute_surface_area_from_pointmap,
+            out_dir=out_dir,
+        )
+        object_catalog_summary = {
+            "schema_version": catalog["schema_version"],
+            "total_count": catalog["total_count"],
+            "returned_count": catalog["returned_count"],
+            "truncated": catalog["truncated"],
+            "artifact_name": OBJECT_CATALOG_JSON_NAME,
+            "atlas_artifact_name": OBJECT_CROPS_ATLAS_NAME,
+        }
+        timings["object_catalog"] = int((time.time() - t0) * 1000)
+
+        instances = _masks_to_instances(deduped)
+        t0 = time.time()
+        artifacts = _artifact_manifest(out_dir, work, payload)
+        timings["artifact_delivery"] = int((time.time() - t0) * 1000)
+        timings["total"] = int((time.time() - t_all) * 1000)
+        delivery_error = _artifact_delivery_error(payload, artifacts)
+        response = {
+            "status": "ok",
+            "mode": "full",
+            "implementation": (
+                "ReplicateAnyScene spatial deduplication over VGGT geometry and "
+                "fal SAM 3 object tracks"
+            ),
+            "upstream": "https://github.com/xiac20/ReplicateAnyScene",
+            "upstream_revision": RAS_REVISION,
+            "frames_used": frames_used,
+            "source_frame_indices": source_frame_indices,
+            "source_frame_timestamps": source_frame_timestamps,
+            "categories": payload["categories"],
+            "raw_track_count": raw_track_count,
+            "instance_count": len(instances),
+            "instances": instances,
+            "geometry": {
+                "backend": "vggt_geometry_inputs",
+                "device": "cpu",
+                "model_id": DEFAULT_VGGT_MODEL_ID,
+                "source_revision": vggt_source_revision,
+                "license_scope": "research_noncommercial",
+                "coordinate_system": "vggt_first_camera",
+                "world_points_shape": list(world_points.shape),
+                "room_align": False,
+                "room_align_requested": False,
+                "room_alignment_applied": False,
+                "room_alignment_reason": "semantic_room_alignment_skipped_external_masks",
+                "room_alignment_detail": (
+                    "room orientation is unnecessary for rigid-transform-invariant "
+                    "3D identity matching"
+                ),
+                "sam3_required": False,
+                "point_cloud_artifact_owner": "geometry_leg",
+                "artifact_exported": False,
+            },
+            "sam": {
+                "backend": "fal_sam3_video_rle_objects",
+                "provider": "fal",
+                "model_id": FAL_SAM3_RLE_OBJECTS_MODEL_ID,
+                "result_schema": FAL_SAM_TRACK_DOCUMENT_SCHEMA,
+                "raw_tracks": raw_track_count,
+                "requests": [
+                    {
+                        "category": entry["category"],
+                        "request_id": entry["request_id"],
+                    }
+                    for entry in payload["masks"]
+                ],
+                "mask_video": mask_video_meta,
+                "local_model_loaded": False,
+            },
+            "object_catalog": object_catalog_summary,
+            "artifacts": artifacts,
+            "timings_ms": timings,
+            "pipeline": [
+                {"id": "provider_inputs", "status": "ok", "ms": timings.get("download")},
+                {"id": "geometry", "status": "ok", "ms": timings.get("geometry")},
+                {"id": "fal_masks", "status": "ok"},
+                {"id": "spatial_dedup", "status": "ok", "ms": timings.get("dedup")},
+                {"id": "mask_video", "status": "ok", "ms": timings.get("visualization")},
+                {"id": "object_catalog", "status": "ok", "ms": timings.get("object_catalog")},
+                {
+                    "id": "artifact_delivery",
+                    "status": "error" if delivery_error else "ok",
+                    "ms": timings.get("artifact_delivery"),
+                },
+            ],
+            "paper_mapping": {
+                "paper": "ReplicateAnyScene (arXiv:2604.10789)",
+                "stage": 2,
+                "title": "Spatial-Guided Visual Deduplication",
+                "segmentation_provider": "fal",
+            },
+        }
+        if delivery_error:
+            response.update({"status": "error", **delivery_error})
+        return response
+    except Exception as exc:
+        timings["total"] = int((time.time() - t_all) * 1000)
+        return {
+            "status": "error",
+            "mode": "full",
+            "error_code": "full_dedup_finalize_failed",
             "error": str(exc),
             "timings_ms": timings,
         }
@@ -4729,610 +4782,31 @@ def run_stage2_omega_geometry(payload: dict[str, Any]) -> dict[str, Any]:
             shutil.rmtree(work, ignore_errors=True)
 
 
-def _load_scene_parse_vggt_model(ras_root: Path) -> Any:
-    from vggt.models.vggt import VGGT
-    from safetensors.torch import load_file
-
-    model = VGGT()
-    state_dict = load_file(
-        str(_scene_parse_vggt_dir(ras_root) / COMMERCIAL_VGGT_CHECKPOINT),
-        device="cpu",
-    )
-    model.load_state_dict(state_dict, strict=True)
-    return model
-
-
-def _load_scene_parse_sam_video_model(ras_root: Path, backend: str) -> Any:
-    checkpoint = str(_scene_parse_sam_checkpoint(ras_root, backend))
-    if backend == "sam3.1_multiplex":
-        from sam3.model_builder import build_sam3_multiplex_video_predictor
-
-        return build_sam3_multiplex_video_predictor(
-            checkpoint_path=checkpoint,
-            max_num_objects=SCENE_PARSE_CATALOG_MAX_OBJECTS,
-            multiplex_count=16,
-            use_fa3=False,
-            compile=False,
-            warm_up=False,
-        )
-    from sam3.model_builder import build_sam3_video_predictor
-
-    return build_sam3_video_predictor(checkpoint_path=checkpoint)
-
-
 def run_scene_parse_catalog(payload: dict[str, Any]) -> dict[str, Any]:
-    """Run the catalog-only production profile without debug artifact export."""
-    normalized, request_error = _validate_scene_parse_catalog_request(payload)
-    if request_error or normalized is None:
-        return {
-            "status": "error",
-            "mode": "full",
-            "analysis_type": SCENE_PARSE_CATALOG_ANALYSIS_TYPE,
-            "error_code": "invalid_scene_parse_request",
-            "error": request_error or "scene_parse_catalog_v1 request is invalid",
-        }
-    payload = normalized
-    timings: dict[str, int] = {}
-    stage = "model_preflight"
-    work = Path(tempfile.mkdtemp(prefix="ras-scene-parse-catalog-"))
-    vggt_model = None
-    sam_video = None
-    unload_model = None
-    t_all = time.time()
-    try:
-        sam_backend = _preflight_scene_parse_sam_backend()
-
-        stage = "source_download"
-        t0 = time.time()
-        video_path, source_size = _materialize_scene_parse_video(payload, work)
-        timings["source_download"] = int((time.time() - t0) * 1000)
-
-        stage = "source_validation"
-        t0 = time.time()
-        decoded_frame_count, _source_width, _source_height = (
-            _probe_scene_parse_decoded_stream(video_path)
-        )
-        decoded_timestamps, duration_seconds = _scene_parse_decoded_timeline(
-            video_path,
-            decoded_frame_count=decoded_frame_count,
-        )
-        duration_ms = int(round(duration_seconds * 1000))
-        requested_frames = _scene_parse_requested_frames(
-            duration_ms,
-            len(payload["category_prompts"]),
-        )
-        source_frame_indices, source_frame_timestamps = _scene_parse_uniform_frame_plan(
-            decoded_timestamps,
-            requested_frames,
-        )
-        timings["source_validation"] = int((time.time() - t0) * 1000)
-
-        # Source bytes, declared size, digest, and duration are all validated
-        # before source/bootstrap work can download or load a model.
-        stage = "runtime_bootstrap"
-        t0 = time.time()
-        try:
-            _ensure_ras_installed(require_sam3=True, ensure_weights=False)
-            ras_root = _ensure_ras_on_path()
-            ras_source_revision = _verified_checkout_revision(
-                ras_root,
-                RAS_REVISION,
-                ignore_submodules=True,
-            )
-            vggt_source_revision = _verified_checkout_revision(
-                ras_root / "vggt",
-                VGGT_REVISION,
-            )
-            sam_source_revision = _verified_checkout_revision(
-                ras_root / "sam3",
-                SAM3_REVISION,
-            )
-        except SceneParseCatalogError:
-            raise
-        except Exception as exc:
-            raise SceneParseCatalogError(
-                "model_unavailable",
-                f"Pinned Scene Parse model runtime is unavailable ({type(exc).__name__}).",
-            ) from exc
-        timings["runtime_bootstrap"] = int((time.time() - t0) * 1000)
-
-        import cv2
-        import torch
-        from src.models import unload_model as ras_unload_model
-        from src.object_segmentation import segment_and_track
-        from src.sg_deduplication import (
-            cross_category_deduplicate,
-            get_overlap_ratio,
-            self_category_deduplicate,
-        )
-        from src.vggt_predict import vggt_predict
-
-        unload_model = ras_unload_model
-        if not torch.cuda.is_available():
-            raise SceneParseCatalogError(
-                "model_unavailable",
-                "scene_parse_catalog_v1 requires a CUDA GPU.",
-            )
-        device = "cuda"
-
-        stage = "sample_frames"
-        t0 = time.time()
-        frames = _load_scene_parse_sampled_frames(
-            video_path,
-            work,
-            source_frame_indices,
-        ).to(device)
-        frames_used = int(frames.shape[0])
-        if not 1 <= frames_used <= SCENE_PARSE_SAMPLING_MAX_FRAMES:
-            raise SceneParseCatalogError(
-                "source_video_invalid",
-                "Source video did not produce a bounded non-empty frame sample.",
-            )
-        if (
-            len(source_frame_indices) != frames_used
-            or len(source_frame_timestamps) != frames_used
-        ):
-            raise SceneParseCatalogError(
-                "source_video_invalid",
-                "Source video frame timeline does not match sampled frames.",
-            )
-        timings["sample_frames"] = int((time.time() - t0) * 1000)
-
-        stage = "model_weights"
-        t0 = time.time()
-        sam_identity = _ensure_scene_parse_model_weights(ras_root)
-        timings["model_weights"] = int((time.time() - t0) * 1000)
-
-        stage = "vggt"
-        t0 = time.time()
-        vggt_model = _load_scene_parse_vggt_model(ras_root).to(device)
-        prediction = vggt_predict(frames, vggt_model)
-        unload_model(vggt_model)
-        vggt_model = None
-        timings["vggt"] = int((time.time() - t0) * 1000)
-
-        stage = "sam"
-        t0 = time.time()
-        color_dir = work / "color"
-        color_dir.mkdir(parents=True, exist_ok=True)
-        for index, image in enumerate(prediction["colors"]):
-            ok = cv2.imwrite(
-                str(color_dir / f"{index}.jpg"),
-                cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
-            )
-            if not ok:
-                raise RuntimeError("could not materialize sampled frame for SAM video tracking")
-        sam_video = _load_scene_parse_sam_video_model(ras_root, sam_backend)
-        session = sam_video.handle_request(
-            request={"type": "start_session", "resource_path": str(color_dir)}
-        )
-        session_id = session.get("session_id") if isinstance(session, dict) else None
-        if not isinstance(session_id, str) or not session_id:
-            raise RuntimeError("SAM video tracker did not create a session")
-
-        category_masks: dict[str, list[Any]] = {}
-        raw_category_masks: dict[str, list[Any]] = {}
-        raw_track_count = 0
-        for category_prompt in payload["category_prompts"]:
-            raw_tracks = list(
-                segment_and_track(category_prompt, sam_video, session_id) or ()
-            )
-            raw_track_count += len(raw_tracks)
-            raw_category_masks[category_prompt] = raw_tracks
-            category_masks[category_prompt] = self_category_deduplicate(
-                raw_tracks,
-                prediction["world_points"],
-                prediction["world_points_conf"],
-            )
-        category_deduplicated_count = sum(len(value) for value in category_masks.values())
-        deduplicated = cross_category_deduplicate(
-            category_masks,
-            prediction["world_points"],
-            prediction["world_points_conf"],
-        )
-        deduplicated, preserved_short_count = preserve_short_scene_parse_tracks(
-            deduplicated_masks=deduplicated,
-            category_masks=raw_category_masks,
-            category_prompts=payload["category_prompts"],
-            world_points=prediction["world_points"],
-            world_points_conf=prediction["world_points_conf"],
-            overlap_fn=get_overlap_ratio,
-        )
-        unload_model(sam_video)
-        sam_video = None
-        timings["sam_and_dedup"] = int((time.time() - t0) * 1000)
-
-        stage = "catalog"
-        t0 = time.time()
-        colors = prediction["colors"]
-        catalog = build_scene_parse_objects(
-            all_masks=deduplicated,
-            frame_shape=(int(colors.shape[0]), int(colors.shape[1]), int(colors.shape[2])),
-            source_sha256=payload["source_sha256"],
-            category_prompts=payload["category_prompts"],
-            source_frame_indices=source_frame_indices,
-            source_frame_timestamps_s=source_frame_timestamps,
-        )
-        warnings = ["Catalog scope is limited to the supplied category prompts."]
-        if frames_used < requested_frames:
-            warnings.append(
-                "Source video contained fewer decodable frames than the sampling policy requested."
-            )
-        if preserved_short_count:
-            warnings.append(
-                f"Retained {preserved_short_count} brief object hypotheses with fewer than three sampled-frame observations."
-            )
-        if catalog["limited_evidence_count"]:
-            warnings.append(
-                f"{catalog['limited_evidence_count']} returned object hypotheses have limited evidence strength."
-            )
-        if catalog["truncated"]:
-            warnings.append(
-                f"Object catalog was limited to {SCENE_PARSE_CATALOG_MAX_OBJECTS} hypotheses."
-            )
-        timings["catalog"] = int((time.time() - t0) * 1000)
-        timings["total"] = int((time.time() - t_all) * 1000)
-        response = {
-            "status": "ok",
-            "mode": "full",
-            "analysis_type": SCENE_PARSE_CATALOG_ANALYSIS_TYPE,
-            "schema": SCENE_PARSE_CATALOG_SCHEMA,
-            "source": {
-                "sha256": payload["source_sha256"],
-                "size_bytes": source_size,
-                "duration_ms": duration_ms,
-            },
-            "scope": "requested_category_prompts",
-            "exhaustive": False,
-            "identity_semantics": "result_scoped_ras_spatial_hypothesis",
-            "category_prompts": payload["category_prompts"],
-            "sampling": {
-                "policy": SCENE_PARSE_SAMPLING_POLICY,
-                "target_fps": SCENE_PARSE_SAMPLING_TARGET_FPS,
-                "min_frames": SCENE_PARSE_SAMPLING_MIN_FRAMES,
-                "max_frames": SCENE_PARSE_SAMPLING_MAX_FRAMES,
-                "prompt_frame_budget": SCENE_PARSE_PROMPT_FRAME_BUDGET,
-                "planned_prompt_frames": requested_frames
-                * len(payload["category_prompts"]),
-                "requested_frames": requested_frames,
-                "frames_used": frames_used,
-                "source_frame_indices": source_frame_indices,
-                "source_timestamps_ms": [
-                    int(round(value * 1000)) for value in source_frame_timestamps
-                ],
-            },
-            "objects": catalog["objects"],
-            "counts": {
-                "raw_tracks": raw_track_count,
-                "category_deduplicated_tracks": category_deduplicated_count,
-                "deduplicated_objects": catalog["total_count"],
-                "returned_objects": catalog["returned_count"],
-                "omitted_objects": catalog["total_count"] - catalog["returned_count"],
-                "evidence_items": catalog["evidence_count"],
-            },
-            "truncated": catalog["truncated"],
-            "warnings": warnings,
-            "provenance": {
-                "ras": {
-                    "repository": "https://github.com/xiac20/ReplicateAnyScene",
-                    "revision": ras_source_revision,
-                },
-                "geometry": {
-                    "backend": "vggt",
-                    "model_id": COMMERCIAL_VGGT_MODEL_ID,
-                    "model_revision": COMMERCIAL_VGGT_MODEL_REVISION,
-                    "checkpoint_filename": COMMERCIAL_VGGT_CHECKPOINT,
-                    "checkpoint_sha256": COMMERCIAL_VGGT_CHECKPOINT_SHA256,
-                    "source_revision": vggt_source_revision,
-                    "license_scope": "commercial",
-                },
-                "segmentation": {
-                    **sam_identity,
-                    "source_revision": sam_source_revision,
-                },
-            },
-            "timings_ms": timings,
-        }
-        return bound_scene_parse_response(response)
-    except SceneParseCatalogError as exc:
-        timings["total"] = int((time.time() - t_all) * 1000)
-        return {
-            "status": "error",
-            "mode": "full",
-            "analysis_type": SCENE_PARSE_CATALOG_ANALYSIS_TYPE,
-            "error_code": exc.code,
-            "error": str(exc),
-            "failed_stage": stage,
-            "timings_ms": timings,
-        }
-    except Exception as exc:
-        timings["total"] = int((time.time() - t_all) * 1000)
-        return {
-            "status": "error",
-            "mode": "full",
-            "analysis_type": SCENE_PARSE_CATALOG_ANALYSIS_TYPE,
-            "error_code": "inference_failed",
-            "error": f"Scene Parse catalog inference failed ({type(exc).__name__}).",
-            "failed_stage": stage,
-            "timings_ms": timings,
-        }
-    finally:
-        if unload_model is not None:
-            if sam_video is not None:
-                unload_model(sam_video)
-            if vggt_model is not None:
-                unload_model(vggt_model)
-        if os.environ.get("STAGE2_KEEP_WORK") != "1":
-            shutil.rmtree(work, ignore_errors=True)
+    """Fail closed for the retired Scene Parse-owned profile."""
+    return {
+        "status": "error",
+        "mode": "full",
+        "analysis_type": SCENE_PARSE_CATALOG_ANALYSIS_TYPE,
+        "error_code": "profile_retired",
+        "error": (
+            "scene_parse_catalog_v1 is retired from this Agent-Lab-only worker; "
+            "Scene Parse must use its owning service."
+        ),
+    }
 
 
 def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
-    """
-    Full Stage 2 using ReplicateAnyScene sources only.
-
-    Mirrors main.py Stage 2 (VGGT → room align → SAM3 video track →
-    self/cross category dedup → mask video). Does not run Stage 3+.
-    """
-    payload_mode = str(payload.get("mode") or "full").lower()
-    _catalog_version, catalog_error = _resolve_object_catalog_version(payload, payload_mode)
-    if catalog_error:
-        return {"status": "error", "error": catalog_error, "mode": "full"}
-    payload = {**payload, "mode": "full"}
-    t_all = time.time()
-    video_url = str(payload.get("video_url") or "").strip()
-    categories = payload.get("categories") or []
-    if isinstance(categories, str):
-        categories = [c.strip() for c in categories.split(",") if c.strip()]
-    categories = [str(c).strip() for c in categories if str(c).strip()]
-    max_frames = max(2, min(int(payload.get("max_frames") or 48), 160))
-    room_align = str(payload.get("room_align", os.environ.get("STAGE2_ROOM_ALIGN", "1"))).lower() not in {
-        "0",
-        "false",
-        "no",
+    """Fail closed for the retired monolithic local-SAM Full RAS path."""
+    return {
+        "status": "error",
+        "mode": "full",
+        "error_code": "local_sam_path_retired",
+        "error": (
+            "The monolithic local-SAM Full RAS path is retired. Route this run through "
+            "the VGGT geometry leg, fal SAM 3 object tracks, and dedup_ras_finalize_v1."
+        ),
     }
-    has_video = bool(video_url) or bool(payload.get("video_b64"))
-    if not has_video or not categories:
-        return {"status": "error", "error": "video_url/video_b64 and categories are required", "mode": "full"}
-
-    work = Path(tempfile.mkdtemp(prefix="ras-stage2-full-"))
-    out_dir = work / "output"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    timings: dict[str, int] = {}
-
-    try:
-        t0 = time.time()
-        video_path = _materialize_standard_video(payload, work)
-        timings["download"] = int((time.time() - t0) * 1000)
-
-        t0 = time.time()
-        (
-            sampled_image_paths,
-            source_frame_indices,
-            source_frame_timestamps,
-            _source_duration_seconds,
-        ) = _prepare_standard_vggt_sample(video_path, work, max_frames)
-        timings["sample"] = int((time.time() - t0) * 1000)
-
-        _ensure_ras_installed()
-        ras_root = _ensure_ras_on_path()
-        vggt_source_revision = _verified_checkout_revision(ras_root / "vggt", VGGT_REVISION)
-        sam3_source_revision = _verified_checkout_revision(ras_root / "sam3", SAM3_REVISION)
-        _link_models_dir(ras_root)
-
-        import torch
-        import cv2
-
-        from src.models import (
-            load_sam3_image_model,
-            load_sam3_video_model,
-            load_vggt_model,
-            unload_model,
-        )
-        from src.utils import vis_instance_masks
-        from src.geometry_utils import (
-            align_to_room_coordinate_system,
-            align_vggt_predictions,
-            compute_surface_area_from_pointmap,
-        )
-        from src.vggt_predict import vggt_predict
-        from src.object_segmentation import segment_and_track, segment_wall_and_floor
-        from src.sg_deduplication import cross_category_deduplicate, self_category_deduplicate
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        t0 = time.time()
-        frames = _load_preprocessed_sampled_images(sampled_image_paths).to(device)
-        n_frames = int(frames.shape[0])
-        if not (
-            n_frames
-            == len(source_frame_indices)
-            == len(source_frame_timestamps)
-        ):
-            raise RuntimeError("Source video sampled-frame evidence is not aligned.")
-        timings["sample"] += int((time.time() - t0) * 1000)
-
-        t0 = time.time()
-        vggt_model = load_vggt_model().to(device)
-        pred = vggt_predict(frames, vggt_model)
-        unload_model(vggt_model)
-        timings["vggt"] = int((time.time() - t0) * 1000)
-
-        wall_masks, floor_masks = [], []
-        room_alignment_applied = False
-        if room_align:
-            t0 = time.time()
-            sam3_image = load_sam3_image_model()
-            wall_masks, floor_masks = segment_wall_and_floor(pred["colors"], sam3_image)
-            R, t = align_to_room_coordinate_system(pred["world_points"], wall_masks, floor_masks)
-            room_alignment_applied = _room_alignment_was_applied(R, t)
-            if room_alignment_applied:
-                pred = align_vggt_predictions(pred, R, t)
-            unload_model(sam3_image)
-            timings["room_align"] = int((time.time() - t0) * 1000)
-        else:
-            timings["room_align"] = 0
-
-        # Persist color frames for SAM3 video session (same as RAS main.py).
-        color_dir = out_dir / "color"
-        color_dir.mkdir(parents=True, exist_ok=True)
-        for i, image in enumerate(pred["colors"]):
-            cv2.imwrite(str(color_dir / f"{i}.jpg"), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-        export_meta = _export_vggt_artifacts(
-            pred,
-            out_dir,
-            coordinate_system="room_z_up" if room_alignment_applied else "vggt_first_camera",
-        ) if _artifact_exports_enabled(payload) else {}
-
-        t0 = time.time()
-        sam3_video = load_sam3_video_model()
-        response = sam3_video.handle_request(
-            request=dict(type="start_session", resource_path=str(color_dir)),
-        )
-        session_id = response["session_id"]
-        all_masks: dict[str, list] = {}
-        for category in categories:
-            category_masks = segment_and_track(category, sam3_video, session_id)
-            all_masks[category] = self_category_deduplicate(
-                category_masks,
-                pred["world_points"],
-                pred["world_points_conf"],
-            )
-        deduped = cross_category_deduplicate(
-            all_masks,
-            pred["world_points"],
-            pred["world_points_conf"],
-        )
-        mask_video = out_dir / "instance_masks.mp4"
-        vis_instance_masks(pred["colors"], deduped, str(mask_video))
-        unload_model(sam3_video)
-        timings["sam_dedup_vis"] = int((time.time() - t0) * 1000)
-
-        t0 = time.time()
-        mask_video_meta = _normalize_mask_video(
-            mask_video,
-            video_path,
-            source_frame_indices,
-            source_frame_timestamps,
-        )
-        timings["mask_video_normalize"] = int((time.time() - t0) * 1000)
-
-        object_catalog_summary = None
-        if _object_catalog_negotiated(payload):
-            t0 = time.time()
-            catalog = build_object_catalog(
-                all_masks=deduped,
-                colors=pred["colors"],
-                world_points=pred["world_points"],
-                requested_categories=categories,
-                source_frame_indices=source_frame_indices,
-                source_frame_timestamps=source_frame_timestamps,
-                surface_area_fn=compute_surface_area_from_pointmap,
-                out_dir=out_dir,
-            )
-            object_catalog_summary = {
-                "schema_version": catalog["schema_version"],
-                "total_count": catalog["total_count"],
-                "returned_count": catalog["returned_count"],
-                "truncated": catalog["truncated"],
-                "artifact_name": OBJECT_CATALOG_JSON_NAME,
-                "atlas_artifact_name": OBJECT_CROPS_ATLAS_NAME,
-            }
-            timings["object_catalog"] = int((time.time() - t0) * 1000)
-
-        instances = _masks_to_instances(deduped)
-        raw_count = sum(len(v) for v in all_masks.values())
-        t0 = time.time()
-        artifacts = _artifact_manifest(out_dir, work, payload)
-        timings["artifact_delivery"] = int((time.time() - t0) * 1000)
-        timings["total"] = int((time.time() - t_all) * 1000)
-        delivery_error = _artifact_delivery_error(payload, artifacts)
-
-        pipeline = [
-            {"id": "intake", "status": "ok", "ms": timings.get("download")},
-            {"id": "sample_frames", "status": "ok", "ms": timings.get("sample")},
-            {"id": "vggt", "status": "ok", "ms": timings.get("vggt")},
-            {
-                "id": "room_align",
-                "status": "ok" if room_alignment_applied else "not_applied" if room_align else "skipped",
-                "ms": timings.get("room_align"),
-            },
-            {"id": "sam_dedup", "status": "ok", "ms": timings.get("sam_dedup_vis")},
-            {"id": "mask_video", "status": "ok", "ms": timings.get("mask_video_normalize")},
-        ]
-        if object_catalog_summary is not None:
-            pipeline.append(
-                {"id": "object_catalog", "status": "ok", "ms": timings.get("object_catalog")}
-            )
-        pipeline.extend([
-            {
-                "id": "artifact_delivery",
-                "status": "error" if delivery_error else "ok",
-                "ms": timings.get("artifact_delivery"),
-            },
-            {"id": "emit", "status": "ok", "detail": {"instance_ids": [x["instance_id"] for x in instances]}},
-        ])
-
-        response = {
-            "status": "ok",
-            "mode": "full",
-            "implementation": "ReplicateAnyScene spatial-guided visual deduplication (vendor pipeline)",
-            "upstream": "https://github.com/xiac20/ReplicateAnyScene",
-            "upstream_revision": RAS_REVISION,
-            "frames_used": n_frames,
-            "source_frame_indices": source_frame_indices,
-            "source_frame_timestamps": source_frame_timestamps,
-            "categories": categories,
-            "raw_track_count": raw_count,
-            "instance_count": len(instances),
-            "instances": instances,
-            "geometry": {
-                "backend": "vggt",
-                "device": device,
-                "model_id": _vggt_model_id(),
-                "source_revision": vggt_source_revision,
-                "license_scope": _vggt_license_scope(),
-                "room_align": room_align,
-                "room_align_requested": room_align,
-                "room_alignment_applied": room_alignment_applied,
-                "wall_mask_frames": len(wall_masks),
-                "floor_mask_frames": len(floor_masks),
-                "artifact_export": export_meta,
-            },
-            "sam": {
-                "backend": "sam3_video",
-                "model_id": SAM3_MODEL_ID,
-                "source_revision": sam3_source_revision,
-                "raw_tracks": raw_count,
-                "mask_video": mask_video_meta,
-            },
-            "artifacts": artifacts,
-            "timings_ms": timings,
-            "pipeline": pipeline,
-            "paper_mapping": {
-                "paper": "ReplicateAnyScene (arXiv:2604.10789)",
-                "stage": 2,
-                "title": "Spatial-Guided Visual Deduplication",
-            },
-        }
-        if object_catalog_summary is not None:
-            response["object_catalog"] = object_catalog_summary
-        if delivery_error:
-            response.update({"status": "error", **delivery_error})
-        return response
-    except Exception as e:
-        return {
-            "status": "error",
-            "mode": "full",
-            "error": str(e),
-            "timings_ms": timings,
-            "hint": (
-                "Ensure vendor/ReplicateAnyScene is present with sam3+vggt installed, "
-                "and weights under STAGE2_MODELS_DIR (VGGT/ and SAM3/) via scripts/download_weights.sh."
-            ),
-        }
-    finally:
-        if os.environ.get("STAGE2_KEEP_WORK") != "1":
-            shutil.rmtree(work, ignore_errors=True)
 
 
 def _resolve_runpod_analysis_type(payload: dict[str, Any], mode: str) -> tuple[str | None, str | None]:
@@ -5397,35 +4871,6 @@ def _resolve_runpod_analysis_type(payload: dict[str, Any], mode: str) -> tuple[s
                 f"expected_geometry_source_revision must be {VGGT_OMEGA_SPACE_REVISION} "
                 f"for analysis_type {raw_analysis_type}"
             )
-    if raw_analysis_type == "dedup_ras_vggt_sam3":
-        if SAM3_REVISION != DEFAULT_SAM3_REVISION:
-            return raw_analysis_type, (
-                f"analysis_type {raw_analysis_type} requires SAM 3 source {DEFAULT_SAM3_REVISION}; "
-                f"this worker is configured for {SAM3_REVISION}"
-            )
-        expected_model_id = payload.get("expected_sam_model_id")
-        if expected_model_id is not None and expected_model_id != SAM3_MODEL_ID:
-            return raw_analysis_type, (
-                f"expected_sam_model_id must be {SAM3_MODEL_ID} "
-                f"for analysis_type {raw_analysis_type}"
-            )
-        expected_source_revision = payload.get("expected_sam_source_revision")
-        if expected_source_revision is not None and expected_source_revision != DEFAULT_SAM3_REVISION:
-            return raw_analysis_type, (
-                f"expected_sam_source_revision must be {DEFAULT_SAM3_REVISION} "
-                f"for analysis_type {raw_analysis_type}"
-            )
-    if raw_analysis_type == SCENE_PARSE_CATALOG_ANALYSIS_TYPE:
-        if VGGT_REVISION != DEFAULT_VGGT_REVISION:
-            return raw_analysis_type, (
-                f"analysis_type {raw_analysis_type} requires VGGT source {DEFAULT_VGGT_REVISION}; "
-                f"this worker is configured for {VGGT_REVISION}"
-            )
-        if SAM3_REVISION != DEFAULT_SAM3_REVISION:
-            return raw_analysis_type, (
-                f"analysis_type {raw_analysis_type} requires SAM source {DEFAULT_SAM3_REVISION}; "
-                f"this worker is configured for {SAM3_REVISION}"
-            )
     return raw_analysis_type, None
 
 
@@ -5461,8 +4906,8 @@ def _attach_success_provenance(
         if not isinstance(source, dict) or (
             source.get("ras_revision") != RAS_REVISION
             or source.get("vggt_revision") != DEFAULT_VGGT_REVISION
-            or source.get("sam3_revision") != DEFAULT_SAM3_REVISION
-            or source.get("sam3_required") is not True
+            or source.get("sam_provider") != "fal"
+            or source.get("sam3_required") is not False
             or source.get("weights_required") is not False
         ):
             return provenance_error("source bootstrap")
@@ -5572,102 +5017,65 @@ def _attach_success_provenance(
             or artifacts.get("required_files") != list(BEST_VIEW_SCORE_ARTIFACT_NAMES)
         ):
             return provenance_error("best-view scoring")
-    if analysis_type == "dedup_ras_vggt_sam3":
+    if analysis_type == FULL_DEDUP_FINALIZE_ANALYSIS_TYPE:
         sam = result.get("sam")
-        if not isinstance(sam, dict) or (
-            sam.get("model_id") != SAM3_MODEL_ID
-            or sam.get("source_revision") != DEFAULT_SAM3_REVISION
-        ):
-            return provenance_error("SAM 3")
-    if analysis_type == SCENE_PARSE_CATALOG_ANALYSIS_TYPE:
-        source = result.get("source")
-        sampling = result.get("sampling")
-        objects = result.get("objects")
-        counts = result.get("counts")
-        category_prompts = result.get("category_prompts")
-        provenance = result.get("provenance")
-        ras = provenance.get("ras") if isinstance(provenance, dict) else None
-        geometry = provenance.get("geometry") if isinstance(provenance, dict) else None
-        segmentation = provenance.get("segmentation") if isinstance(provenance, dict) else None
-        expected_sam = _scene_parse_model_identity()
-        frames_used = sampling.get("frames_used") if isinstance(sampling, dict) else None
-        frame_indices = (
-            sampling.get("source_frame_indices") if isinstance(sampling, dict) else None
+        geometry = result.get("geometry")
+        artifacts = result.get("artifacts")
+        categories = result.get("categories")
+        frames_used = result.get("frames_used")
+        world_points_shape = (
+            geometry.get("world_points_shape") if isinstance(geometry, dict) else None
         )
-        timestamps = (
-            sampling.get("source_timestamps_ms") if isinstance(sampling, dict) else None
-        )
-        object_keys = [
-            item.get("object_key")
-            for item in objects
-            if isinstance(item, dict)
-        ] if isinstance(objects, list) else []
         if (
-            result.get("schema") != SCENE_PARSE_CATALOG_SCHEMA
-            or result.get("scope") != "requested_category_prompts"
-            or result.get("exhaustive") is not False
-            or result.get("identity_semantics") != "result_scoped_ras_spatial_hypothesis"
-            or not isinstance(category_prompts, list)
-            or not 1 <= len(category_prompts) <= SCENE_PARSE_MAX_CATEGORY_PROMPTS
-            or not all(isinstance(value, str) and value for value in category_prompts)
-            or not isinstance(source, dict)
-            or not isinstance(source.get("sha256"), str)
-            or not re.fullmatch(r"[0-9a-f]{64}", source["sha256"])
-            or type(source.get("size_bytes")) is not int
-            or not 1 <= source["size_bytes"] <= SCENE_PARSE_MAX_REMOTE_VIDEO_BYTES
-            or type(source.get("duration_ms")) is not int
-            or not 1 <= source["duration_ms"] <= int(SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS * 1000)
-            or not isinstance(sampling, dict)
-            or sampling.get("policy") != SCENE_PARSE_SAMPLING_POLICY
-            or sampling.get("target_fps") != SCENE_PARSE_SAMPLING_TARGET_FPS
-            or sampling.get("min_frames") != SCENE_PARSE_SAMPLING_MIN_FRAMES
-            or sampling.get("max_frames") != SCENE_PARSE_SAMPLING_MAX_FRAMES
-            or sampling.get("prompt_frame_budget") != SCENE_PARSE_PROMPT_FRAME_BUDGET
-            or type(sampling.get("planned_prompt_frames")) is not int
-            or type(sampling.get("requested_frames")) is not int
-            or not SCENE_PARSE_SAMPLING_MIN_FRAMES
-            <= sampling["requested_frames"]
-            <= SCENE_PARSE_SAMPLING_MAX_FRAMES
-            or sampling["planned_prompt_frames"]
-            != sampling["requested_frames"] * len(category_prompts)
-            or sampling["planned_prompt_frames"] > SCENE_PARSE_PROMPT_FRAME_BUDGET
-            or type(frames_used) is not int
-            or not 1 <= frames_used <= SCENE_PARSE_SAMPLING_MAX_FRAMES
-            or not isinstance(frame_indices, list)
-            or len(frame_indices) != frames_used
-            or not all(type(value) is int and value >= 0 for value in frame_indices)
-            or not isinstance(timestamps, list)
-            or len(timestamps) != frames_used
-            or not all(type(value) is int and value >= 0 for value in timestamps)
-            or not isinstance(objects, list)
-            or len(objects) > SCENE_PARSE_CATALOG_MAX_OBJECTS
-            or len(object_keys) != len(objects)
-            or len(set(object_keys)) != len(object_keys)
-            or not all(
-                isinstance(value, str) and re.fullmatch(r"obj_[0-9a-f]{24}", value)
-                for value in object_keys
-            )
-            or not isinstance(counts, dict)
-            or counts.get("returned_objects") != len(objects)
-            or type(result.get("truncated")) is not bool
-            or not isinstance(result.get("warnings"), list)
-            or not isinstance(ras, dict)
-            or ras.get("revision") != RAS_REVISION
+            type(frames_used) is not int
+            or not 2 <= frames_used <= BEST_VIEW_MAX_FRAMES
+            or not isinstance(sam, dict)
+            or sam.get("backend") != "fal_sam3_video_rle_objects"
+            or sam.get("provider") != "fal"
+            or sam.get("model_id") != FAL_SAM3_RLE_OBJECTS_MODEL_ID
+            or sam.get("result_schema") != FAL_SAM_TRACK_DOCUMENT_SCHEMA
+            or sam.get("local_model_loaded") is not False
             or not isinstance(geometry, dict)
-            or geometry.get("model_id") != COMMERCIAL_VGGT_MODEL_ID
-            or geometry.get("model_revision") != COMMERCIAL_VGGT_MODEL_REVISION
-            or geometry.get("checkpoint_sha256") != COMMERCIAL_VGGT_CHECKPOINT_SHA256
+            or geometry.get("backend") != "vggt_geometry_inputs"
+            or geometry.get("model_id") != DEFAULT_VGGT_MODEL_ID
             or geometry.get("source_revision") != DEFAULT_VGGT_REVISION
-            or geometry.get("license_scope") != "commercial"
-            or not isinstance(segmentation, dict)
-            or any(segmentation.get(key) != value for key, value in expected_sam.items())
-            or segmentation.get("source_revision") != DEFAULT_SAM3_REVISION
+            or geometry.get("coordinate_system") != "vggt_first_camera"
+            or geometry.get("room_align") is not False
+            or geometry.get("room_align_requested") is not False
+            or geometry.get("room_alignment_applied") is not False
+            or geometry.get("room_alignment_reason")
+            != "semantic_room_alignment_skipped_external_masks"
+            or geometry.get("sam3_required") is not False
+            or geometry.get("point_cloud_artifact_owner") != "geometry_leg"
+            or geometry.get("artifact_exported") is not False
+            or not isinstance(world_points_shape, list)
+            or len(world_points_shape) != 4
+            or world_points_shape[0] != frames_used
+            or type(world_points_shape[1]) is not int
+            or type(world_points_shape[2]) is not int
+            or world_points_shape[3] != 3
+            or not 0 < world_points_shape[1] <= BEST_VIEW_MAX_MODEL_FRAME_DIMENSION
+            or not 0 < world_points_shape[2] <= BEST_VIEW_MAX_MODEL_FRAME_DIMENSION
+            or world_points_shape[1] * world_points_shape[2]
+            > BEST_VIEW_MAX_MODEL_FRAME_PIXELS
+            or not isinstance(categories, list)
+            or not 1 <= len(categories) <= 8
+            or not isinstance(sam.get("requests"), list)
+            or len(sam["requests"]) != len(categories)
             or any(
-                key in result
-                for key in ("artifacts", "geometry", "sam", "instances", "object_catalog")
+                not isinstance(entry, dict)
+                or set(entry) != {"category", "request_id"}
+                or entry.get("category") != categories[index]
+                or not isinstance(entry.get("request_id"), str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{6,128}", entry["request_id"])
+                for index, entry in enumerate(sam["requests"])
             )
+            or not isinstance(artifacts, dict)
+            or artifacts.get("complete") is not True
+            or artifacts.get("required_files") != list(FULL_DEDUP_FINAL_ARTIFACTS)
+            or artifacts.get("files") != list(FULL_DEDUP_FINAL_ARTIFACTS)
         ):
-            return provenance_error("Scene Parse catalog")
+            return provenance_error("fal-backed Full RAS")
     if object_catalog_version == OBJECT_CATALOG_VERSION:
         object_catalog = result.get("object_catalog")
         artifacts = result.get("artifacts")
@@ -5727,11 +5135,16 @@ def _attach_success_provenance(
             or object_catalog.get("atlas_artifact_name") != OBJECT_CROPS_ATLAS_NAME
             or not isinstance(artifacts, dict)
             or artifacts.get("complete") is not True
-            or artifacts.get("required_files") != [
-                "point_cloud.glb",
-                "instance_masks.mp4",
-                *OBJECT_CATALOG_ARTIFACTS,
-            ]
+            or artifacts.get("required_files")
+            != (
+                list(FULL_DEDUP_FINAL_ARTIFACTS)
+                if analysis_type == FULL_DEDUP_FINALIZE_ANALYSIS_TYPE
+                else [
+                    "point_cloud.glb",
+                    "instance_masks.mp4",
+                    *OBJECT_CATALOG_ARTIFACTS,
+                ]
+            )
         ):
             return provenance_error("object catalog")
 
@@ -5759,20 +5172,6 @@ def run_stage2(payload: dict[str, Any]) -> dict[str, Any]:
             result["error_code"] = error_code
         return result
 
-    if analysis_type == SCENE_PARSE_CATALOG_ANALYSIS_TYPE:
-        normalized, scene_parse_error = _validate_scene_parse_catalog_request(payload)
-        if scene_parse_error or normalized is None:
-            return input_error(
-                scene_parse_error or "scene_parse_catalog_v1 request is invalid",
-                "invalid_scene_parse_request",
-            )
-        result = run_scene_parse_catalog(normalized)
-        return _attach_success_provenance(
-            result,
-            mode=mode,
-            analysis_type=analysis_type,
-        )
-
     if analysis_type == BEST_VIEW_SCORE_ANALYSIS_TYPE:
         normalized, score_error = _validate_best_view_score_request(payload)
         if score_error or normalized is None:
@@ -5785,6 +5184,22 @@ def run_stage2(payload: dict[str, Any]) -> dict[str, Any]:
             result,
             mode=mode,
             analysis_type=analysis_type,
+        )
+
+    if analysis_type == FULL_DEDUP_FINALIZE_ANALYSIS_TYPE:
+        normalized, finalize_error = _validate_full_dedup_finalize_request(payload)
+        if finalize_error or normalized is None:
+            return input_error(
+                finalize_error
+                or f"{FULL_DEDUP_FINALIZE_ANALYSIS_TYPE} request is invalid",
+                "invalid_full_dedup_finalize_request",
+            )
+        result = run_full_dedup_finalize(normalized)
+        return _attach_success_provenance(
+            result,
+            mode=mode,
+            analysis_type=analysis_type,
+            object_catalog_version=OBJECT_CATALOG_VERSION,
         )
 
     _catalog_version, catalog_error = _resolve_object_catalog_version(payload, mode)

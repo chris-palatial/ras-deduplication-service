@@ -34,14 +34,14 @@ fi
 
 # Each deployed commit owns an immutable app checkout and venv.  The venv keeps
 # the base image's CUDA/PyTorch packages, while PYTHONPATH gives the exact
-# revision-scoped VGGT/SAM3 source trees precedence over any system copy.
+# revision-scoped VGGT source tree precedence over any system copy.
 runtime_dir="$STAGE2_RUNTIME_ROOT/$STAGE2_CODE_REV"
 export STAGE2_VENV="$runtime_dir/venv"
 export RAS_ROOT="$runtime_dir/ReplicateAnyScene"
 export STAGE2_MODELS_DIR="${STAGE2_MODELS_DIR:-/workspace/models}"
 export STAGE2_MODE_DEFAULT="${STAGE2_MODE_DEFAULT:-full}"
 export HF_HOME="${HF_HOME:-/workspace/hf-cache}"
-export PYTHONPATH="$RAS_ROOT/vggt:$RAS_ROOT/sam3${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$RAS_ROOT/vggt${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONNOUSERSITE=1
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 export PIP_ROOT_USER_ACTION=ignore

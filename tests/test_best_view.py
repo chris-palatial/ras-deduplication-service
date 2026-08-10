@@ -141,6 +141,10 @@ class DecodeRleTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             best_view.decode_rle("3 4 4 2", 4, 5)
 
+    def test_identity_decoder_rejects_dual_grammar_ambiguity(self):
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            best_view.decode_rle_unambiguous("1 3", 2, 2)
+
     def test_rejects_kaggle_pairs_past_the_canvas(self):
         with self.assertRaises(ValueError):
             best_view.decode_rle("18 9", 4, 5)

@@ -30,10 +30,13 @@ from artifact_upload import upload_artifact_file
 
 
 class Stage2ServiceTest(unittest.TestCase):
-    def test_sam3_model_builder_runtime_dependency_is_pinned(self):
+    def test_local_sam_runtime_dependency_is_removed(self):
         requirements = (Path(__file__).resolve().parents[1] / "requirements.txt").read_text()
+        dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text()
 
-        self.assertIn("pycocotools==2.0.11", requirements.splitlines())
+        self.assertNotIn("pycocotools", requirements)
+        self.assertNotIn("facebookresearch/sam3", dockerfile)
+        self.assertNotIn("pip install -q --no-cache-dir --ignore-installed /app/vendor/ReplicateAnyScene/sam3", dockerfile)
 
     def test_deployment_packaging_includes_shared_artifact_contract(self):
         root = Path(__file__).resolve().parents[1]
@@ -52,7 +55,7 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertIn("artifact_contract.py", compile_step)
         self.assertIn("object_catalog.py", wrapper_copy)
         self.assertIn("object_catalog.py", compile_step)
-        self.assertIn("scene_parse_catalog.py", wrapper_copy)
+        self.assertNotIn("scene_parse_catalog.py", wrapper_copy)
         self.assertIn("scene_parse_catalog.py", compile_step)
         self.assertIn("best_view.py", wrapper_copy)
         self.assertIn("best_view.py", compile_step)
@@ -129,7 +132,7 @@ class Stage2ServiceTest(unittest.TestCase):
             "_verify_import_from_checkout",
             side_effect=lambda module, _path: events.append(f"verify:{module}"),
         ), patch.object(stage2, "_vggt_weights_ok", return_value=True):
-            stage2._ensure_ras_installed(require_sam3=False)
+            stage2._ensure_ras_installed()
 
         self.assertEqual(events[0], "lock_enter")
         self.assertEqual(events[-1], "lock_exit")
@@ -443,14 +446,21 @@ class Stage2ServiceTest(unittest.TestCase):
             stage2, "_ensure_python_packages"
         ), patch.object(stage2, "_verify_import_from_checkout"), patch.object(
             stage2, "_download_vggt_weights"
-        ) as download_vggt, patch.object(
-            stage2, "_download_sam3_weights"
-        ) as download_sam3:
-            stage2._ensure_ras_installed(require_sam3=True, ensure_weights=False)
+        ) as download_vggt:
+            stage2._ensure_ras_installed(ensure_weights=False)
 
-        self.assertEqual(clone.call_count, 3)
+        self.assertEqual(clone.call_count, 2)
+        self.assertEqual(
+            [call.args[0] for call in clone.call_args_list],
+            [
+                "https://github.com/xiac20/ReplicateAnyScene.git",
+                "https://github.com/facebookresearch/vggt.git",
+            ],
+        )
         download_vggt.assert_not_called()
-        download_sam3.assert_not_called()
+
+    def test_bootstrap_has_no_local_sam_switch(self):
+        self.assertNotIn("require_sam3", stage2._ensure_ras_installed.__code__.co_varnames)
 
     def test_pinned_fetch_retries_a_transient_failure(self):
         failed = types.SimpleNamespace(returncode=128, stderr="fatal: temporary network error\n")
@@ -715,7 +725,6 @@ class Stage2ServiceTest(unittest.TestCase):
         cases = (
             ("validation_v1", "dry_run", "run_stage2_dry"),
             ("geometry_vggt_1b", "geometry", "run_stage2_geometry"),
-            ("dedup_ras_vggt_sam3", "full", "run_stage2_full"),
         )
         for analysis_type, mode, runner_name in cases:
             runner_result = {"status": "ok", "mode": mode}
@@ -723,8 +732,8 @@ class Stage2ServiceTest(unittest.TestCase):
                 runner_result["source"] = {
                     "ras_revision": stage2.RAS_REVISION,
                     "vggt_revision": stage2.DEFAULT_VGGT_REVISION,
-                    "sam3_revision": stage2.DEFAULT_SAM3_REVISION,
-                    "sam3_required": True,
+                    "sam_provider": "fal",
+                    "sam3_required": False,
                     "weights_required": False,
                 }
             if mode in {"geometry", "full"}:
@@ -732,12 +741,6 @@ class Stage2ServiceTest(unittest.TestCase):
                     "backend": "vggt",
                     "model_id": stage2.DEFAULT_VGGT_MODEL_ID,
                     "source_revision": stage2.DEFAULT_VGGT_REVISION,
-                }
-            if mode == "full":
-                runner_result["sam"] = {
-                    "backend": "sam3_video",
-                    "model_id": stage2.SAM3_MODEL_ID,
-                    "source_revision": stage2.DEFAULT_SAM3_REVISION,
                 }
             with self.subTest(analysis_type=analysis_type), patch.object(
                 stage2,
@@ -756,9 +759,6 @@ class Stage2ServiceTest(unittest.TestCase):
             if mode in {"geometry", "full"}:
                 self.assertEqual(result["geometry"]["model_id"], stage2.DEFAULT_VGGT_MODEL_ID)
                 self.assertEqual(result["geometry"]["source_revision"], stage2.DEFAULT_VGGT_REVISION)
-            if mode == "full":
-                self.assertEqual(result["sam"]["model_id"], stage2.SAM3_MODEL_ID)
-                self.assertEqual(result["sam"]["source_revision"], stage2.DEFAULT_SAM3_REVISION)
             runner.assert_called_once()
 
     def test_typed_validation_bootstraps_pinned_sources_without_weights(self):
@@ -796,11 +796,7 @@ class Stage2ServiceTest(unittest.TestCase):
         ), patch.object(
             stage2,
             "_verified_checkout_revision",
-            side_effect=[
-                stage2.RAS_REVISION,
-                stage2.DEFAULT_VGGT_REVISION,
-                stage2.DEFAULT_SAM3_REVISION,
-            ],
+            side_effect=[stage2.RAS_REVISION, stage2.DEFAULT_VGGT_REVISION],
         ):
             result = stage2.run_stage2({
                 "analysis_type": "validation_v1",
@@ -814,8 +810,9 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertEqual(result["analysis_type"], "validation_v1")
         self.assertEqual(result["source"]["ras_revision"], stage2.RAS_REVISION)
         self.assertEqual(result["source"]["vggt_revision"], stage2.DEFAULT_VGGT_REVISION)
-        self.assertEqual(result["source"]["sam3_revision"], stage2.DEFAULT_SAM3_REVISION)
-        ensure.assert_called_once_with(require_sam3=True, ensure_weights=False)
+        self.assertEqual(result["source"]["sam_provider"], "fal")
+        self.assertIs(result["source"]["sam3_required"], False)
+        ensure.assert_called_once_with(ensure_weights=False)
 
     def test_typed_runner_error_preserves_analysis_identity(self):
         with patch.object(
@@ -849,26 +846,9 @@ class Stage2ServiceTest(unittest.TestCase):
                 },
                 "VGGT",
             ),
-            (
-                "dedup_ras_vggt_sam3",
-                "full",
-                {
-                    "status": "ok",
-                    "mode": "full",
-                    "geometry": {
-                        "model_id": stage2.DEFAULT_VGGT_MODEL_ID,
-                        "source_revision": stage2.DEFAULT_VGGT_REVISION,
-                    },
-                    "sam": {
-                        "model_id": stage2.SAM3_MODEL_ID,
-                        "source_revision": "0" * 40,
-                    },
-                },
-                "SAM 3",
-            ),
         )
         for analysis_type, mode, runner_result, component in cases:
-            runner_name = "run_stage2_geometry" if mode == "geometry" else "run_stage2_full"
+            runner_name = "run_stage2_geometry"
             with self.subTest(analysis_type=analysis_type), patch.object(
                 stage2, runner_name, return_value=runner_result
             ):
@@ -889,7 +869,7 @@ class Stage2ServiceTest(unittest.TestCase):
         cases = (
             ("validation_v1", "geometry", "dry_run"),
             ("geometry_vggt_1b", "full", "geometry"),
-            ("dedup_ras_vggt_sam3", "dry_run", "full"),
+            (stage2.FULL_DEDUP_FINALIZE_ANALYSIS_TYPE, "dry_run", "full"),
         )
         for analysis_type, mode, expected_mode in cases:
             with self.subTest(analysis_type=analysis_type, mode=mode):
@@ -971,30 +951,12 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertEqual(wrong_revision["status"], "error")
         self.assertIn("expected_geometry_source_revision", wrong_revision["error"])
 
-        full_common = {
+        retired = stage2.run_stage2({
             "analysis_type": "dedup_ras_vggt_sam3",
             "mode": "full",
-            "categories": ["chair"],
-            "max_frames": 8,
-        }
-        wrong_sam_model = stage2.run_stage2({
-            **full_common,
-            "expected_sam_model_id": "facebook/sam3.1",
         })
-        self.assertEqual(wrong_sam_model["status"], "error")
-        self.assertIn("expected_sam_model_id", wrong_sam_model["error"])
-
-        wrong_sam_revision = stage2.run_stage2({
-            **full_common,
-            "expected_sam_source_revision": "0" * 40,
-        })
-        self.assertEqual(wrong_sam_revision["status"], "error")
-        self.assertIn("expected_sam_source_revision", wrong_sam_revision["error"])
-
-        with patch.object(stage2, "SAM3_REVISION", "0" * 40):
-            mismatched_sam_worker = stage2.run_stage2(full_common)
-        self.assertEqual(mismatched_sam_worker["status"], "error")
-        self.assertIn(f"requires SAM 3 source {stage2.DEFAULT_SAM3_REVISION}", mismatched_sam_worker["error"])
+        self.assertEqual(retired["status"], "error")
+        self.assertIn("RAS finalizer composite", retired["error"])
 
     def test_legacy_request_without_analysis_type_remains_supported(self):
         with patch.object(
@@ -2236,7 +2198,7 @@ class Stage2ServiceTest(unittest.TestCase):
                 "facebook/VGGT-1B",
             )
 
-    def test_gated_model_downloads_require_an_explicit_hf_token(self):
+    def test_gated_vggt_download_requires_an_explicit_hf_token(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             stage2.os.environ,
             {"VGGT_MODEL_ID": "facebook/VGGT-1B-Commercial"},
@@ -2244,14 +2206,6 @@ class Stage2ServiceTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "requires an approved Hugging Face token"):
                 stage2._download_vggt_weights(Path(tmp))
-
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(
-            stage2.os.environ,
-            {},
-            clear=True,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "SAM3 weights are gated"):
-                stage2._download_sam3_weights(Path(tmp))
 
     def test_weight_download_script_never_converts_a_missing_token_to_true(self):
         script = (
@@ -3201,6 +3155,7 @@ def _best_view_prediction(frames: int, height: int, width: int):
         "extrinsics": extrinsics,
         "intrinsic": intrinsic,
         "world_points": np.zeros((frames, height, width, 3), dtype=np.float32),
+        "world_points_conf": np.ones((frames, height, width), dtype=np.float32),
     }
 
 
@@ -3341,11 +3296,13 @@ class BestViewGeometryLegTest(unittest.TestCase):
             with np.load(archive, allow_pickle=False) as data:
                 schema = data["schema"].item()
                 depth = data["depth"]
+                confidence = data["confidence"]
                 intrinsics = data["intrinsics"]
                 extrinsics = data["extrinsics"]
                 model_frame_hw = data["model_frame_hw"].tolist()
                 indices = data["source_frame_indices"].tolist()
                 timestamps = data["source_frame_timestamps"].tolist()
+                duration = data["source_duration_seconds"].item()
             probed_frames = stage2._probe_video_frame_count(clip)
 
         self.assertEqual(result["status"], "ok")
@@ -3353,11 +3310,14 @@ class BestViewGeometryLegTest(unittest.TestCase):
         self.assertEqual(schema, b"palatial.geometry_inputs.v1")
         self.assertEqual(depth.dtype, np.float16)
         self.assertEqual(depth.shape, (3, 8, 8))
+        self.assertEqual(confidence.dtype, np.float16)
+        self.assertEqual(confidence.shape, (3, 8, 8))
         self.assertEqual(intrinsics.shape, (3, 3, 3))
         self.assertEqual(extrinsics.shape, (3, 3, 4))
         self.assertEqual(model_frame_hw, [8, 8])
         self.assertEqual(indices, [0, 4, 8])
         self.assertEqual(timestamps, [0.0, 0.5, 1.0])
+        self.assertEqual(duration, 3.0)
         self.assertEqual(probed_frames, 3)
         self.assertEqual(
             captured["required"],
@@ -3859,9 +3819,7 @@ class BestViewScoreLegTest(unittest.TestCase):
         self.assertEqual(result["raw_track_count"], 1)
         self.assertEqual(result["instance_count"], 1)
         self.assertEqual(captured["files"], ["best_view.json"])
-        captured["bootstrap"].assert_called_once_with(
-            require_sam3=False, ensure_weights=False
-        )
+        captured["bootstrap"].assert_called_once_with(ensure_weights=False)
 
         report = captured["report"]
         self.assertEqual(report["schema"], "palatial.best_view.v1")
@@ -3933,7 +3891,7 @@ class BestViewScoreLegTest(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "error")
-        self.assertIn("frame count does not match expected_frames_used", result["error"])
+        self.assertIn("source_frame_indices", result["error"])
 
     def test_rejects_geometry_inputs_whose_model_frame_size_disagrees(self):
         result, _captured = self._run(
@@ -3953,6 +3911,24 @@ class BestViewScoreLegTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "error")
         self.assertIn("schema must be", result["error"])
+
+    def test_rejects_non_monotonic_geometry_frame_identity(self):
+        for field, value, expected in (
+            (
+                "source_frame_indices",
+                np.asarray([0, 0, 2], dtype=np.int64),
+                "source_frame_indices",
+            ),
+            (
+                "source_frame_timestamps",
+                np.asarray([0.0, np.nan, 1.0], dtype=np.float64),
+                "source_frame_timestamps",
+            ),
+        ):
+            with self.subTest(field=field):
+                result, _captured = self._run(geometry_overrides={field: value})
+                self.assertEqual(result["status"], "error")
+                self.assertIn(expected, result["error"])
 
     def test_provenance_rejects_inconsistent_instance_counts(self):
         def response(total, returned, truncated):
