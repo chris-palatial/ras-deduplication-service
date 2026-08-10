@@ -13,6 +13,8 @@ import os
 import base64
 import binascii
 import fcntl
+import hashlib
+import hmac
 import importlib
 import importlib.util
 import json
@@ -36,6 +38,13 @@ from object_catalog import (
     OBJECT_CROPS_ATLAS_NAME,
     build_object_catalog,
 )
+from scene_parse_catalog import (
+    SCENE_PARSE_CATALOG_MAX_OBJECTS,
+    SCENE_PARSE_CATALOG_SCHEMA,
+    bound_scene_parse_response,
+    build_scene_parse_objects,
+    preserve_short_scene_parse_tracks,
+)
 
 # Resolve the pinned upstream checkout. Standalone wrapper layout:
 #   <service-root>/
@@ -49,10 +58,38 @@ DEFAULT_SAM3_REVISION = "bfbed072a07a6a52c8d5fdc75a7a186251a835b1"
 SAM3_REVISION = os.environ.get("SAM3_REVISION", DEFAULT_SAM3_REVISION)
 MAX_INLINE_VIDEO_BYTES = 6 * 1024 * 1024
 MAX_REMOTE_VIDEO_BYTES = 64 * 1024 * 1024
+SCENE_PARSE_MAX_REMOTE_VIDEO_BYTES = 2 * 1024 * 1024 * 1024
+SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS = 60.0
 DEFAULT_VGGT_MODEL_ID = "facebook/VGGT-1B"
 COMMERCIAL_VGGT_MODEL_ID = "facebook/VGGT-1B-Commercial"
+COMMERCIAL_VGGT_MODEL_REVISION = "ebb29a532abe92960eeb6903a5530f16990ef4ab"
+COMMERCIAL_VGGT_CHECKPOINT = "model.safetensors"
+COMMERCIAL_VGGT_CHECKPOINT_SHA256 = "2b766b284359bc47ce26be107254621f685b758a0282082ff109f3ff02788b53"
+COMMERCIAL_VGGT_CHECKPOINT_BYTES = 5_026_367_224
 SAM3_MODEL_ID = "facebook/sam3"
+SAM3_MODEL_REVISION = "3c879f39826c281e95690f02c7821c4de09afae7"
+SAM3_CHECKPOINT_SHA256 = "9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e"
+SAM3_CHECKPOINT_BYTES = 3_450_062_241
+SAM31_MODEL_ID = "facebook/sam3.1"
+SAM31_MODEL_REVISION = "daa63191845a41281374e725f4c9e51c7a824460"
+SAM31_CHECKPOINT = "sam3.1_multiplex.pt"
+SAM31_CHECKPOINT_SHA256 = "0567debeec80ba4ac6369540c6c248025283cb3ff2b92827509e57e2b3541cb6"
+SAM31_CHECKPOINT_BYTES = 3_502_755_717
 VGGT_MODEL_MARKER = ".stage2_model_id"
+SCENE_PARSE_MODEL_MANIFEST = ".palatial_model.json"
+SCENE_PARSE_CATALOG_ANALYSIS_TYPE = "scene_parse_catalog_v1"
+SCENE_PARSE_SAMPLING_POLICY = "uniform_2fps_min24_cap96_prompt_budget768_v1"
+SCENE_PARSE_SAMPLING_TARGET_FPS = 2.0
+SCENE_PARSE_SAMPLING_MIN_FRAMES = 24
+SCENE_PARSE_SAMPLING_MAX_FRAMES = 96
+SCENE_PARSE_PROMPT_FRAME_BUDGET = 768
+SCENE_PARSE_MAX_DECODED_FRAMES = 14_400
+SCENE_PARSE_MAX_SOURCE_DIMENSION = 8_192
+SCENE_PARSE_MAX_SOURCE_PIXELS = 16_777_216
+SCENE_PARSE_DECODE_MAX_LONG_EDGE = 1_036
+SCENE_PARSE_MAX_SAMPLED_DISK_BYTES = 256 * 1024 * 1024
+SCENE_PARSE_MAX_CATEGORY_PROMPTS = 32
+SCENE_PARSE_MAX_CATEGORY_PROMPT_CHARS = 64
 VGGT_OMEGA_ANALYSIS_TYPE = "geometry_vggt_omega_1b"
 VGGT_OMEGA_MODEL_ID = "facebook/VGGT-Omega"
 VGGT_OMEGA_SPACE_ID = "facebook/vggt-omega"
@@ -93,6 +130,7 @@ RUNPOD_ANALYSIS_TYPE_MODES = {
     "geometry_vggt_1b": "geometry",
     VGGT_OMEGA_ANALYSIS_TYPE: "geometry",
     "dedup_ras_vggt_sam3": "full",
+    SCENE_PARSE_CATALOG_ANALYSIS_TYPE: "full",
 }
 NON_RUNPOD_ANALYSIS_TYPES = {
     "mask_sam3": "route it to the fal SAM 3 adapter",
@@ -100,6 +138,15 @@ NON_RUNPOD_ANALYSIS_TYPES = {
 }
 VGGT_1B_ANALYSIS_TYPES = frozenset({"geometry_vggt_1b", "dedup_ras_vggt_sam3"})
 _PROCESS_INITIALIZATION_LOCK = threading.Lock()
+_VERIFIED_MODEL_FILE_CACHE: dict[str, tuple[Any, ...]] = {}
+
+
+class SceneParseCatalogError(RuntimeError):
+    """Safe typed failure for the production Scene Parse profile."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
 
 
 def _source_frame_plan(
@@ -465,6 +512,303 @@ def _hugging_face_token() -> str | None:
     return None
 
 
+def _scene_parse_models_root(ras: Path | None = None) -> Path:
+    return _models_dir(ras) / "SceneParse"
+
+
+def _scene_parse_vggt_dir(ras: Path | None = None) -> Path:
+    return _scene_parse_models_root(ras) / "VGGT-1B-Commercial"
+
+
+def _scene_parse_sam_backend() -> str:
+    value = os.environ.get("STAGE2_SCENE_PARSE_SAM_BACKEND", "sam3").strip().lower()
+    if value not in {"sam3", "sam3.1_multiplex"}:
+        raise SceneParseCatalogError(
+            "model_unavailable",
+            "STAGE2_SCENE_PARSE_SAM_BACKEND must be sam3 or sam3.1_multiplex.",
+        )
+    return value
+
+
+def _scene_parse_sam_dir(ras: Path | None = None, backend: str | None = None) -> Path:
+    selected = backend or _scene_parse_sam_backend()
+    name = "SAM3.1" if selected == "sam3.1_multiplex" else "SAM3"
+    return _scene_parse_models_root(ras) / name
+
+
+def _scene_parse_sam_checkpoint(
+    ras: Path | None = None,
+    backend: str | None = None,
+) -> Path:
+    selected = backend or _scene_parse_sam_backend()
+    filename = SAM31_CHECKPOINT if selected == "sam3.1_multiplex" else "sam3.pt"
+    return _scene_parse_sam_dir(ras, selected) / filename
+
+
+def _version_tuple(value: Any) -> tuple[int, int]:
+    match = re.match(r"^(\d+)\.(\d+)", str(value or ""))
+    return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+
+
+def _preflight_scene_parse_sam_backend(ras: Path | None = None) -> str:
+    """Reject an unavailable SAM3.1 runtime before download or model work."""
+    backend = _scene_parse_sam_backend()
+    if backend != "sam3.1_multiplex":
+        return backend
+    checkpoint = _scene_parse_sam_checkpoint(ras, backend)
+    if not checkpoint.is_file() or checkpoint.stat().st_size <= 1_000_000:
+        raise SceneParseCatalogError(
+            "model_unavailable",
+            "SAM 3.1 multiplex checkpoint is missing; expected "
+            "STAGE2_MODELS_DIR/SceneParse/SAM3.1/sam3.1_multiplex.pt.",
+        )
+    if sys.version_info < (3, 12):
+        raise SceneParseCatalogError(
+            "model_unavailable",
+            "SAM 3.1 multiplex requires Python 3.12 or newer; this worker image is incompatible.",
+        )
+    try:
+        import torch
+    except Exception as exc:
+        raise SceneParseCatalogError(
+            "model_unavailable",
+            f"SAM 3.1 multiplex runtime could not import PyTorch ({type(exc).__name__}).",
+        ) from exc
+    if _version_tuple(getattr(torch, "__version__", "")) < (2, 7):
+        raise SceneParseCatalogError(
+            "model_unavailable",
+            "SAM 3.1 multiplex requires PyTorch 2.7 or newer; this worker image is incompatible.",
+        )
+    if _version_tuple(getattr(getattr(torch, "version", None), "cuda", "")) < (12, 6):
+        raise SceneParseCatalogError(
+            "model_unavailable",
+            "SAM 3.1 multiplex requires CUDA 12.6 or newer; this worker image is incompatible.",
+        )
+    return backend
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _checkpoint_digest_matches(path: Path, expected_sha256: str) -> bool:
+    """Re-attest each checkpoint once per worker process and after any change."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    signature = (
+        expected_sha256,
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+    cache_key = str(path.resolve())
+    if _VERIFIED_MODEL_FILE_CACHE.get(cache_key) == signature:
+        return True
+    if not hmac.compare_digest(_sha256_file(path), expected_sha256):
+        _VERIFIED_MODEL_FILE_CACHE.pop(cache_key, None)
+        return False
+    _VERIFIED_MODEL_FILE_CACHE[cache_key] = signature
+    return True
+
+
+def _pinned_model_ready(
+    directory: Path,
+    *,
+    model_id: str,
+    revision: str,
+    checkpoint_name: str,
+    checkpoint_sha256: str,
+    checkpoint_bytes: int,
+) -> bool:
+    checkpoint = directory / checkpoint_name
+    manifest_path = directory / SCENE_PARSE_MODEL_MANIFEST
+    if not checkpoint.is_file() or checkpoint.stat().st_size != checkpoint_bytes:
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return manifest == {
+        "checkpoint_bytes": checkpoint_bytes,
+        "checkpoint_filename": checkpoint_name,
+        "checkpoint_sha256": checkpoint_sha256,
+        "model_id": model_id,
+        "model_revision": revision,
+    } and _checkpoint_digest_matches(checkpoint, checkpoint_sha256)
+
+
+def _write_pinned_model_manifest(
+    directory: Path,
+    *,
+    model_id: str,
+    revision: str,
+    checkpoint_name: str,
+    checkpoint_sha256: str,
+    checkpoint_bytes: int,
+) -> None:
+    checkpoint = directory / checkpoint_name
+    if not checkpoint.is_file() or checkpoint.stat().st_size != checkpoint_bytes:
+        raise SceneParseCatalogError(
+            "model_unavailable",
+            f"Pinned checkpoint {checkpoint_name} has an unexpected size.",
+        )
+    if not _checkpoint_digest_matches(checkpoint, checkpoint_sha256):
+        raise SceneParseCatalogError(
+            "model_unavailable",
+            f"Pinned checkpoint {checkpoint_name} failed SHA-256 verification.",
+        )
+    manifest = {
+        "checkpoint_bytes": checkpoint_bytes,
+        "checkpoint_filename": checkpoint_name,
+        "checkpoint_sha256": checkpoint_sha256,
+        "model_id": model_id,
+        "model_revision": revision,
+    }
+    directory.mkdir(parents=True, exist_ok=True)
+    temporary = directory / f".{SCENE_PARSE_MODEL_MANIFEST}.tmp"
+    temporary.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, directory / SCENE_PARSE_MODEL_MANIFEST)
+
+
+def _download_scene_parse_snapshot(
+    directory: Path,
+    *,
+    model_id: str,
+    revision: str,
+    allow_patterns: list[str],
+) -> None:
+    token = _hugging_face_token()
+    if token is None:
+        raise SceneParseCatalogError(
+            "model_unavailable",
+            f"{model_id} requires an approved Hugging Face token in HF_TOKEN.",
+        )
+    from huggingface_hub import snapshot_download
+
+    directory.mkdir(parents=True, exist_ok=True)
+    print(f"[stage2] downloading pinned {model_id}@{revision} ...", flush=True)
+    try:
+        snapshot_download(
+            repo_id=model_id,
+            revision=revision,
+            local_dir=str(directory),
+            allow_patterns=allow_patterns,
+            token=token,
+        )
+    except Exception as exc:
+        raise SceneParseCatalogError(
+            "model_unavailable",
+            f"Pinned model download failed for {model_id} ({type(exc).__name__}).",
+        ) from exc
+
+
+def _ensure_scene_parse_model_weights(ras: Path) -> dict[str, str]:
+    """Prepare production weights in isolated paths without changing Agent Lab."""
+    backend = _preflight_scene_parse_sam_backend(ras)
+    models_dir = _models_dir(ras)
+    with _stage2_initialization_lock(models_dir):
+        vggt_dir = _scene_parse_vggt_dir(ras)
+        if not _pinned_model_ready(
+            vggt_dir,
+            model_id=COMMERCIAL_VGGT_MODEL_ID,
+            revision=COMMERCIAL_VGGT_MODEL_REVISION,
+            checkpoint_name=COMMERCIAL_VGGT_CHECKPOINT,
+            checkpoint_sha256=COMMERCIAL_VGGT_CHECKPOINT_SHA256,
+            checkpoint_bytes=COMMERCIAL_VGGT_CHECKPOINT_BYTES,
+        ):
+            _download_scene_parse_snapshot(
+                vggt_dir,
+                model_id=COMMERCIAL_VGGT_MODEL_ID,
+                revision=COMMERCIAL_VGGT_MODEL_REVISION,
+                allow_patterns=[COMMERCIAL_VGGT_CHECKPOINT],
+            )
+            _write_pinned_model_manifest(
+                vggt_dir,
+                model_id=COMMERCIAL_VGGT_MODEL_ID,
+                revision=COMMERCIAL_VGGT_MODEL_REVISION,
+                checkpoint_name=COMMERCIAL_VGGT_CHECKPOINT,
+                checkpoint_sha256=COMMERCIAL_VGGT_CHECKPOINT_SHA256,
+                checkpoint_bytes=COMMERCIAL_VGGT_CHECKPOINT_BYTES,
+            )
+
+        sam_dir = _scene_parse_sam_dir(ras, backend)
+        if backend == "sam3":
+            if not _pinned_model_ready(
+                sam_dir,
+                model_id=SAM3_MODEL_ID,
+                revision=SAM3_MODEL_REVISION,
+                checkpoint_name="sam3.pt",
+                checkpoint_sha256=SAM3_CHECKPOINT_SHA256,
+                checkpoint_bytes=SAM3_CHECKPOINT_BYTES,
+            ):
+                _download_scene_parse_snapshot(
+                    sam_dir,
+                    model_id=SAM3_MODEL_ID,
+                    revision=SAM3_MODEL_REVISION,
+                    allow_patterns=["sam3.pt"],
+                )
+                _write_pinned_model_manifest(
+                    sam_dir,
+                    model_id=SAM3_MODEL_ID,
+                    revision=SAM3_MODEL_REVISION,
+                    checkpoint_name="sam3.pt",
+                    checkpoint_sha256=SAM3_CHECKPOINT_SHA256,
+                    checkpoint_bytes=SAM3_CHECKPOINT_BYTES,
+                )
+        elif not _pinned_model_ready(
+            sam_dir,
+            model_id=SAM31_MODEL_ID,
+            revision=SAM31_MODEL_REVISION,
+            checkpoint_name=SAM31_CHECKPOINT,
+            checkpoint_sha256=SAM31_CHECKPOINT_SHA256,
+            checkpoint_bytes=SAM31_CHECKPOINT_BYTES,
+        ):
+            # SAM3.1 is intentionally not auto-downloaded into the current
+            # incompatible image. A separately built worker must mount the
+            # reviewed checkpoint, then this first call verifies it once.
+            _write_pinned_model_manifest(
+                sam_dir,
+                model_id=SAM31_MODEL_ID,
+                revision=SAM31_MODEL_REVISION,
+                checkpoint_name=SAM31_CHECKPOINT,
+                checkpoint_sha256=SAM31_CHECKPOINT_SHA256,
+                checkpoint_bytes=SAM31_CHECKPOINT_BYTES,
+            )
+    return _scene_parse_model_identity(backend)
+
+
+def _scene_parse_model_identity(backend: str | None = None) -> dict[str, str]:
+    selected = backend or _scene_parse_sam_backend()
+    if selected == "sam3.1_multiplex":
+        return {
+            "backend": selected,
+            "model_id": SAM31_MODEL_ID,
+            "model_revision": SAM31_MODEL_REVISION,
+            "checkpoint_filename": SAM31_CHECKPOINT,
+            "checkpoint_sha256": SAM31_CHECKPOINT_SHA256,
+            "loader": "build_sam3_multiplex_video_predictor",
+        }
+    return {
+        "backend": "sam3_video",
+        "model_id": SAM3_MODEL_ID,
+        "model_revision": SAM3_MODEL_REVISION,
+        "checkpoint_filename": "sam3.pt",
+        "checkpoint_sha256": SAM3_CHECKPOINT_SHA256,
+        "loader": "build_sam3_video_predictor",
+    }
+
+
 def _vggt_weights_ok(vggt_dir: Path, expected_model_id: str | None = None) -> bool:
     if not vggt_dir.is_dir():
         return False
@@ -713,8 +1057,17 @@ def _ensure_ras_on_path() -> Path:
     return ras
 
 
-def _download_video(video_url: str, dest_dir: Path, timeout_s: int = 180) -> Path:
+def _download_video(
+    video_url: str,
+    dest_dir: Path,
+    timeout_s: int = 180,
+    *,
+    max_bytes: int | None = None,
+    expected_size_bytes: int | None = None,
+) -> Path:
     import requests
+
+    max_bytes = MAX_REMOTE_VIDEO_BYTES if max_bytes is None else max_bytes
 
     parsed_url = urlparse(video_url)
     if (
@@ -752,6 +1105,10 @@ def _download_video(video_url: str, dest_dir: Path, timeout_s: int = 180) -> Pat
                 )
             r.raise_for_status()
             declared_raw = r.headers.get("content-length")
+            if expected_size_bytes is not None and declared_raw is None:
+                raise RuntimeError(
+                    "video response must include Content-Length when source_size_bytes is provided"
+                )
             if declared_raw is not None:
                 try:
                     declared = int(declared_raw)
@@ -759,10 +1116,12 @@ def _download_video(video_url: str, dest_dir: Path, timeout_s: int = 180) -> Pat
                     raise RuntimeError("video download returned an invalid Content-Length") from exc
                 if declared <= 0:
                     raise RuntimeError("video download returned an empty file")
-                if declared > MAX_REMOTE_VIDEO_BYTES:
+                if declared > max_bytes:
                     raise RuntimeError(
-                        f"video download exceeds the {MAX_REMOTE_VIDEO_BYTES // 1024 // 1024} MiB service limit"
+                        f"video download exceeds the {max_bytes // 1024 // 1024} MiB service limit"
                     )
+                if expected_size_bytes is not None and declared != expected_size_bytes:
+                    raise RuntimeError("video Content-Length does not match source_size_bytes")
 
             written = 0
             with open(dest, "wb") as f:
@@ -770,13 +1129,15 @@ def _download_video(video_url: str, dest_dir: Path, timeout_s: int = 180) -> Pat
                     if not chunk:
                         continue
                     written += len(chunk)
-                    if written > MAX_REMOTE_VIDEO_BYTES:
+                    if written > max_bytes:
                         raise RuntimeError(
-                            f"video download exceeds the {MAX_REMOTE_VIDEO_BYTES // 1024 // 1024} MiB service limit"
+                            f"video download exceeds the {max_bytes // 1024 // 1024} MiB service limit"
                         )
                     f.write(chunk)
             if written == 0:
                 raise RuntimeError("video download returned an empty file")
+            if expected_size_bytes is not None and written != expected_size_bytes:
+                raise RuntimeError("downloaded video size does not match source_size_bytes")
     except requests.RequestException as exc:
         dest.unlink(missing_ok=True)
         # Requests exceptions may contain the complete URL, including its
@@ -820,6 +1181,101 @@ def _materialize_video(payload: dict[str, Any], work: Path) -> Path:
             "or provide an HTTPS video_url up to 64 MiB."
         )
     return _download_video(video_url, work)
+
+
+def _validate_scene_parse_catalog_request(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Validate the closed production request without JSON coercions."""
+    allowed = {
+        "analysis_type",
+        "mode",
+        "video_url",
+        "source_sha256",
+        "source_size_bytes",
+        "category_prompts",
+    }
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        return None, f"scene_parse_catalog_v1 does not accept fields: {', '.join(unknown)}"
+    if payload.get("analysis_type") != SCENE_PARSE_CATALOG_ANALYSIS_TYPE:
+        return None, f"analysis_type must be {SCENE_PARSE_CATALOG_ANALYSIS_TYPE}"
+    if payload.get("mode") != "full":
+        return None, f"analysis_type {SCENE_PARSE_CATALOG_ANALYSIS_TYPE} requires mode full"
+    video_url = payload.get("video_url")
+    if not isinstance(video_url, str) or not video_url or video_url.strip() != video_url:
+        return None, "video_url must be one trimmed HTTPS URL"
+    source_sha256 = payload.get("source_sha256")
+    if not isinstance(source_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+        return None, "source_sha256 must be 64 lowercase hexadecimal characters"
+    source_size_bytes = payload.get("source_size_bytes")
+    if source_size_bytes is not None and (
+        type(source_size_bytes) is not int
+        or source_size_bytes < 1
+        or source_size_bytes > SCENE_PARSE_MAX_REMOTE_VIDEO_BYTES
+    ):
+        return None, (
+            "source_size_bytes must be an integer from 1 through "
+            f"{SCENE_PARSE_MAX_REMOTE_VIDEO_BYTES}"
+        )
+    category_prompts = payload.get("category_prompts")
+    if not isinstance(category_prompts, list) or not (
+        1 <= len(category_prompts) <= SCENE_PARSE_MAX_CATEGORY_PROMPTS
+    ):
+        return None, "category_prompts must contain 1-32 unique strings"
+    normalized_keys: set[str] = set()
+    for prompt in category_prompts:
+        if (
+            not isinstance(prompt, str)
+            or prompt.strip() != prompt
+            or not 1 <= len(prompt) <= SCENE_PARSE_MAX_CATEGORY_PROMPT_CHARS
+            or any(ord(character) < 32 or ord(character) == 127 for character in prompt)
+        ):
+            return None, "each category prompt must be a trimmed 1-64 character string"
+        key = prompt.casefold()
+        if key in normalized_keys:
+            return None, "category_prompts must be unique after case folding"
+        normalized_keys.add(key)
+    return {
+        "analysis_type": SCENE_PARSE_CATALOG_ANALYSIS_TYPE,
+        "mode": "full",
+        "video_url": video_url,
+        "source_sha256": source_sha256,
+        "category_prompts": list(category_prompts),
+        **(
+            {"source_size_bytes": source_size_bytes}
+            if source_size_bytes is not None
+            else {}
+        ),
+    }, None
+
+
+def _materialize_scene_parse_video(payload: dict[str, Any], work: Path) -> tuple[Path, int]:
+    expected_size = payload.get("source_size_bytes")
+    try:
+        video_path = _download_video(
+            payload["video_url"],
+            work,
+            max_bytes=SCENE_PARSE_MAX_REMOTE_VIDEO_BYTES,
+            expected_size_bytes=expected_size,
+        )
+    except RuntimeError as exc:
+        detail = str(exc)
+        code = "source_size_mismatch" if "source_size_bytes" in detail else "source_download_failed"
+        raise SceneParseCatalogError(code, detail) from exc
+    actual_size = video_path.stat().st_size
+    if expected_size is not None and actual_size != expected_size:
+        raise SceneParseCatalogError(
+            "source_size_mismatch",
+            "Downloaded video size does not match source_size_bytes.",
+        )
+    actual_sha256 = _sha256_file(video_path)
+    if not hmac.compare_digest(actual_sha256, payload["source_sha256"]):
+        raise SceneParseCatalogError(
+            "source_sha256_mismatch",
+            "Downloaded video SHA-256 does not match source_sha256.",
+        )
+    return video_path, actual_size
 
 
 class VggtOmegaSpaceError(RuntimeError):
@@ -1689,6 +2145,334 @@ def _probe_video_frame_count(path: Path) -> int | None:
     except (OSError, ValueError, TypeError, json.JSONDecodeError, subprocess.SubprocessError):
         pass
     return None
+
+
+def _scene_parse_requested_frames(
+    duration_ms: int,
+    category_prompt_count: int,
+) -> int:
+    if (
+        type(duration_ms) is not int
+        or duration_ms <= 0
+    ):
+        raise SceneParseCatalogError(
+            "source_video_invalid",
+            "Source video duration could not be established.",
+        )
+    if duration_ms > int(SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS * 1000):
+        raise SceneParseCatalogError(
+            "source_video_invalid",
+            f"Source video exceeds the {int(SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS)} second limit.",
+        )
+    if (
+        type(category_prompt_count) is not int
+        or not 1 <= category_prompt_count <= SCENE_PARSE_MAX_CATEGORY_PROMPTS
+    ):
+        raise SceneParseCatalogError(
+            "invalid_scene_parse_request",
+            "Scene Parse category prompt count is outside the production contract.",
+        )
+    target = min(
+        SCENE_PARSE_SAMPLING_MAX_FRAMES,
+        max(
+            SCENE_PARSE_SAMPLING_MIN_FRAMES,
+            (
+                duration_ms * int(SCENE_PARSE_SAMPLING_TARGET_FPS) + 999
+            )
+            // 1000,
+        ),
+    )
+    prompt_budget_cap = SCENE_PARSE_PROMPT_FRAME_BUDGET // category_prompt_count
+    return max(
+        SCENE_PARSE_SAMPLING_MIN_FRAMES,
+        min(target, prompt_budget_cap),
+    )
+
+
+def _probe_scene_parse_decoded_stream(path: Path) -> tuple[int, int, int]:
+    """Count decoded frames with bounded output and validate source dimensions."""
+    import subprocess
+
+    try:
+        metadata = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-max_alloc",
+                str(256 * 1024 * 1024),
+                "-max_pixels",
+                str(SCENE_PARSE_MAX_SOURCE_PIXELS),
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        parsed = json.loads(metadata.stdout) if metadata.returncode == 0 else None
+        streams = parsed.get("streams") if isinstance(parsed, dict) else None
+        stream = streams[0] if isinstance(streams, list) and len(streams) == 1 else None
+        if not isinstance(stream, dict):
+            raise ValueError("exactly one decodable video stream is required")
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
+        raise SceneParseCatalogError(
+            "source_video_invalid",
+            "Source video dimensions could not be validated within the production limits.",
+        ) from exc
+    if (
+        width < 1
+        or height < 1
+        or width > SCENE_PARSE_MAX_SOURCE_DIMENSION
+        or height > SCENE_PARSE_MAX_SOURCE_DIMENSION
+        or width * height > SCENE_PARSE_MAX_SOURCE_PIXELS
+    ):
+        raise SceneParseCatalogError(
+            "source_video_invalid",
+            "Source video dimensions exceed the production decode limit.",
+        )
+
+    try:
+        counted = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-max_alloc",
+                str(256 * 1024 * 1024),
+                "-max_pixels",
+                str(SCENE_PARSE_MAX_SOURCE_PIXELS),
+                "-count_frames",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height,nb_read_frames",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        parsed = json.loads(counted.stdout) if counted.returncode == 0 else None
+        streams = parsed.get("streams") if isinstance(parsed, dict) else None
+        stream = streams[0] if isinstance(streams, list) and len(streams) == 1 else None
+        if not isinstance(stream, dict):
+            raise ValueError("exactly one decodable video stream is required")
+        decoded_frames = int(stream.get("nb_read_frames") or 0)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
+        raise SceneParseCatalogError(
+            "source_video_invalid",
+            "Source video stream could not be decoded within the production limits.",
+        ) from exc
+    if not 1 <= decoded_frames <= SCENE_PARSE_MAX_DECODED_FRAMES:
+        raise SceneParseCatalogError(
+            "source_video_invalid",
+            "Source video decoded-frame count exceeds the production limit.",
+        )
+    return decoded_frames, width, height
+
+
+def _scene_parse_decoded_timeline(
+    video_path: Path,
+    *,
+    decoded_frame_count: int,
+) -> tuple[list[float], float]:
+    """Return the verified decoded-frame timeline and its video duration."""
+    frames = _ffprobe_json(
+        video_path,
+        "-max_pixels",
+        str(SCENE_PARSE_MAX_SOURCE_PIXELS),
+        "-select_streams",
+        "v:0",
+        "-show_frames",
+        "-show_entries",
+        "frame=best_effort_timestamp_time,pts_time,pkt_dts_time,duration_time,pkt_duration_time",
+    ) or {}
+    entries = frames.get("frames") or []
+    if not isinstance(entries, list) or len(entries) != decoded_frame_count:
+        raise SceneParseCatalogError(
+            "source_video_invalid",
+            "Source video decoded timeline does not match its bounded frame count.",
+        )
+    timestamps: list[float] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise SceneParseCatalogError(
+                "source_video_invalid",
+                "Source video contains an invalid decoded-frame timeline.",
+            )
+        timestamp = next(
+            (
+                parsed
+                for field in ("best_effort_timestamp_time", "pts_time", "pkt_dts_time")
+                if (parsed := _finite_number(entry.get(field))) is not None
+            ),
+            None,
+        )
+        if timestamp is None:
+            raise SceneParseCatalogError(
+                "source_video_invalid",
+                "Source video contains a decoded frame without a presentation timestamp.",
+            )
+        timestamps.append(float(timestamp))
+    origin = timestamps[0]
+    normalized_timestamps = [max(0.0, value - origin) for value in timestamps]
+    if any(
+        right <= left
+        for left, right in zip(normalized_timestamps, normalized_timestamps[1:])
+    ):
+        raise SceneParseCatalogError(
+            "source_video_invalid",
+            "Source video decoded-frame timestamps are not strictly increasing.",
+        )
+    final_entry = entries[-1]
+    final_frame_duration = next(
+        (
+            parsed
+            for field in ("duration_time", "pkt_duration_time")
+            if (parsed := _positive_duration(final_entry.get(field))) is not None
+        ),
+        None,
+    )
+    if final_frame_duration is None and len(normalized_timestamps) > 1:
+        final_frame_duration = normalized_timestamps[-1] - normalized_timestamps[-2]
+    if final_frame_duration is None:
+        final_frame_duration = _probe_video_duration(video_path)
+    if final_frame_duration is None:
+        raise SceneParseCatalogError(
+            "source_video_invalid",
+            "Source video decoded duration could not be established.",
+        )
+    decoded_duration = normalized_timestamps[-1] + float(final_frame_duration)
+    if (
+        not math.isfinite(decoded_duration)
+        or decoded_duration <= 0
+        or decoded_duration > SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS + 0.001
+    ):
+        raise SceneParseCatalogError(
+            "source_video_invalid",
+            f"Source video decoded timeline exceeds the {int(SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS)} second limit.",
+        )
+    decoded_duration = min(decoded_duration, SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS)
+    return normalized_timestamps, decoded_duration
+
+
+def _scene_parse_uniform_frame_plan(
+    source_frame_timestamps: list[float],
+    sampled_count: int,
+) -> tuple[list[int], list[float]]:
+    """Uniformly select bounded indices from a pre-validated decoded timeline."""
+    decoded_frame_count = len(source_frame_timestamps)
+    if decoded_frame_count < 1 or sampled_count < 1:
+        raise SceneParseCatalogError(
+            "source_video_invalid",
+            "Source video sample plan is empty.",
+        )
+    count = min(sampled_count, decoded_frame_count)
+    if count == 1:
+        indices = [0]
+    else:
+        indices = [
+            index * (decoded_frame_count - 1) // (count - 1)
+            for index in range(count)
+        ]
+    sampled_timestamps = [source_frame_timestamps[index] for index in indices]
+    canonical_timestamps = _canonical_source_frame_timestamps(sampled_timestamps)
+    if canonical_timestamps is None:
+        raise SceneParseCatalogError(
+            "source_video_invalid",
+            "Source video sampled-frame timeline is invalid.",
+        )
+    return indices, canonical_timestamps
+
+
+def _load_scene_parse_sampled_frames(
+    video_path: Path,
+    work: Path,
+    source_frame_indices: list[int],
+) -> Any:
+    """Decode only selected, scaled JPEGs instead of materializing every frame."""
+    import subprocess
+    from vggt.utils.load_fn import load_and_preprocess_images
+
+    if not source_frame_indices or len(source_frame_indices) > SCENE_PARSE_SAMPLING_MAX_FRAMES:
+        raise SceneParseCatalogError(
+            "source_video_invalid",
+            "Source video sample plan is outside the production frame limit.",
+        )
+    sampled_dir = work / "sampled"
+    sampled_dir.mkdir(parents=True, exist_ok=True)
+    select_expression = "+".join(
+        f"eq(n\\,{frame_index})" for frame_index in source_frame_indices
+    )
+    video_filter = (
+        f"select={select_expression},"
+        f"scale={SCENE_PARSE_DECODE_MAX_LONG_EDGE}:{SCENE_PARSE_DECODE_MAX_LONG_EDGE}:"
+        "force_original_aspect_ratio=decrease"
+    )
+    try:
+        completed = subprocess.run(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-y",
+                "-v",
+                "error",
+                "-max_alloc",
+                str(256 * 1024 * 1024),
+                "-max_pixels",
+                str(SCENE_PARSE_MAX_SOURCE_PIXELS),
+                "-i",
+                str(video_path),
+                "-map",
+                "0:v:0",
+                "-an",
+                "-vf",
+                video_filter,
+                "-vsync",
+                "vfr",
+                "-frames:v",
+                str(len(source_frame_indices)),
+                "-q:v",
+                "2",
+                str(sampled_dir / "frame-%06d.jpg"),
+            ],
+            check=False,
+            capture_output=True,
+            timeout=180,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SceneParseCatalogError(
+            "source_video_invalid",
+            "Source video sample decode exceeded the production limits.",
+        ) from exc
+    image_paths = sorted(sampled_dir.glob("frame-*.jpg"))
+    if completed.returncode != 0 or len(image_paths) != len(source_frame_indices):
+        raise SceneParseCatalogError(
+            "source_video_invalid",
+            "Source video did not decode the complete bounded frame sample.",
+        )
+    sampled_disk_bytes = sum(path.stat().st_size for path in image_paths)
+    if (
+        sampled_disk_bytes < len(image_paths)
+        or sampled_disk_bytes > SCENE_PARSE_MAX_SAMPLED_DISK_BYTES
+    ):
+        raise SceneParseCatalogError(
+            "source_video_invalid",
+            "Source video sampled-frame output exceeds the production disk limit.",
+        )
+    return load_and_preprocess_images([str(path) for path in image_paths])
 
 
 def _sampled_source_frame_timestamps(
@@ -2688,6 +3472,343 @@ def run_stage2_omega_geometry(payload: dict[str, Any]) -> dict[str, Any]:
             shutil.rmtree(work, ignore_errors=True)
 
 
+def _load_scene_parse_vggt_model(ras_root: Path) -> Any:
+    from vggt.models.vggt import VGGT
+    from safetensors.torch import load_file
+
+    model = VGGT()
+    state_dict = load_file(
+        str(_scene_parse_vggt_dir(ras_root) / COMMERCIAL_VGGT_CHECKPOINT),
+        device="cpu",
+    )
+    model.load_state_dict(state_dict, strict=True)
+    return model
+
+
+def _load_scene_parse_sam_video_model(ras_root: Path, backend: str) -> Any:
+    checkpoint = str(_scene_parse_sam_checkpoint(ras_root, backend))
+    if backend == "sam3.1_multiplex":
+        from sam3.model_builder import build_sam3_multiplex_video_predictor
+
+        return build_sam3_multiplex_video_predictor(
+            checkpoint_path=checkpoint,
+            max_num_objects=SCENE_PARSE_CATALOG_MAX_OBJECTS,
+            multiplex_count=16,
+            use_fa3=False,
+            compile=False,
+            warm_up=False,
+        )
+    from sam3.model_builder import build_sam3_video_predictor
+
+    return build_sam3_video_predictor(checkpoint_path=checkpoint)
+
+
+def run_scene_parse_catalog(payload: dict[str, Any]) -> dict[str, Any]:
+    """Run the catalog-only production profile without debug artifact export."""
+    normalized, request_error = _validate_scene_parse_catalog_request(payload)
+    if request_error or normalized is None:
+        return {
+            "status": "error",
+            "mode": "full",
+            "analysis_type": SCENE_PARSE_CATALOG_ANALYSIS_TYPE,
+            "error_code": "invalid_scene_parse_request",
+            "error": request_error or "scene_parse_catalog_v1 request is invalid",
+        }
+    payload = normalized
+    timings: dict[str, int] = {}
+    stage = "model_preflight"
+    work = Path(tempfile.mkdtemp(prefix="ras-scene-parse-catalog-"))
+    vggt_model = None
+    sam_video = None
+    unload_model = None
+    t_all = time.time()
+    try:
+        sam_backend = _preflight_scene_parse_sam_backend()
+
+        stage = "source_download"
+        t0 = time.time()
+        video_path, source_size = _materialize_scene_parse_video(payload, work)
+        timings["source_download"] = int((time.time() - t0) * 1000)
+
+        stage = "source_validation"
+        t0 = time.time()
+        decoded_frame_count, _source_width, _source_height = (
+            _probe_scene_parse_decoded_stream(video_path)
+        )
+        decoded_timestamps, duration_seconds = _scene_parse_decoded_timeline(
+            video_path,
+            decoded_frame_count=decoded_frame_count,
+        )
+        duration_ms = int(round(duration_seconds * 1000))
+        requested_frames = _scene_parse_requested_frames(
+            duration_ms,
+            len(payload["category_prompts"]),
+        )
+        source_frame_indices, source_frame_timestamps = _scene_parse_uniform_frame_plan(
+            decoded_timestamps,
+            requested_frames,
+        )
+        timings["source_validation"] = int((time.time() - t0) * 1000)
+
+        # Source bytes, declared size, digest, and duration are all validated
+        # before source/bootstrap work can download or load a model.
+        stage = "runtime_bootstrap"
+        t0 = time.time()
+        try:
+            _ensure_ras_installed(require_sam3=True, ensure_weights=False)
+            ras_root = _ensure_ras_on_path()
+            ras_source_revision = _verified_checkout_revision(
+                ras_root,
+                RAS_REVISION,
+                ignore_submodules=True,
+            )
+            vggt_source_revision = _verified_checkout_revision(
+                ras_root / "vggt",
+                VGGT_REVISION,
+            )
+            sam_source_revision = _verified_checkout_revision(
+                ras_root / "sam3",
+                SAM3_REVISION,
+            )
+        except SceneParseCatalogError:
+            raise
+        except Exception as exc:
+            raise SceneParseCatalogError(
+                "model_unavailable",
+                f"Pinned Scene Parse model runtime is unavailable ({type(exc).__name__}).",
+            ) from exc
+        timings["runtime_bootstrap"] = int((time.time() - t0) * 1000)
+
+        import cv2
+        import torch
+        from src.models import unload_model as ras_unload_model
+        from src.object_segmentation import segment_and_track
+        from src.sg_deduplication import (
+            cross_category_deduplicate,
+            get_overlap_ratio,
+            self_category_deduplicate,
+        )
+        from src.vggt_predict import vggt_predict
+
+        unload_model = ras_unload_model
+        if not torch.cuda.is_available():
+            raise SceneParseCatalogError(
+                "model_unavailable",
+                "scene_parse_catalog_v1 requires a CUDA GPU.",
+            )
+        device = "cuda"
+
+        stage = "sample_frames"
+        t0 = time.time()
+        frames = _load_scene_parse_sampled_frames(
+            video_path,
+            work,
+            source_frame_indices,
+        ).to(device)
+        frames_used = int(frames.shape[0])
+        if not 1 <= frames_used <= SCENE_PARSE_SAMPLING_MAX_FRAMES:
+            raise SceneParseCatalogError(
+                "source_video_invalid",
+                "Source video did not produce a bounded non-empty frame sample.",
+            )
+        if (
+            len(source_frame_indices) != frames_used
+            or len(source_frame_timestamps) != frames_used
+        ):
+            raise SceneParseCatalogError(
+                "source_video_invalid",
+                "Source video frame timeline does not match sampled frames.",
+            )
+        timings["sample_frames"] = int((time.time() - t0) * 1000)
+
+        stage = "model_weights"
+        t0 = time.time()
+        sam_identity = _ensure_scene_parse_model_weights(ras_root)
+        timings["model_weights"] = int((time.time() - t0) * 1000)
+
+        stage = "vggt"
+        t0 = time.time()
+        vggt_model = _load_scene_parse_vggt_model(ras_root).to(device)
+        prediction = vggt_predict(frames, vggt_model)
+        unload_model(vggt_model)
+        vggt_model = None
+        timings["vggt"] = int((time.time() - t0) * 1000)
+
+        stage = "sam"
+        t0 = time.time()
+        color_dir = work / "color"
+        color_dir.mkdir(parents=True, exist_ok=True)
+        for index, image in enumerate(prediction["colors"]):
+            ok = cv2.imwrite(
+                str(color_dir / f"{index}.jpg"),
+                cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
+            )
+            if not ok:
+                raise RuntimeError("could not materialize sampled frame for SAM video tracking")
+        sam_video = _load_scene_parse_sam_video_model(ras_root, sam_backend)
+        session = sam_video.handle_request(
+            request={"type": "start_session", "resource_path": str(color_dir)}
+        )
+        session_id = session.get("session_id") if isinstance(session, dict) else None
+        if not isinstance(session_id, str) or not session_id:
+            raise RuntimeError("SAM video tracker did not create a session")
+
+        category_masks: dict[str, list[Any]] = {}
+        raw_category_masks: dict[str, list[Any]] = {}
+        raw_track_count = 0
+        for category_prompt in payload["category_prompts"]:
+            raw_tracks = list(
+                segment_and_track(category_prompt, sam_video, session_id) or ()
+            )
+            raw_track_count += len(raw_tracks)
+            raw_category_masks[category_prompt] = raw_tracks
+            category_masks[category_prompt] = self_category_deduplicate(
+                raw_tracks,
+                prediction["world_points"],
+                prediction["world_points_conf"],
+            )
+        category_deduplicated_count = sum(len(value) for value in category_masks.values())
+        deduplicated = cross_category_deduplicate(
+            category_masks,
+            prediction["world_points"],
+            prediction["world_points_conf"],
+        )
+        deduplicated, preserved_short_count = preserve_short_scene_parse_tracks(
+            deduplicated_masks=deduplicated,
+            category_masks=raw_category_masks,
+            category_prompts=payload["category_prompts"],
+            world_points=prediction["world_points"],
+            world_points_conf=prediction["world_points_conf"],
+            overlap_fn=get_overlap_ratio,
+        )
+        unload_model(sam_video)
+        sam_video = None
+        timings["sam_and_dedup"] = int((time.time() - t0) * 1000)
+
+        stage = "catalog"
+        t0 = time.time()
+        colors = prediction["colors"]
+        catalog = build_scene_parse_objects(
+            all_masks=deduplicated,
+            frame_shape=(int(colors.shape[0]), int(colors.shape[1]), int(colors.shape[2])),
+            source_sha256=payload["source_sha256"],
+            category_prompts=payload["category_prompts"],
+            source_frame_indices=source_frame_indices,
+            source_frame_timestamps_s=source_frame_timestamps,
+        )
+        warnings = ["Catalog scope is limited to the supplied category prompts."]
+        if frames_used < requested_frames:
+            warnings.append(
+                "Source video contained fewer decodable frames than the sampling policy requested."
+            )
+        if preserved_short_count:
+            warnings.append(
+                f"Retained {preserved_short_count} brief object hypotheses with fewer than three sampled-frame observations."
+            )
+        if catalog["limited_evidence_count"]:
+            warnings.append(
+                f"{catalog['limited_evidence_count']} returned object hypotheses have limited evidence strength."
+            )
+        if catalog["truncated"]:
+            warnings.append(
+                f"Object catalog was limited to {SCENE_PARSE_CATALOG_MAX_OBJECTS} hypotheses."
+            )
+        timings["catalog"] = int((time.time() - t0) * 1000)
+        timings["total"] = int((time.time() - t_all) * 1000)
+        response = {
+            "status": "ok",
+            "mode": "full",
+            "analysis_type": SCENE_PARSE_CATALOG_ANALYSIS_TYPE,
+            "schema": SCENE_PARSE_CATALOG_SCHEMA,
+            "source": {
+                "sha256": payload["source_sha256"],
+                "size_bytes": source_size,
+                "duration_ms": duration_ms,
+            },
+            "scope": "requested_category_prompts",
+            "exhaustive": False,
+            "identity_semantics": "result_scoped_ras_spatial_hypothesis",
+            "category_prompts": payload["category_prompts"],
+            "sampling": {
+                "policy": SCENE_PARSE_SAMPLING_POLICY,
+                "target_fps": SCENE_PARSE_SAMPLING_TARGET_FPS,
+                "min_frames": SCENE_PARSE_SAMPLING_MIN_FRAMES,
+                "max_frames": SCENE_PARSE_SAMPLING_MAX_FRAMES,
+                "prompt_frame_budget": SCENE_PARSE_PROMPT_FRAME_BUDGET,
+                "planned_prompt_frames": requested_frames
+                * len(payload["category_prompts"]),
+                "requested_frames": requested_frames,
+                "frames_used": frames_used,
+                "source_frame_indices": source_frame_indices,
+                "source_timestamps_ms": [
+                    int(round(value * 1000)) for value in source_frame_timestamps
+                ],
+            },
+            "objects": catalog["objects"],
+            "counts": {
+                "raw_tracks": raw_track_count,
+                "category_deduplicated_tracks": category_deduplicated_count,
+                "deduplicated_objects": catalog["total_count"],
+                "returned_objects": catalog["returned_count"],
+                "omitted_objects": catalog["total_count"] - catalog["returned_count"],
+                "evidence_items": catalog["evidence_count"],
+            },
+            "truncated": catalog["truncated"],
+            "warnings": warnings,
+            "provenance": {
+                "ras": {
+                    "repository": "https://github.com/xiac20/ReplicateAnyScene",
+                    "revision": ras_source_revision,
+                },
+                "geometry": {
+                    "backend": "vggt",
+                    "model_id": COMMERCIAL_VGGT_MODEL_ID,
+                    "model_revision": COMMERCIAL_VGGT_MODEL_REVISION,
+                    "checkpoint_filename": COMMERCIAL_VGGT_CHECKPOINT,
+                    "checkpoint_sha256": COMMERCIAL_VGGT_CHECKPOINT_SHA256,
+                    "source_revision": vggt_source_revision,
+                    "license_scope": "commercial",
+                },
+                "segmentation": {
+                    **sam_identity,
+                    "source_revision": sam_source_revision,
+                },
+            },
+            "timings_ms": timings,
+        }
+        return bound_scene_parse_response(response)
+    except SceneParseCatalogError as exc:
+        timings["total"] = int((time.time() - t_all) * 1000)
+        return {
+            "status": "error",
+            "mode": "full",
+            "analysis_type": SCENE_PARSE_CATALOG_ANALYSIS_TYPE,
+            "error_code": exc.code,
+            "error": str(exc),
+            "failed_stage": stage,
+            "timings_ms": timings,
+        }
+    except Exception as exc:
+        timings["total"] = int((time.time() - t_all) * 1000)
+        return {
+            "status": "error",
+            "mode": "full",
+            "analysis_type": SCENE_PARSE_CATALOG_ANALYSIS_TYPE,
+            "error_code": "inference_failed",
+            "error": f"Scene Parse catalog inference failed ({type(exc).__name__}).",
+            "failed_stage": stage,
+            "timings_ms": timings,
+        }
+    finally:
+        if unload_model is not None:
+            if sam_video is not None:
+                unload_model(sam_video)
+            if vggt_model is not None:
+                unload_model(vggt_model)
+        if os.environ.get("STAGE2_KEEP_WORK") != "1":
+            shutil.rmtree(work, ignore_errors=True)
+
+
 def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
     """
     Full Stage 2 using ReplicateAnyScene sources only.
@@ -3027,6 +4148,17 @@ def _resolve_runpod_analysis_type(payload: dict[str, Any], mode: str) -> tuple[s
                 f"expected_sam_source_revision must be {DEFAULT_SAM3_REVISION} "
                 f"for analysis_type {raw_analysis_type}"
             )
+    if raw_analysis_type == SCENE_PARSE_CATALOG_ANALYSIS_TYPE:
+        if VGGT_REVISION != DEFAULT_VGGT_REVISION:
+            return raw_analysis_type, (
+                f"analysis_type {raw_analysis_type} requires VGGT source {DEFAULT_VGGT_REVISION}; "
+                f"this worker is configured for {VGGT_REVISION}"
+            )
+        if SAM3_REVISION != DEFAULT_SAM3_REVISION:
+            return raw_analysis_type, (
+                f"analysis_type {raw_analysis_type} requires SAM source {DEFAULT_SAM3_REVISION}; "
+                f"this worker is configured for {SAM3_REVISION}"
+            )
     return raw_analysis_type, None
 
 
@@ -3119,6 +4251,95 @@ def _attach_success_provenance(
             or sam.get("source_revision") != DEFAULT_SAM3_REVISION
         ):
             return provenance_error("SAM 3")
+    if analysis_type == SCENE_PARSE_CATALOG_ANALYSIS_TYPE:
+        source = result.get("source")
+        sampling = result.get("sampling")
+        objects = result.get("objects")
+        counts = result.get("counts")
+        category_prompts = result.get("category_prompts")
+        provenance = result.get("provenance")
+        ras = provenance.get("ras") if isinstance(provenance, dict) else None
+        geometry = provenance.get("geometry") if isinstance(provenance, dict) else None
+        segmentation = provenance.get("segmentation") if isinstance(provenance, dict) else None
+        expected_sam = _scene_parse_model_identity()
+        frames_used = sampling.get("frames_used") if isinstance(sampling, dict) else None
+        frame_indices = (
+            sampling.get("source_frame_indices") if isinstance(sampling, dict) else None
+        )
+        timestamps = (
+            sampling.get("source_timestamps_ms") if isinstance(sampling, dict) else None
+        )
+        object_keys = [
+            item.get("object_key")
+            for item in objects
+            if isinstance(item, dict)
+        ] if isinstance(objects, list) else []
+        if (
+            result.get("schema") != SCENE_PARSE_CATALOG_SCHEMA
+            or result.get("scope") != "requested_category_prompts"
+            or result.get("exhaustive") is not False
+            or result.get("identity_semantics") != "result_scoped_ras_spatial_hypothesis"
+            or not isinstance(category_prompts, list)
+            or not 1 <= len(category_prompts) <= SCENE_PARSE_MAX_CATEGORY_PROMPTS
+            or not all(isinstance(value, str) and value for value in category_prompts)
+            or not isinstance(source, dict)
+            or not isinstance(source.get("sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", source["sha256"])
+            or type(source.get("size_bytes")) is not int
+            or not 1 <= source["size_bytes"] <= SCENE_PARSE_MAX_REMOTE_VIDEO_BYTES
+            or type(source.get("duration_ms")) is not int
+            or not 1 <= source["duration_ms"] <= int(SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS * 1000)
+            or not isinstance(sampling, dict)
+            or sampling.get("policy") != SCENE_PARSE_SAMPLING_POLICY
+            or sampling.get("target_fps") != SCENE_PARSE_SAMPLING_TARGET_FPS
+            or sampling.get("min_frames") != SCENE_PARSE_SAMPLING_MIN_FRAMES
+            or sampling.get("max_frames") != SCENE_PARSE_SAMPLING_MAX_FRAMES
+            or sampling.get("prompt_frame_budget") != SCENE_PARSE_PROMPT_FRAME_BUDGET
+            or type(sampling.get("planned_prompt_frames")) is not int
+            or type(sampling.get("requested_frames")) is not int
+            or not SCENE_PARSE_SAMPLING_MIN_FRAMES
+            <= sampling["requested_frames"]
+            <= SCENE_PARSE_SAMPLING_MAX_FRAMES
+            or sampling["planned_prompt_frames"]
+            != sampling["requested_frames"] * len(category_prompts)
+            or sampling["planned_prompt_frames"] > SCENE_PARSE_PROMPT_FRAME_BUDGET
+            or type(frames_used) is not int
+            or not 1 <= frames_used <= SCENE_PARSE_SAMPLING_MAX_FRAMES
+            or not isinstance(frame_indices, list)
+            or len(frame_indices) != frames_used
+            or not all(type(value) is int and value >= 0 for value in frame_indices)
+            or not isinstance(timestamps, list)
+            or len(timestamps) != frames_used
+            or not all(type(value) is int and value >= 0 for value in timestamps)
+            or not isinstance(objects, list)
+            or len(objects) > SCENE_PARSE_CATALOG_MAX_OBJECTS
+            or len(object_keys) != len(objects)
+            or len(set(object_keys)) != len(object_keys)
+            or not all(
+                isinstance(value, str) and re.fullmatch(r"obj_[0-9a-f]{24}", value)
+                for value in object_keys
+            )
+            or not isinstance(counts, dict)
+            or counts.get("returned_objects") != len(objects)
+            or type(result.get("truncated")) is not bool
+            or not isinstance(result.get("warnings"), list)
+            or not isinstance(ras, dict)
+            or ras.get("revision") != RAS_REVISION
+            or not isinstance(geometry, dict)
+            or geometry.get("model_id") != COMMERCIAL_VGGT_MODEL_ID
+            or geometry.get("model_revision") != COMMERCIAL_VGGT_MODEL_REVISION
+            or geometry.get("checkpoint_sha256") != COMMERCIAL_VGGT_CHECKPOINT_SHA256
+            or geometry.get("source_revision") != DEFAULT_VGGT_REVISION
+            or geometry.get("license_scope") != "commercial"
+            or not isinstance(segmentation, dict)
+            or any(segmentation.get(key) != value for key, value in expected_sam.items())
+            or segmentation.get("source_revision") != DEFAULT_SAM3_REVISION
+            or any(
+                key in result
+                for key in ("artifacts", "geometry", "sam", "instances", "object_catalog")
+            )
+        ):
+            return provenance_error("Scene Parse catalog")
     if object_catalog_version == OBJECT_CATALOG_VERSION:
         object_catalog = result.get("object_catalog")
         artifacts = result.get("artifacts")
@@ -3202,11 +4423,27 @@ def run_stage2(payload: dict[str, Any]) -> dict[str, Any]:
             "error": analysis_error,
         }
 
-    def input_error(message: str) -> dict[str, Any]:
+    def input_error(message: str, error_code: str | None = None) -> dict[str, Any]:
         result = {"status": "error", "mode": mode, "error": message}
         if analysis_type is not None:
             result["analysis_type"] = analysis_type
+        if error_code is not None:
+            result["error_code"] = error_code
         return result
+
+    if analysis_type == SCENE_PARSE_CATALOG_ANALYSIS_TYPE:
+        normalized, scene_parse_error = _validate_scene_parse_catalog_request(payload)
+        if scene_parse_error or normalized is None:
+            return input_error(
+                scene_parse_error or "scene_parse_catalog_v1 request is invalid",
+                "invalid_scene_parse_request",
+            )
+        result = run_scene_parse_catalog(normalized)
+        return _attach_success_provenance(
+            result,
+            mode=mode,
+            analysis_type=analysis_type,
+        )
 
     _catalog_version, catalog_error = _resolve_object_catalog_version(payload, mode)
     if catalog_error:
