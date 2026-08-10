@@ -83,7 +83,7 @@ if [[ "$ready" != true ]]; then
   fi
   rm -rf -- "$runtime_dir"
   mkdir -p "$runtime_dir"
-  git clone --filter=blob:none --no-checkout https://github.com/chris-palatial/ras-stage2-service.git "$app_dir"
+  git clone --filter=blob:none --no-checkout https://github.com/chris-palatial/ras-deduplication-service.git "$app_dir"
   git -C "$app_dir" fetch --depth 1 origin "$STAGE2_CODE_REV"
   git -C "$app_dir" checkout --detach FETCH_HEAD
   python -m venv --system-site-packages "$STAGE2_VENV"

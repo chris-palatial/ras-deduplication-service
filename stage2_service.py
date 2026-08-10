@@ -1,5 +1,5 @@
 """
-Stage 2 only: Spatial-Guided Visual Deduplication.
+Core runner for the RAS Deduplication Service.
 
 This module does NOT reimplement VGGT/SAM/dedup. It calls the public
 ReplicateAnyScene Stage 2 path (same sequence as their main.py Stage 2 block).
@@ -31,8 +31,8 @@ from urllib.parse import urlparse
 
 from artifact_contract import GLB_MAX_BYTES
 
-# Resolve vendor checkout. Layout:
-#   services/replicate-any-scene-stage2/
+# Resolve the pinned upstream checkout. Standalone wrapper layout:
+#   <service-root>/
 #     stage2_service.py
 #     vendor/ReplicateAnyScene/   (paper repo)
 RAS_ROOT = Path(os.environ.get("RAS_ROOT", Path(__file__).resolve().parent / "vendor" / "ReplicateAnyScene")).resolve()

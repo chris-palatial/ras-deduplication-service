@@ -465,7 +465,10 @@ def build_point_cloud_glb(
         })
 
     gltf = {
-        "asset": {"version": "2.0", "generator": "Palatial Stage2 point-cloud exporter"},
+        "asset": {
+            "version": "2.0",
+            "generator": "Palatial RAS Deduplication point-cloud exporter",
+        },
         "scene": 0,
         "scenes": [{"nodes": list(range(len(nodes)))}],
         "nodes": nodes,

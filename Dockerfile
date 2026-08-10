@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1.7
-# Stage 2 service: official ReplicateAnyScene + thin RunPod handler.
+# RAS Deduplication Service: official ReplicateAnyScene + thin RunPod handler.
 # Build on linux/amd64. Prefer baking weights once or mounting STAGE2_MODELS_DIR.
 #
-#   docker build -t ras-stage2:full \
+#   docker build -t ras-deduplication:full \
 #     --build-arg STAGE2_BUILD_REVISION="$(git rev-parse HEAD)" \
 #     --secret id=hf_token,env=HF_TOKEN \
 #     --build-arg DOWNLOAD_WEIGHTS=1 .

@@ -1148,6 +1148,11 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertEqual(put_request.get_header("X-amz-checksum-sha256"), "safe-sha256")
 
     def test_artifact_post_uses_stable_uploader_identity_and_rejects_override(self):
+        self.assertEqual(
+            artifact_uploader.UPLOADER_USER_AGENT,
+            "palatial-ras-deduplication-artifact-uploader/2",
+        )
+
         class JsonResponse(io.BytesIO):
             def __enter__(self):
                 return self
@@ -1966,6 +1971,10 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertEqual(version, 2)
         self.assertEqual(total_length, len(data))
         self.assertEqual(json_type, 0x4E4F534A)
+        self.assertEqual(
+            document["asset"]["generator"],
+            "Palatial RAS Deduplication point-cloud exporter",
+        )
         self.assertEqual(stats["point_count"], 5)
         self.assertEqual(stats["camera_count"], 2)
         self.assertEqual(document["meshes"][0]["primitives"][0]["mode"], 0)
