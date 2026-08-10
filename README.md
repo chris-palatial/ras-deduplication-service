@@ -23,6 +23,7 @@ contracts.
 | File | Role |
 | --- | --- |
 | `stage2_service.py` | Calls RAS Stage 2; provides model-free, local VGGT, and hosted VGGT-Omega geometry modes |
+| `object_catalog.py` | Builds a bounded, versioned catalog and JPEG crop atlas from Full RAS masks |
 | `point_cloud_glb.py` | Exports bounded colored VGGT points + camera frustums as glTF 2.0 GLB |
 | `artifact_upload.py` | Uses Agent Lab upload tickets to deliver files to R2 and return receipts |
 | `handler.py` | RunPod Serverless entry |
@@ -37,11 +38,57 @@ contracts.
 - `full` — exact RAS Stage 2 path (stops before Stage 3 mesh generation)
 
 New Agent Lab requests also carry a stable `analysis_type`. This worker owns
-`validation_v1`, `geometry_vggt_1b`, `geometry_vggt_omega_1b`, and
-`dedup_ras_vggt_sam3`; it rejects fal mask types because those belong to a
-separate backend. Typed results preserve the analysis id on both success and
-failure and verify the model runner's provenance instead of rewriting it.
-Legacy requests without `analysis_type` remain supported.
+`validation_v1`, the internal `validation_object_catalog_transport_v1` canary,
+`geometry_vggt_1b`, `geometry_vggt_omega_1b`, and `dedup_ras_vggt_sam3`; it
+rejects fal mask types because those belong to a separate backend. Typed
+results preserve the analysis id on both success and failure and verify the
+model runner's provenance instead of rewriting it. Legacy requests without
+`analysis_type` remain supported.
+
+### Negotiated object catalog
+
+Full RAS callers can explicitly request `palatial.object_catalog.v1` with this
+exact input combination:
+
+```json
+{
+  "mode": "full",
+  "analysis_type": "dedup_ras_vggt_sam3",
+  "object_catalog_version": 1
+}
+```
+
+The version is a JSON integer; strings, booleans, unknown versions, untyped
+requests, and non-full modes fail before video materialization or model work.
+Omitting the field keeps the legacy response and artifact contract unchanged.
+
+A negotiated run adds two required, fixed-name artifacts:
+
+- `object_catalog.json` (`application/json`, at most 512 KiB) records up to 128
+  spatial-deduplicated instance hypotheses for the caller's requested
+  categories. It explicitly reports `scope: requested_categories` and
+  `exhaustive: false`; it is not an open-vocabulary inventory or ground truth.
+- `object_crops.jpg` (`image/jpeg`, at most 8 MiB) is a deterministic 224-pixel
+  tile atlas. JSON tile coordinates map each catalog row to its crop, and the
+  JSON mirrors the atlas SHA-256 so the edge can bind the verified artifacts.
+
+The representative view reuses RAS's public Stage-3 surface-area scorer on a
+deterministic shortlist of at most 16 sampled views and at most 25,000 mask
+pixels per score. If geometry cannot produce a positive finite score, the
+largest visible mask wins, with the earliest sampled frame as the tie-breaker.
+This small selector is the only Stage-3 code path reused: the service still
+does not run SAM3D asset generation or claim a mesh result.
+
+The deployment transport can be checked without provider access through the
+privileged internal `validation_object_catalog_transport_v1` dry-run. It
+requires `object_catalog_transport_canary: true`, the exact fixed category
+`synthetic_transport_canary`, no video or `object_catalog_version`, and a valid
+Agent Lab upload ticket. It passes an empty catalog through the real generator
+and uploader, producing only the two catalog artifacts. The RunPod response
+carries `synthetic_transport_canary: true`; the catalog remains an ordinary
+closed-schema zero-object v1 document. `instance_count` is zero, and no
+representative or physical-object claim is present. The response marker is a
+transport canary, never a user-visible analysis result.
 
 ### Hosted VGGT-Omega geometry
 
@@ -211,12 +258,14 @@ printing request credentials or endpoint output when verification does not pass.
 ```
 
 Agent Lab supplies `upload`; callers should not mint it themselves. A geometry
-job must durably receipt `point_cloud.glb`; a full job must durably receipt both
-`point_cloud.glb` and `instance_masks.mp4`. Missing or failed required uploads
-make the job explicitly fail with `artifact_delivery_failed` instead of
-returning a partial `status: ok`. Its JSON contains digest receipts only. Agent
-Lab verifies each receipt against R2 before exposing `/media/*` URLs; no signed
-PUT URL, file bytes, base64 output, or temporary worker path is returned.
+job must durably receipt `point_cloud.glb`; a legacy full job must durably
+receipt `point_cloud.glb` and `instance_masks.mp4`. A negotiated object-catalog
+run additionally requires both `object_catalog.json` and `object_crops.jpg`.
+Missing or failed required uploads make the job explicitly fail with
+`artifact_delivery_failed` instead of returning a partial `status: ok`. Its
+JSON contains digest receipts only. Agent Lab verifies each receipt against R2
+before exposing `/media/*` URLs; no signed PUT URL, file bytes, base64 output,
+or temporary worker path is returned.
 Every failed PUT is checked for an already-stored object first. When a retry is
 safe, the uploader obtains a fresh short-lived grant instead of replaying its
 old presigned URL; explicit 4xx/409 rejections are verified once but never

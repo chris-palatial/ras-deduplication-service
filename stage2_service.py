@@ -30,6 +30,12 @@ from typing import Any
 from urllib.parse import urlparse
 
 from artifact_contract import GLB_MAX_BYTES
+from object_catalog import (
+    OBJECT_CATALOG_JSON_NAME,
+    OBJECT_CATALOG_VERSION,
+    OBJECT_CROPS_ATLAS_NAME,
+    build_object_catalog,
+)
 
 # Resolve the pinned upstream checkout. Standalone wrapper layout:
 #   <service-root>/
@@ -68,13 +74,22 @@ ARTIFACT_MEDIA_TYPES = {
     "point_cloud.ply": "application/octet-stream",
     "instance_masks.mp4": "video/mp4",
     "camera_intrinsics.json": "application/json",
+    OBJECT_CATALOG_JSON_NAME: "application/json",
+    OBJECT_CROPS_ATLAS_NAME: "image/jpeg",
 }
 REQUIRED_ARTIFACTS = {
     "geometry": ("point_cloud.glb",),
     "full": ("point_cloud.glb", "instance_masks.mp4"),
 }
+OBJECT_CATALOG_ARTIFACTS = (
+    OBJECT_CATALOG_JSON_NAME,
+    OBJECT_CROPS_ATLAS_NAME,
+)
+OBJECT_CATALOG_TRANSPORT_CANARY_ANALYSIS_TYPE = "validation_object_catalog_transport_v1"
+OBJECT_CATALOG_TRANSPORT_CANARY_CATEGORY = "synthetic_transport_canary"
 RUNPOD_ANALYSIS_TYPE_MODES = {
     "validation_v1": "dry_run",
+    OBJECT_CATALOG_TRANSPORT_CANARY_ANALYSIS_TYPE: "dry_run",
     "geometry_vggt_1b": "geometry",
     VGGT_OMEGA_ANALYSIS_TYPE: "geometry",
     "dedup_ras_vggt_sam3": "full",
@@ -135,6 +150,21 @@ def _sampled_source_frame_indices(video_path: Path, sampled_count: int) -> list[
     """Mirror upstream np.linspace sampling over FFmpeg-decoded frames."""
     plan = _source_frame_plan(video_path, sampled_count)
     return plan[0] if plan else None
+
+
+def _canonical_source_frame_timestamps(values: Any) -> list[float] | None:
+    """Use the catalog's six-decimal timeline representation everywhere."""
+    if not isinstance(values, (list, tuple)):
+        return None
+    canonical: list[float] = []
+    for raw_value in values:
+        value = _finite_number(raw_value)
+        if value is None or value < 0:
+            return None
+        canonical.append(round(value, 6))
+    if any(right <= left for left, right in zip(canonical, canonical[1:])):
+        return None
+    return canonical
 
 
 
@@ -1952,20 +1982,119 @@ def _upload_ticket(payload: dict[str, Any] | None) -> dict[str, Any] | None:
     return upload if isinstance(upload, dict) else None
 
 
+def _resolve_object_catalog_version(
+    payload: dict[str, Any],
+    mode: str,
+) -> tuple[int | None, str | None]:
+    """Validate explicit catalog negotiation without accepting JSON coercions."""
+    if "object_catalog_version" not in payload:
+        return None, None
+    version = payload.get("object_catalog_version")
+    if type(version) is not int or version != OBJECT_CATALOG_VERSION:
+        return None, "object_catalog_version must be the integer 1"
+    if mode != "full":
+        return None, "object_catalog_version 1 is supported only for full mode"
+    if payload.get("analysis_type") != "dedup_ras_vggt_sam3":
+        return None, (
+            "object_catalog_version 1 requires analysis_type "
+            "dedup_ras_vggt_sam3"
+        )
+    return version, None
+
+
+def _object_catalog_negotiated(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return (
+        str(payload.get("mode") or "").lower() == "full"
+        and type(payload.get("object_catalog_version")) is int
+        and payload.get("object_catalog_version") == OBJECT_CATALOG_VERSION
+        and payload.get("analysis_type") == "dedup_ras_vggt_sam3"
+    )
+
+
+def _object_catalog_transport_canary(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return (
+        str(payload.get("mode") or "").lower() == "dry_run"
+        and payload.get("analysis_type") == OBJECT_CATALOG_TRANSPORT_CANARY_ANALYSIS_TYPE
+        and type(payload.get("object_catalog_transport_canary")) is bool
+        and payload.get("object_catalog_transport_canary") is True
+        and payload.get("categories") == [OBJECT_CATALOG_TRANSPORT_CANARY_CATEGORY]
+        and "object_catalog_version" not in payload
+        and not payload.get("video_url")
+        and not payload.get("video_b64")
+        and bool(_upload_ticket(payload))
+    )
+
+
+def _resolve_object_catalog_transport_canary(
+    payload: dict[str, Any],
+    mode: str,
+    analysis_type: str | None,
+) -> tuple[bool, str | None]:
+    flag_present = "object_catalog_transport_canary" in payload
+    typed_canary = analysis_type == OBJECT_CATALOG_TRANSPORT_CANARY_ANALYSIS_TYPE
+    if not flag_present and not typed_canary:
+        return False, None
+    if not typed_canary:
+        return False, (
+            "object_catalog_transport_canary is reserved for analysis_type "
+            f"{OBJECT_CATALOG_TRANSPORT_CANARY_ANALYSIS_TYPE}"
+        )
+    if mode != "dry_run":
+        return False, (
+            f"analysis_type {OBJECT_CATALOG_TRANSPORT_CANARY_ANALYSIS_TYPE} "
+            "requires mode dry_run"
+        )
+    if type(payload.get("object_catalog_transport_canary")) is not bool or not payload.get(
+        "object_catalog_transport_canary"
+    ):
+        return False, "object_catalog_transport_canary must be the boolean true"
+    if "object_catalog_version" in payload:
+        return False, "transport canaries must not set object_catalog_version"
+    if payload.get("categories") != [OBJECT_CATALOG_TRANSPORT_CANARY_CATEGORY]:
+        return False, (
+            "transport canary categories must be exactly "
+            f"['{OBJECT_CATALOG_TRANSPORT_CANARY_CATEGORY}']"
+        )
+    if payload.get("video_url") or payload.get("video_b64"):
+        return False, "transport canaries do not accept video input"
+    if not _upload_ticket(payload):
+        return False, "transport canaries require a privileged artifact upload ticket"
+    return True, None
+
+
+def _required_artifacts(payload: dict[str, Any] | None) -> tuple[str, ...]:
+    if _object_catalog_transport_canary(payload):
+        return OBJECT_CATALOG_ARTIFACTS
+    mode = str((payload or {}).get("mode") or "")
+    required = REQUIRED_ARTIFACTS.get(mode, ())
+    if _object_catalog_negotiated(payload):
+        return (*required, *OBJECT_CATALOG_ARTIFACTS)
+    return required
+
+
 def _artifact_manifest(out_dir: Path, work: Path, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     """Deliver artifacts durably and return receipts, never temporary paths."""
     artifact_root = os.environ.get("STAGE2_ARTIFACT_DIR", "").strip()
+    allowed_artifacts = set(ARTIFACT_MEDIA_TYPES)
+    if not (
+        _object_catalog_negotiated(payload)
+        or _object_catalog_transport_canary(payload)
+    ):
+        allowed_artifacts.difference_update(OBJECT_CATALOG_ARTIFACTS)
     files = sorted(
         p.name
         for p in out_dir.iterdir()
-        if p.is_file() and p.name in ARTIFACT_MEDIA_TYPES
+        if p.is_file() and p.name in allowed_artifacts
     ) if out_dir.is_dir() else []
     upload = _upload_ticket(payload)
     if upload:
         from artifact_upload import artifact_failure_record, upload_artifact_file
 
-        mode = str((payload or {}).get("mode") or "")
-        required_files = list(REQUIRED_ARTIFACTS.get(mode, ()))
+        required_files = list(_required_artifacts(payload))
         required_set = set(required_files)
         # Deliver the product contract before optional debug artifacts. This
         # matters when a short-lived ticket or proxy upload fails partway.
@@ -1984,9 +2113,20 @@ def _artifact_manifest(out_dir: Path, work: Path, payload: dict[str, Any] | None
                 )
         for name in upload_order:
             try:
-                receipts.append(
-                    upload_artifact_file(upload, out_dir / name, ARTIFACT_MEDIA_TYPES[name])
-                )
+                if _object_catalog_transport_canary(payload):
+                    receipt = upload_artifact_file(
+                        upload,
+                        out_dir / name,
+                        ARTIFACT_MEDIA_TYPES[name],
+                        require_put_acknowledgement=True,
+                    )
+                else:
+                    receipt = upload_artifact_file(
+                        upload,
+                        out_dir / name,
+                        ARTIFACT_MEDIA_TYPES[name],
+                    )
+                receipts.append(receipt)
             except Exception as exc:
                 # Signed PUT URLs are credentials. Keep only the uploader's
                 # bounded phase/status record in both logs and provider JSON.
@@ -2054,7 +2194,7 @@ def _artifact_delivery_error(
         return None
     missing = artifacts.get("missing_required")
     if not isinstance(missing, list):
-        missing = list(REQUIRED_ARTIFACTS.get(str((payload or {}).get("mode") or ""), ()))
+        missing = list(_required_artifacts(payload))
     return {
         "error_code": "artifact_delivery_failed",
         "error": "Required result files could not be delivered to durable storage.",
@@ -2064,6 +2204,100 @@ def _artifact_delivery_error(
             "errors": artifacts.get("errors", []),
         },
     }
+
+
+def run_object_catalog_transport_canary(payload: dict[str, Any]) -> dict[str, Any]:
+    """Exercise catalog generation and durable delivery without video or models."""
+    is_canary, canary_error = _resolve_object_catalog_transport_canary(
+        payload,
+        str(payload.get("mode") or "").lower(),
+        payload.get("analysis_type") if isinstance(payload.get("analysis_type"), str) else None,
+    )
+    if canary_error or not is_canary:
+        return {
+            "status": "error",
+            "mode": "dry_run",
+            "error": canary_error or "invalid object catalog transport canary request",
+            "synthetic_transport_canary": True,
+            "instance_count": 0,
+            "instances": [],
+        }
+    import numpy as np
+
+    started = time.time()
+    work = Path(tempfile.mkdtemp(prefix="ras-object-catalog-canary-"))
+    out_dir = work / "output"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timings: dict[str, int] = {}
+    try:
+        generation_started = time.time()
+        catalog = build_object_catalog(
+            all_masks={OBJECT_CATALOG_TRANSPORT_CANARY_CATEGORY: []},
+            colors=np.zeros((1, 8, 8, 3), dtype=np.uint8),
+            world_points=np.zeros((1, 8, 8, 3), dtype=np.float32),
+            requested_categories=[OBJECT_CATALOG_TRANSPORT_CANARY_CATEGORY],
+            source_frame_indices=None,
+            source_frame_timestamps=None,
+            surface_area_fn=lambda _pointmap, _mask: 0.0,
+            out_dir=out_dir,
+        )
+        timings["object_catalog"] = int((time.time() - generation_started) * 1000)
+
+        delivery_started = time.time()
+        artifacts = _artifact_manifest(out_dir, work, payload)
+        timings["artifact_delivery"] = int((time.time() - delivery_started) * 1000)
+        timings["total"] = int((time.time() - started) * 1000)
+        delivery_error = _artifact_delivery_error(payload, artifacts)
+        response = {
+            "status": "ok",
+            "mode": "dry_run",
+            "implementation": "Synthetic object catalog transport canary (no video or models)",
+            "synthetic_transport_canary": True,
+            "frames_used": 1,
+            "categories": [OBJECT_CATALOG_TRANSPORT_CANARY_CATEGORY],
+            "raw_track_count": 0,
+            "instance_count": 0,
+            "instances": [],
+            "object_catalog": {
+                "schema_version": catalog["schema_version"],
+                "total_count": 0,
+                "returned_count": 0,
+                "truncated": False,
+                "artifact_name": OBJECT_CATALOG_JSON_NAME,
+                "atlas_artifact_name": OBJECT_CROPS_ATLAS_NAME,
+            },
+            "artifacts": artifacts,
+            "timings_ms": timings,
+            "pipeline": [
+                {
+                    "id": "synthetic_object_catalog",
+                    "status": "ok",
+                    "ms": timings.get("object_catalog"),
+                },
+                {
+                    "id": "artifact_delivery",
+                    "status": "error" if delivery_error else "ok",
+                    "ms": timings.get("artifact_delivery"),
+                },
+            ],
+        }
+        if delivery_error:
+            response.update({"status": "error", **delivery_error})
+        return response
+    except Exception as exc:
+        timings["total"] = int((time.time() - started) * 1000)
+        return {
+            "status": "error",
+            "mode": "dry_run",
+            "error": f"Object catalog transport canary failed ({type(exc).__name__}).",
+            "synthetic_transport_canary": True,
+            "instance_count": 0,
+            "instances": [],
+            "timings_ms": timings,
+        }
+    finally:
+        if os.environ.get("STAGE2_KEEP_WORK") != "1":
+            shutil.rmtree(work, ignore_errors=True)
 
 
 def _artifact_exports_enabled(payload: dict[str, Any] | None = None) -> bool:
@@ -2461,6 +2695,11 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
     Mirrors main.py Stage 2 (VGGT → room align → SAM3 video track →
     self/cross category dedup → mask video). Does not run Stage 3+.
     """
+    payload_mode = str(payload.get("mode") or "full").lower()
+    _catalog_version, catalog_error = _resolve_object_catalog_version(payload, payload_mode)
+    if catalog_error:
+        return {"status": "error", "error": catalog_error, "mode": "full"}
+    payload = {**payload, "mode": "full"}
     t_all = time.time()
     video_url = str(payload.get("video_url") or "").strip()
     categories = payload.get("categories") or []
@@ -2503,7 +2742,11 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
             unload_model,
         )
         from src.utils import load_video_frames, vis_instance_masks
-        from src.geometry_utils import align_to_room_coordinate_system, align_vggt_predictions
+        from src.geometry_utils import (
+            align_to_room_coordinate_system,
+            align_vggt_predictions,
+            compute_surface_area_from_pointmap,
+        )
         from src.vggt_predict import vggt_predict
         from src.object_segmentation import segment_and_track, segment_wall_and_floor
         from src.sg_deduplication import cross_category_deduplicate, self_category_deduplicate
@@ -2515,7 +2758,9 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
         n_frames = int(frames.shape[0])
         source_frame_plan = _source_frame_plan(video_path, n_frames)
         source_frame_indices = source_frame_plan[0] if source_frame_plan else None
-        source_frame_timestamps = source_frame_plan[1] if source_frame_plan else None
+        source_frame_timestamps = _canonical_source_frame_timestamps(
+            source_frame_plan[1] if source_frame_plan else None
+        )
         timings["sample"] = int((time.time() - t0) * 1000)
 
         t0 = time.time()
@@ -2583,6 +2828,29 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
         )
         timings["mask_video_normalize"] = int((time.time() - t0) * 1000)
 
+        object_catalog_summary = None
+        if _object_catalog_negotiated(payload):
+            t0 = time.time()
+            catalog = build_object_catalog(
+                all_masks=deduped,
+                colors=pred["colors"],
+                world_points=pred["world_points"],
+                requested_categories=categories,
+                source_frame_indices=source_frame_indices,
+                source_frame_timestamps=source_frame_timestamps,
+                surface_area_fn=compute_surface_area_from_pointmap,
+                out_dir=out_dir,
+            )
+            object_catalog_summary = {
+                "schema_version": catalog["schema_version"],
+                "total_count": catalog["total_count"],
+                "returned_count": catalog["returned_count"],
+                "truncated": catalog["truncated"],
+                "artifact_name": OBJECT_CATALOG_JSON_NAME,
+                "atlas_artifact_name": OBJECT_CROPS_ATLAS_NAME,
+            }
+            timings["object_catalog"] = int((time.time() - t0) * 1000)
+
         instances = _masks_to_instances(deduped)
         raw_count = sum(len(v) for v in all_masks.values())
         t0 = time.time()
@@ -2590,6 +2858,31 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
         timings["artifact_delivery"] = int((time.time() - t0) * 1000)
         timings["total"] = int((time.time() - t_all) * 1000)
         delivery_error = _artifact_delivery_error(payload, artifacts)
+
+        pipeline = [
+            {"id": "intake", "status": "ok", "ms": timings.get("download")},
+            {"id": "sample_frames", "status": "ok", "ms": timings.get("sample")},
+            {"id": "vggt", "status": "ok", "ms": timings.get("vggt")},
+            {
+                "id": "room_align",
+                "status": "ok" if room_alignment_applied else "not_applied" if room_align else "skipped",
+                "ms": timings.get("room_align"),
+            },
+            {"id": "sam_dedup", "status": "ok", "ms": timings.get("sam_dedup_vis")},
+            {"id": "mask_video", "status": "ok", "ms": timings.get("mask_video_normalize")},
+        ]
+        if object_catalog_summary is not None:
+            pipeline.append(
+                {"id": "object_catalog", "status": "ok", "ms": timings.get("object_catalog")}
+            )
+        pipeline.extend([
+            {
+                "id": "artifact_delivery",
+                "status": "error" if delivery_error else "ok",
+                "ms": timings.get("artifact_delivery"),
+            },
+            {"id": "emit", "status": "ok", "detail": {"instance_ids": [x["instance_id"] for x in instances]}},
+        ])
 
         response = {
             "status": "ok",
@@ -2599,6 +2892,7 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
             "upstream_revision": RAS_REVISION,
             "frames_used": n_frames,
             "source_frame_indices": source_frame_indices,
+            "source_frame_timestamps": source_frame_timestamps,
             "categories": categories,
             "raw_track_count": raw_count,
             "instance_count": len(instances),
@@ -2625,30 +2919,15 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
             },
             "artifacts": artifacts,
             "timings_ms": timings,
-            "pipeline": [
-                {"id": "intake", "status": "ok", "ms": timings.get("download")},
-                {"id": "sample_frames", "status": "ok", "ms": timings.get("sample")},
-                {"id": "vggt", "status": "ok", "ms": timings.get("vggt")},
-                {
-                    "id": "room_align",
-                    "status": "ok" if room_alignment_applied else "not_applied" if room_align else "skipped",
-                    "ms": timings.get("room_align"),
-                },
-                {"id": "sam_dedup", "status": "ok", "ms": timings.get("sam_dedup_vis")},
-                {"id": "mask_video", "status": "ok", "ms": timings.get("mask_video_normalize")},
-                {
-                    "id": "artifact_delivery",
-                    "status": "error" if delivery_error else "ok",
-                    "ms": timings.get("artifact_delivery"),
-                },
-                {"id": "emit", "status": "ok", "detail": {"instance_ids": [x["instance_id"] for x in instances]}},
-            ],
+            "pipeline": pipeline,
             "paper_mapping": {
                 "paper": "ReplicateAnyScene (arXiv:2604.10789)",
                 "stage": 2,
                 "title": "Spatial-Guided Visual Deduplication",
             },
         }
+        if object_catalog_summary is not None:
+            response["object_catalog"] = object_catalog_summary
         if delivery_error:
             response.update({"status": "error", **delivery_error})
         return response
@@ -2756,6 +3035,7 @@ def _attach_success_provenance(
     *,
     mode: str,
     analysis_type: str | None,
+    object_catalog_version: int | None = None,
 ) -> dict[str, Any]:
     # Legacy callers predate versioned analysis types. Preserve their response
     # shape, but never manufacture provenance for the typed contract: the
@@ -2787,6 +3067,27 @@ def _attach_success_provenance(
             or source.get("weights_required") is not False
         ):
             return provenance_error("source bootstrap")
+    if analysis_type == OBJECT_CATALOG_TRANSPORT_CANARY_ANALYSIS_TYPE:
+        object_catalog = result.get("object_catalog")
+        artifacts = result.get("artifacts")
+        if (
+            result.get("synthetic_transport_canary") is not True
+            or result.get("frames_used") != 1
+            or result.get("categories") != [OBJECT_CATALOG_TRANSPORT_CANARY_CATEGORY]
+            or result.get("raw_track_count") != 0
+            or result.get("instance_count") != 0
+            or result.get("instances") != []
+            or not isinstance(object_catalog, dict)
+            or object_catalog.get("schema_version") != "palatial.object_catalog.v1"
+            or object_catalog.get("total_count") != 0
+            or object_catalog.get("returned_count") != 0
+            or object_catalog.get("truncated") is not False
+            or not isinstance(artifacts, dict)
+            or artifacts.get("complete") is not True
+            or artifacts.get("required_files") != list(OBJECT_CATALOG_ARTIFACTS)
+            or artifacts.get("files") != list(OBJECT_CATALOG_ARTIFACTS)
+        ):
+            return provenance_error("object catalog transport canary")
     if analysis_type in VGGT_1B_ANALYSIS_TYPES:
         geometry = result.get("geometry")
         if not isinstance(geometry, dict) or (
@@ -2818,6 +3119,72 @@ def _attach_success_provenance(
             or sam.get("source_revision") != DEFAULT_SAM3_REVISION
         ):
             return provenance_error("SAM 3")
+    if object_catalog_version == OBJECT_CATALOG_VERSION:
+        object_catalog = result.get("object_catalog")
+        artifacts = result.get("artifacts")
+        frames_used = result.get("frames_used")
+        source_frame_indices = result.get("source_frame_indices")
+        source_frame_timestamps = result.get("source_frame_timestamps")
+        indices_valid = (
+            source_frame_indices is None
+            or isinstance(source_frame_indices, list)
+            and len(source_frame_indices) == frames_used
+            and all(type(value) is int and value >= 0 for value in source_frame_indices)
+            and all(
+                right > left
+                for left, right in zip(source_frame_indices, source_frame_indices[1:])
+            )
+        )
+        timestamps_valid = (
+            source_frame_timestamps is None
+            or isinstance(source_frame_timestamps, list)
+            and len(source_frame_timestamps) == frames_used
+            and all(
+                type(value) in {int, float} and math.isfinite(value) and value >= 0
+                for value in source_frame_timestamps
+            )
+            and all(
+                right > left
+                for left, right in zip(source_frame_timestamps, source_frame_timestamps[1:])
+            )
+        )
+        timeline_valid = (
+            isinstance(frames_used, int)
+            and not isinstance(frames_used, bool)
+            and 1 <= frames_used <= 160
+            and indices_valid
+            and timestamps_valid
+        )
+        total_count = object_catalog.get("total_count") if isinstance(object_catalog, dict) else None
+        returned_count = (
+            object_catalog.get("returned_count") if isinstance(object_catalog, dict) else None
+        )
+        truncated = object_catalog.get("truncated") if isinstance(object_catalog, dict) else None
+        counts_valid = (
+            type(total_count) is int
+            and type(returned_count) is int
+            and total_count >= 0
+            and 0 <= returned_count <= min(total_count, 128)
+            and type(truncated) is bool
+            and truncated is (total_count > returned_count)
+        )
+        if (
+            not timeline_valid
+            or not counts_valid
+            or result.get("synthetic_transport_canary") is not None
+            or not isinstance(object_catalog, dict)
+            or object_catalog.get("schema_version") != "palatial.object_catalog.v1"
+            or object_catalog.get("artifact_name") != OBJECT_CATALOG_JSON_NAME
+            or object_catalog.get("atlas_artifact_name") != OBJECT_CROPS_ATLAS_NAME
+            or not isinstance(artifacts, dict)
+            or artifacts.get("complete") is not True
+            or artifacts.get("required_files") != [
+                "point_cloud.glb",
+                "instance_masks.mp4",
+                *OBJECT_CATALOG_ARTIFACTS,
+            ]
+        ):
+            return provenance_error("object catalog")
 
     return enriched
 
@@ -2840,6 +3207,24 @@ def run_stage2(payload: dict[str, Any]) -> dict[str, Any]:
         if analysis_type is not None:
             result["analysis_type"] = analysis_type
         return result
+
+    _catalog_version, catalog_error = _resolve_object_catalog_version(payload, mode)
+    if catalog_error:
+        return input_error(catalog_error)
+    is_transport_canary, canary_error = _resolve_object_catalog_transport_canary(
+        payload,
+        mode,
+        analysis_type,
+    )
+    if canary_error:
+        return input_error(canary_error)
+    if is_transport_canary:
+        result = run_object_catalog_transport_canary({**payload, "mode": mode})
+        return _attach_success_provenance(
+            result,
+            mode=mode,
+            analysis_type=analysis_type,
+        )
 
     try:
         max_frames = int(payload.get("max_frames") or (24 if mode == "dry_run" else 48))
@@ -2864,4 +3249,9 @@ def run_stage2(payload: dict[str, Any]) -> dict[str, Any]:
         )
     else:
         result = run_stage2_full(payload)
-    return _attach_success_provenance(result, mode=mode, analysis_type=analysis_type)
+    return _attach_success_provenance(
+        result,
+        mode=mode,
+        analysis_type=analysis_type,
+        object_catalog_version=_catalog_version,
+    )
