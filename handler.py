@@ -1,5 +1,5 @@
 """
-RunPod Serverless entry for ReplicateAnyScene Stage 2 only.
+RunPod Serverless entry for the RAS Deduplication Service.
 
 Does not reimplement the paper pipeline — stage2_service imports and runs the
 public ReplicateAnyScene Stage 2 sequence.

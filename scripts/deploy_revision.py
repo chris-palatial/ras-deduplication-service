@@ -16,7 +16,7 @@ from typing import Any
 
 API_ROOT = "https://rest.runpod.io/v1"
 GITHUB_API_ROOT = "https://api.github.com"
-GITHUB_REPOSITORY = "chris-palatial/ras-stage2-service"
+GITHUB_REPOSITORY = "chris-palatial/ras-deduplication-service"
 GITHUB_BRANCH = "main"
 DEFAULT_TEMPLATE_ID = "inapyg0va0"
 DEFAULT_ENDPOINT_ID = "sp2oyuum48vk0j"
@@ -66,9 +66,9 @@ def bootstrap_command(revision: str) -> str:
     return (
         "set -euo pipefail; export DEBIAN_FRONTEND=noninteractive; "
         "apt-get update -qq; apt-get install -y -qq git curl >/dev/null; "
-        "BOOT_DIR=$(mktemp -d /tmp/ras-stage2-boot.XXXXXX); "
+        "BOOT_DIR=$(mktemp -d /tmp/ras-deduplication-boot.XXXXXX); "
         "git clone --filter=blob:none --no-checkout "
-        "https://github.com/chris-palatial/ras-stage2-service.git \"$BOOT_DIR\"; "
+        "https://github.com/chris-palatial/ras-deduplication-service.git \"$BOOT_DIR\"; "
         f"git -C \"$BOOT_DIR\" fetch --depth 1 origin {revision}; "
         "git -C \"$BOOT_DIR\" checkout --detach FETCH_HEAD; "
         f"export STAGE2_CODE_REV={revision}; "
@@ -434,7 +434,7 @@ def wait_for_endpoint_rollout(
 def github_branch_head(token: str = "", *, deadline: float | None = None) -> str:
     headers = {
         "accept": "application/vnd.github+json",
-        "user-agent": "ras-stage2-deployer",
+        "user-agent": "ras-deduplication-deployer",
         "x-github-api-version": "2022-11-28",
     }
     if token:

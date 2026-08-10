@@ -1,13 +1,22 @@
-# ReplicateAnyScene Stage 2 + VGGT-Omega geometry service
+# RAS Deduplication Service
 
-Thin RunPod / HTTP wrapper around the **public paper repo** Stage 2, plus a
-geometry-only adapter for Meta's official VGGT-Omega Hugging Face Space.
+Thin RunPod / HTTP wrapper around the **public ReplicateAnyScene (RAS) Stage 2**
+physical-object deduplication pipeline, plus a geometry-only adapter for Meta's
+official VGGT-Omega Hugging Face Space.
 
-We do **not** reimplement VGGT, SAM3, or spatial dedup here.
-Those live in:
+This repository is the service wrapper. It does **not** fork or reimplement
+VGGT, SAM3, or RAS spatial deduplication. At image-build or worker-bootstrap
+time, it clones and verifies exact commits from:
 
 - https://github.com/xiac20/ReplicateAnyScene (`main.py` Stage 2 block + `src/*`)
-- submodules `vggt` + `sam3` (facebookresearch)
+- https://github.com/facebookresearch/vggt
+- https://github.com/facebookresearch/sam3
+
+Those checkouts are pinned runtime dependencies, not Git submodules of this
+wrapper repository. The public product and repository name is **RAS
+Deduplication Service**. Existing `STAGE2_*` environment variables,
+`stage2_code_revision`, and internal module names remain stable compatibility
+contracts.
 
 ## What we add
 

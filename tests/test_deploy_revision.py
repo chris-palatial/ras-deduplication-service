@@ -29,6 +29,21 @@ SOURCE_EVIDENCE = {
 
 
 class DeployRevisionTests(unittest.TestCase):
+    def test_bootstrap_clones_the_canonical_deduplication_repository(self):
+        root = Path(__file__).resolve().parents[1]
+        start_script = (root / "scripts" / "start_serverless.sh").read_text()
+        bootstrap = deploy_revision.bootstrap_command(REVISION)
+        canonical_url = "https://github.com/chris-palatial/ras-deduplication-service.git"
+
+        self.assertEqual(
+            deploy_revision.GITHUB_REPOSITORY,
+            "chris-palatial/ras-deduplication-service",
+        )
+        self.assertIn(canonical_url, start_script)
+        self.assertIn(canonical_url, bootstrap)
+        self.assertNotIn("ras-stage2-service", start_script)
+        self.assertNotIn("ras-stage2-service", bootstrap)
+
     def test_deploy_source_smoke_pins_match_worker_contract(self):
         self.assertEqual(deploy_revision.EXPECTED_RAS_REVISION, stage2.RAS_REVISION)
         self.assertEqual(deploy_revision.EXPECTED_VGGT_REVISION, stage2.DEFAULT_VGGT_REVISION)

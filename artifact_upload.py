@@ -24,7 +24,7 @@ LOST_PUT_VERIFY_WINDOW_SECONDS = 15
 # Cloudflare Browser Integrity Check rejects urllib's default Python signature
 # before the artifact Worker runs. Keep one honest service identity on grant,
 # verification, and PUT requests; optional ticket headers cannot override it.
-UPLOADER_USER_AGENT = "palatial-stage2-artifact-uploader/2"
+UPLOADER_USER_AGENT = "palatial-ras-deduplication-artifact-uploader/2"
 
 PHASE_LABELS = {
     "ticket_validation": "artifact upload ticket validation",
