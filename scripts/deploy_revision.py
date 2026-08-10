@@ -8,6 +8,7 @@ import email.utils
 import json
 import os
 import re
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -386,49 +387,105 @@ def _active_worker_versions(snapshot: dict[str, Any]) -> list[str | None]:
     return versions
 
 
+def _rollout_report(
+    status: str,
+    observation: str,
+    *,
+    previous_version: str,
+    version: str,
+    worker_versions: list[str | None],
+    polls: int,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "observation": observation,
+        "previous_version": previous_version,
+        "version": version,
+        "version_advanced": version != previous_version,
+        "active_workers": len(worker_versions),
+        "workers_on_target_version": sum(
+            1 for worker_version in worker_versions if worker_version == version
+        ),
+        "polls": polls,
+    }
+
+
 def wait_for_endpoint_rollout(
     endpoint_id: str,
     previous_version: str,
     api_key: str,
     *,
     deadline: float,
+    expect_version_change: bool = True,
 ) -> dict[str, Any]:
-    """Wait until the endpoint advances and every live worker is on that version."""
+    """Observe the live fleet until it runs the endpoint's target version.
+
+    Convergence is a statement about reaching the target state, not about
+    catching a transition. RunPod does not bump the endpoint version for a
+    template update that changes nothing, so a re-run against an already
+    pinned template can never observe an advance, and demanding one made every
+    retry of a timed-out rollout fail by construction.
+
+    `expect_version_change` carries the only fact that separates the two cases:
+    whether the template already held this revision's pins before the update.
+    When it did, the endpoint's current version already reflects the target
+    template and no advance is owed. When it did not, an advance is still
+    required before a uniform fleet can mean anything, because a fleet that is
+    uniformly on the previous version is uniformly on the previous code.
+
+    The report is advisory. `run_post_deploy_smoke` is the authoritative proof
+    that the target revision serves traffic, so a fleet that has not finished
+    draining is reported rather than raised.
+    """
     if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", endpoint_id):
         raise RuntimeError("RunPod endpoint id is malformed")
 
     polls = 0
-    last_observation = "endpoint_version_not_advanced"
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(
-                f"RunPod endpoint fleet did not converge before the bounded timeout ({last_observation})"
-            )
+    pending: dict[str, Any] | None = None
+    while pending is None or time.monotonic() < deadline:
         polls += 1
-        snapshot = request_json(
-            "GET",
-            f"{API_ROOT}/endpoints/{endpoint_id}?includeWorkers=true",
-            api_key,
-            deadline=deadline,
-        )
+        try:
+            snapshot = request_json(
+                "GET",
+                f"{API_ROOT}/endpoints/{endpoint_id}?includeWorkers=true",
+                api_key,
+                deadline=deadline,
+            )
+        except TimeoutError:
+            # A read that cannot finish before the fleet deadline is the fleet
+            # deadline expiring. Report the last observation instead of losing
+            # the deployment to it.
+            if pending is None:
+                raise
+            return pending
         version = _endpoint_version(snapshot)
         worker_versions = _active_worker_versions(snapshot)
-        if version == previous_version:
-            last_observation = "endpoint_version_not_advanced"
-        elif all(worker_version == version for worker_version in worker_versions):
-            return {
-                "status": "converged",
-                "previous_version": previous_version,
-                "version": version,
-                "active_workers": len(worker_versions),
-                "polls": polls,
-            }
-        else:
-            last_observation = "mixed_worker_versions"
+        version_advanced = version != previous_version
+        endpoint_at_target = version_advanced or not expect_version_change
+        fleet_on_version = all(
+            worker_version == version for worker_version in worker_versions
+        )
+        if endpoint_at_target and fleet_on_version:
+            return _rollout_report(
+                "converged" if version_advanced else "already_converged",
+                "fleet_on_target_version",
+                previous_version=previous_version,
+                version=version,
+                worker_versions=worker_versions,
+                polls=polls,
+            )
+        pending = _rollout_report(
+            "fleet_not_converged",
+            "mixed_worker_versions" if endpoint_at_target else "endpoint_version_not_advanced",
+            previous_version=previous_version,
+            version=version,
+            worker_versions=worker_versions,
+            polls=polls,
+        )
         poll_remaining = deadline - time.monotonic()
         if poll_remaining > 0:
             time.sleep(min(5.0, poll_remaining))
+    return pending
 
 
 def github_branch_head(token: str = "", *, deadline: float | None = None) -> str:
@@ -483,15 +540,29 @@ def build_payload(current: dict, revision: str) -> dict:
     return payload
 
 
-def validate_payload(payload: dict[str, Any], revision: str) -> dict[str, bool]:
-    env = payload.get("env")
-    entrypoint = payload.get("dockerEntrypoint")
-    command = payload.get("dockerStartCmd")
-    assertions = {
+def revision_pin_assertions(snapshot: dict[str, Any], revision: str) -> dict[str, bool]:
+    """Report which revision pins a template snapshot already carries."""
+    env = snapshot.get("env")
+    entrypoint = snapshot.get("dockerEntrypoint")
+    command = snapshot.get("dockerStartCmd")
+    return {
         "environment_pin": isinstance(env, dict) and env.get("STAGE2_CODE_REV") == revision,
         "entrypoint_pin": entrypoint == ["bash", "-lc"],
         "bootstrap_pin": command == [bootstrap_command(revision)],
     }
+
+
+def revision_pins_applied(snapshot: dict[str, Any], revision: str) -> bool:
+    """Report whether the live template already pins exactly this revision.
+
+    A template that already carries every pin makes the update a no-op, and
+    RunPod does not issue a new endpoint version for a no-op update.
+    """
+    return all(revision_pin_assertions(snapshot, revision).values())
+
+
+def validate_payload(payload: dict[str, Any], revision: str) -> dict[str, bool]:
+    assertions = revision_pin_assertions(payload, revision)
     if not all(assertions.values()):
         failed = sorted(name for name, passed in assertions.items() if not passed)
         raise RuntimeError(f"RunPod template revision validation failed: {', '.join(failed)}")
@@ -545,6 +616,11 @@ def main() -> None:
         "--rollout-timeout-seconds",
         type=int,
         default=int(os.environ.get("STAGE2_DEPLOY_ROLLOUT_TIMEOUT_SECONDS", "2700")),
+        help=(
+            "total deployment budget after the template update. The smoke "
+            "budget is reserved out of it and the remainder is the window the "
+            "live fleet gets to finish draining onto the new version."
+        ),
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -562,6 +638,11 @@ def main() -> None:
         raise SystemExit("--smoke-timeout-seconds must be from 30 through 1200")
     if args.rollout_timeout_seconds < 300 or args.rollout_timeout_seconds > 3600:
         raise SystemExit("--rollout-timeout-seconds must be from 300 through 3600")
+    if args.rollout_timeout_seconds <= args.smoke_timeout_seconds:
+        raise SystemExit(
+            "--rollout-timeout-seconds must exceed --smoke-timeout-seconds so the "
+            "authoritative smoke keeps a usable budget"
+        )
 
     api_key = os.environ.get("RUNPOD_API_KEY", "").strip()
     if not api_key:
@@ -574,6 +655,10 @@ def main() -> None:
         api_key,
     )
     previous_endpoint_version = _endpoint_version(endpoint_before)
+    # Read before the update: a template that already carries every pin makes
+    # the update a no-op, so the endpoint owes no new version and the current
+    # one already reflects the target template.
+    already_pinned = revision_pins_applied(current, args.revision)
     # This authoritative branch read is intentionally the final network action
     # before the RunPod mutation. An out-of-order older workflow exits cleanly.
     branch_head = github_branch_head(
@@ -591,12 +676,29 @@ def main() -> None:
     updated = request_json("POST", base + "/update", api_key, build_payload(current, args.revision))
     validate_payload(updated, args.revision)
     deadline = time.monotonic() + args.rollout_timeout_seconds
+    # The smoke is the only direct observation of the deployed revision, so its
+    # budget is reserved up front. Sharing one deadline let a slow fleet consume
+    # the whole deployment budget and leave the authoritative check no time at
+    # all, which turned a draining worker into a failed deployment.
     rollout = wait_for_endpoint_rollout(
         args.endpoint_id,
         previous_endpoint_version,
         api_key,
-        deadline=deadline,
+        deadline=deadline - args.smoke_timeout_seconds,
+        expect_version_change=not already_pinned,
     )
+    if rollout["status"] == "fleet_not_converged":
+        # Not fatal on its own: the template is pinned, so every worker started
+        # from here runs the target revision, and the smoke below still has to
+        # observe that revision serving traffic before this exits successfully.
+        print(
+            "[deploy] warning: endpoint fleet did not finish converging "
+            f"({rollout['observation']}); "
+            f"{rollout['workers_on_target_version']}/{rollout['active_workers']} "
+            "live workers on the target version. The post-deploy smoke remains "
+            "the authoritative check.",
+            file=sys.stderr,
+        )
     smoke = run_post_deploy_smoke(
         args.endpoint_id,
         args.revision,
@@ -609,6 +711,7 @@ def main() -> None:
         "template_id": args.template_id,
         "revision": args.revision,
         "pins_match": True,
+        "template_already_pinned": already_pinned,
         "rollout": rollout,
         "smoke": smoke,
     }, sort_keys=True))
