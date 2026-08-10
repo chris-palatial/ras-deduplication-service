@@ -78,7 +78,10 @@ folding.
 Frame sampling is service-owned policy
 `uniform_2fps_min24_cap96_prompt_budget768_v1`: target two uniformly spaced
 frames per second, clamp to 24–96, then reduce toward 24 as needed to keep at
-most 768 prompt-frame tracking operations. The decoder first verifies one
+most 768 prompt-frame tracking operations. Duration is canonicalized once to
+the returned integer `source.duration_ms`; the frame target is exactly
+`ceil(duration_ms * 2 / 1000)`, so producers and consumers cannot disagree at
+sub-millisecond boundaries. The decoder first verifies one
 bounded stream (maximum 14,400 decoded frames, 8,192 on either dimension, and
 16,777,216 pixels per frame), then materializes only the selected frames as
 scaled JPEGs. It never expands the whole video to an image sequence. The

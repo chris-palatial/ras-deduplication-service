@@ -2148,20 +2148,18 @@ def _probe_video_frame_count(path: Path) -> int | None:
 
 
 def _scene_parse_requested_frames(
-    duration_seconds: float,
+    duration_ms: int,
     category_prompt_count: int,
 ) -> int:
     if (
-        not isinstance(duration_seconds, (int, float))
-        or isinstance(duration_seconds, bool)
-        or not math.isfinite(float(duration_seconds))
-        or duration_seconds <= 0
+        type(duration_ms) is not int
+        or duration_ms <= 0
     ):
         raise SceneParseCatalogError(
             "source_video_invalid",
             "Source video duration could not be established.",
         )
-    if duration_seconds > SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS:
+    if duration_ms > int(SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS * 1000):
         raise SceneParseCatalogError(
             "source_video_invalid",
             f"Source video exceeds the {int(SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS)} second limit.",
@@ -2178,7 +2176,10 @@ def _scene_parse_requested_frames(
         SCENE_PARSE_SAMPLING_MAX_FRAMES,
         max(
             SCENE_PARSE_SAMPLING_MIN_FRAMES,
-            int(math.ceil(float(duration_seconds) * SCENE_PARSE_SAMPLING_TARGET_FPS)),
+            (
+                duration_ms * int(SCENE_PARSE_SAMPLING_TARGET_FPS) + 999
+            )
+            // 1000,
         ),
     )
     prompt_budget_cap = SCENE_PARSE_PROMPT_FRAME_BUDGET // category_prompt_count
@@ -3538,8 +3539,9 @@ def run_scene_parse_catalog(payload: dict[str, Any]) -> dict[str, Any]:
             video_path,
             decoded_frame_count=decoded_frame_count,
         )
+        duration_ms = int(round(duration_seconds * 1000))
         requested_frames = _scene_parse_requested_frames(
-            duration_seconds,
+            duration_ms,
             len(payload["category_prompts"]),
         )
         source_frame_indices, source_frame_timestamps = _scene_parse_uniform_frame_plan(
@@ -3721,7 +3723,7 @@ def run_scene_parse_catalog(payload: dict[str, Any]) -> dict[str, Any]:
             "source": {
                 "sha256": payload["source_sha256"],
                 "size_bytes": source_size,
-                "duration_ms": int(round(float(duration_seconds) * 1000)),
+                "duration_ms": duration_ms,
             },
             "scope": "requested_category_prompts",
             "exhaustive": False,

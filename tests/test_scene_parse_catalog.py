@@ -118,15 +118,22 @@ class SceneParseCatalogContractTest(unittest.TestCase):
             runner.assert_not_called()
 
     def test_sampling_policy_is_internal_adaptive_and_bounded(self):
-        self.assertEqual(stage2._scene_parse_requested_frames(0.5, 1), 24)
-        self.assertEqual(stage2._scene_parse_requested_frames(12, 1), 24)
-        self.assertEqual(stage2._scene_parse_requested_frames(12.1, 1), 25)
-        self.assertEqual(stage2._scene_parse_requested_frames(60, 1), 96)
-        self.assertEqual(stage2._scene_parse_requested_frames(60, 8), 96)
-        self.assertEqual(stage2._scene_parse_requested_frames(60, 16), 48)
-        self.assertEqual(stage2._scene_parse_requested_frames(60, 32), 24)
+        self.assertEqual(stage2._scene_parse_requested_frames(500, 1), 24)
+        self.assertEqual(stage2._scene_parse_requested_frames(12_000, 1), 24)
+        self.assertEqual(stage2._scene_parse_requested_frames(12_001, 1), 25)
+        self.assertEqual(stage2._scene_parse_requested_frames(60_000, 1), 96)
+        self.assertEqual(stage2._scene_parse_requested_frames(60_000, 8), 96)
+        self.assertEqual(stage2._scene_parse_requested_frames(60_000, 16), 48)
+        self.assertEqual(stage2._scene_parse_requested_frames(60_000, 32), 24)
         with self.assertRaisesRegex(stage2.SceneParseCatalogError, "60 second"):
-            stage2._scene_parse_requested_frames(60.001, 1)
+            stage2._scene_parse_requested_frames(60_001, 1)
+
+    def test_sampling_uses_the_same_canonical_duration_ms_returned_to_consumers(self):
+        raw_duration_seconds = 12.0001
+        duration_ms = int(round(raw_duration_seconds * 1000))
+
+        self.assertEqual(duration_ms, 12_000)
+        self.assertEqual(stage2._scene_parse_requested_frames(duration_ms, 1), 24)
 
     def test_scene_parse_download_uses_2_gib_profile_limit_and_checks_identity(self):
         payload_bytes = b"video-fixture"
@@ -600,6 +607,7 @@ class SceneParseCatalogRunnerTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "ok", result)
         self.assertEqual(result["schema"], catalog.SCENE_PARSE_CATALOG_SCHEMA)
+        self.assertEqual(result["source"]["duration_ms"], 1250)
         self.assertEqual(result["sampling"]["requested_frames"], 24)
         self.assertEqual(result["sampling"]["frames_used"], 3)
         self.assertEqual(result["counts"]["raw_tracks"], 2)
