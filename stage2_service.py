@@ -3252,6 +3252,9 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
         n_frames = int(frames.shape[0])
         source_frame_plan = _source_frame_plan(video_path, n_frames)
         source_frame_indices = source_frame_plan[0] if source_frame_plan else None
+        source_frame_timestamps = _canonical_source_frame_timestamps(
+            source_frame_plan[1] if source_frame_plan else None
+        )
         timings["sample"] = int((time.time() - t0) * 1000)
 
         t0 = time.time()
@@ -3283,6 +3286,7 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
             "upstream_revision": RAS_REVISION,
             "frames_used": n_frames,
             "source_frame_indices": source_frame_indices,
+            "source_frame_timestamps": source_frame_timestamps,
             "categories": payload["categories"],
             "raw_track_count": 0,
             "instance_count": 0,

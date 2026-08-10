@@ -491,6 +491,93 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertEqual(plan, ([0, 1, 2, 4], [0.0, 0.1, 0.9, 2.4]))
         probe.assert_called_once()
 
+    def test_vggt_geometry_returns_canonical_timestamps_aligned_with_sampled_frames(self):
+        class FakeFrames:
+            shape = (3, 3, 8, 8)
+
+            def to(self, _device):
+                return self
+
+        class FakeModel:
+            @classmethod
+            def from_pretrained(cls, _path):
+                return cls()
+
+            def to(self, _device):
+                return self
+
+        torch_module = types.ModuleType("torch")
+        torch_module.cuda = types.SimpleNamespace(
+            is_available=lambda: True,
+            empty_cache=lambda: None,
+        )
+        vggt_package = types.ModuleType("vggt")
+        vggt_package.__path__ = []
+        vggt_models_package = types.ModuleType("vggt.models")
+        vggt_models_package.__path__ = []
+        vggt_model_module = types.ModuleType("vggt.models.vggt")
+        vggt_model_module.VGGT = FakeModel
+        src_package = types.ModuleType("src")
+        src_package.__path__ = []
+        src_utils_module = types.ModuleType("src.utils")
+        src_utils_module.load_video_frames = lambda _path, _max_frames: FakeFrames()
+        src_predict_module = types.ModuleType("src.vggt_predict")
+        src_predict_module.vggt_predict = lambda _frames, _model: {
+            "world_points": np.zeros((3, 8, 8, 3), dtype=np.float32),
+        }
+        runtime_modules = {
+            "torch": torch_module,
+            "vggt": vggt_package,
+            "vggt.models": vggt_models_package,
+            "vggt.models.vggt": vggt_model_module,
+            "src": src_package,
+            "src.utils": src_utils_module,
+            "src.vggt_predict": src_predict_module,
+        }
+        sampled_indices = [0, 17, 51]
+        sampled_timestamps = [0.0, 0.3333334, 1.7000006]
+
+        with patch.dict(sys.modules, runtime_modules), patch.object(
+            stage2,
+            "_materialize_video",
+            return_value=Path("source.mp4"),
+        ), patch.object(stage2, "_ensure_ras_installed"), patch.object(
+            stage2,
+            "_ensure_ras_on_path",
+            return_value=Path("/runtime/ReplicateAnyScene"),
+        ), patch.object(
+            stage2,
+            "_verified_checkout_revision",
+            return_value=stage2.DEFAULT_VGGT_REVISION,
+        ), patch.object(stage2, "_link_models_dir"), patch.object(
+            stage2,
+            "_source_frame_plan",
+            return_value=(sampled_indices, sampled_timestamps),
+        ) as source_frame_plan, patch.object(
+            stage2,
+            "_artifact_exports_enabled",
+            return_value=False,
+        ), patch.object(stage2, "_artifact_manifest", return_value={}), patch.object(
+            stage2,
+            "_artifact_delivery_error",
+            return_value=None,
+        ):
+            result = stage2.run_stage2_geometry({
+                "categories": ["chair"],
+                "max_frames": 3,
+            })
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["frames_used"], 3)
+        self.assertEqual(result["source_frame_indices"], sampled_indices)
+        self.assertEqual(result["source_frame_timestamps"], [0.0, 0.333333, 1.700001])
+        self.assertEqual(
+            len(result["source_frame_timestamps"]),
+            len(result["source_frame_indices"]),
+        )
+        self.assertEqual(len(result["source_frame_timestamps"]), result["frames_used"])
+        source_frame_plan.assert_called_once_with(Path("source.mp4"), 3)
+
     def test_rejects_unknown_mode_before_model_bootstrap(self):
         result = stage2.run_stage2(
             {"mode": "typo", "video_b64": "eA==", "categories": ["chair"], "max_frames": 8}
