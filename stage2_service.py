@@ -32,6 +32,14 @@ from typing import Any
 from urllib.parse import urlparse
 
 from artifact_contract import GLB_MAX_BYTES
+from best_view import (
+    BEST_VIEW_JSON_NAME,
+    BEST_VIEW_MAX_CANDIDATE_FRAMES,
+    BEST_VIEW_MAX_INSTANCES,
+    BEST_VIEW_SCHEMA,
+    build_best_view_report,
+    decode_rle,
+)
 from object_catalog import (
     OBJECT_CATALOG_JSON_NAME,
     OBJECT_CATALOG_VERSION,
@@ -114,6 +122,36 @@ VGGT_OMEGA_CONFIDENCE_PERCENTILE = 50.0
 VGGT_OMEGA_PROVENANCE_LEVEL = "hosted_unattested"
 _VGGT_OMEGA_EVENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _GLB_JSON_CHUNK = 0x4E4F534A
+# Best view runs as two RunPod legs around one fal segmentation leg.
+# The geometry leg exports what the scorer needs; the score leg is CPU-only.
+BEST_VIEW_GEOMETRY_ANALYSIS_TYPE = "best_view_geometry_v1"
+BEST_VIEW_SCORE_ANALYSIS_TYPE = "best_view_score_v1"
+BEST_VIEW_MAX_FRAMES = BEST_VIEW_MAX_CANDIDATE_FRAMES
+BEST_VIEW_GEOMETRY_INPUTS_NAME = "geometry_inputs.npz"
+BEST_VIEW_GEOMETRY_INPUTS_SCHEMA = "palatial.geometry_inputs.v1"
+BEST_VIEW_SAMPLED_CLIP_NAME = "sampled_clip.mp4"
+BEST_VIEW_SAMPLED_CLIP_FPS = 6
+BEST_VIEW_SAMPLED_CLIP_CRF = 12
+BEST_VIEW_GEOMETRY_ARTIFACT_NAMES = (
+    BEST_VIEW_GEOMETRY_INPUTS_NAME,
+    BEST_VIEW_SAMPLED_CLIP_NAME,
+)
+BEST_VIEW_GEOMETRY_REQUIRED_ARTIFACTS = (
+    *BEST_VIEW_GEOMETRY_ARTIFACT_NAMES,
+    "point_cloud.glb",
+)
+BEST_VIEW_SCORE_ARTIFACT_NAMES = (BEST_VIEW_JSON_NAME,)
+BEST_VIEW_MAX_GEOMETRY_INPUT_BYTES = 64 * 1024 * 1024
+BEST_VIEW_MAX_MASK_DOCUMENT_BYTES = 16 * 1024 * 1024
+BEST_VIEW_MAX_MASK_DOCUMENTS = 8
+BEST_VIEW_MAX_OBJECTS_PER_FRAME = 64
+BEST_VIEW_MAX_TRACKS_PER_CATEGORY = 256
+BEST_VIEW_MAX_MODEL_FRAME_DIMENSION = 4_096
+# float16 depth quantization alone perturbs the point map by roughly 0.05%.
+# Anything past 2% means the exported arrays are not a faithful stand-in for
+# the model's own world points and the scores would not be the model's scores.
+BEST_VIEW_RECONSTRUCTION_TOLERANCE = 0.02
+BEST_VIEW_RECONSTRUCTION_POLICY = "vggt_world_points_round_trip_v1"
 ARTIFACT_MEDIA_TYPES = {
     "point_cloud.glb": "model/gltf-binary",
     "point_cloud.ply": "application/octet-stream",
@@ -121,6 +159,9 @@ ARTIFACT_MEDIA_TYPES = {
     "camera_intrinsics.json": "application/json",
     OBJECT_CATALOG_JSON_NAME: "application/json",
     OBJECT_CROPS_ATLAS_NAME: "image/jpeg",
+    BEST_VIEW_GEOMETRY_INPUTS_NAME: "application/octet-stream",
+    BEST_VIEW_SAMPLED_CLIP_NAME: "video/mp4",
+    BEST_VIEW_JSON_NAME: "application/json",
 }
 REQUIRED_ARTIFACTS = {
     "geometry": ("point_cloud.glb",),
@@ -137,14 +178,20 @@ RUNPOD_ANALYSIS_TYPE_MODES = {
     OBJECT_CATALOG_TRANSPORT_CANARY_ANALYSIS_TYPE: "dry_run",
     "geometry_vggt_1b": "geometry",
     VGGT_OMEGA_ANALYSIS_TYPE: "geometry",
+    BEST_VIEW_GEOMETRY_ANALYSIS_TYPE: "geometry",
     "dedup_ras_vggt_sam3": "full",
     SCENE_PARSE_CATALOG_ANALYSIS_TYPE: "full",
+    BEST_VIEW_SCORE_ANALYSIS_TYPE: "full",
 }
 NON_RUNPOD_ANALYSIS_TYPES = {
     "mask_sam3": "route it to the fal SAM 3 adapter",
     "mask_sam31": "route it to the fal SAM 3.1 adapter",
 }
-VGGT_1B_ANALYSIS_TYPES = frozenset({"geometry_vggt_1b", "dedup_ras_vggt_sam3"})
+VGGT_1B_ANALYSIS_TYPES = frozenset({
+    "geometry_vggt_1b",
+    "dedup_ras_vggt_sam3",
+    BEST_VIEW_GEOMETRY_ANALYSIS_TYPE,
+})
 _PROCESS_INITIALIZATION_LOCK = threading.Lock()
 _VERIFIED_MODEL_FILE_CACHE: dict[str, tuple[Any, ...]] = {}
 
@@ -3056,6 +3103,11 @@ def _resolve_object_catalog_transport_canary(
 def _required_artifacts(payload: dict[str, Any] | None) -> tuple[str, ...]:
     if _object_catalog_transport_canary(payload):
         return OBJECT_CATALOG_ARTIFACTS
+    analysis_type = (payload or {}).get("analysis_type")
+    if analysis_type == BEST_VIEW_GEOMETRY_ANALYSIS_TYPE:
+        return BEST_VIEW_GEOMETRY_REQUIRED_ARTIFACTS
+    if analysis_type == BEST_VIEW_SCORE_ANALYSIS_TYPE:
+        return BEST_VIEW_SCORE_ARTIFACT_NAMES
     mode = str((payload or {}).get("mode") or "")
     required = REQUIRED_ARTIFACTS.get(mode, ())
     if _object_catalog_negotiated(payload):
@@ -3072,6 +3124,11 @@ def _artifact_manifest(out_dir: Path, work: Path, payload: dict[str, Any] | None
         or _object_catalog_transport_canary(payload)
     ):
         allowed_artifacts.difference_update(OBJECT_CATALOG_ARTIFACTS)
+    analysis_type = (payload or {}).get("analysis_type")
+    if analysis_type != BEST_VIEW_GEOMETRY_ANALYSIS_TYPE:
+        allowed_artifacts.difference_update(BEST_VIEW_GEOMETRY_ARTIFACT_NAMES)
+    if analysis_type != BEST_VIEW_SCORE_ANALYSIS_TYPE:
+        allowed_artifacts.difference_update(BEST_VIEW_SCORE_ARTIFACT_NAMES)
     files = sorted(
         p.name
         for p in out_dir.iterdir()
@@ -3522,6 +3579,432 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
                 {"id": "vggt", "name": "VGGT geometry", "status": "ok", "ms": timings.get("vggt")},
                 {"id": "sam", "name": "SAM3", "status": "skipped_geometry_mode"},
                 {"id": "dedup", "name": "Spatial dedup", "status": "skipped_geometry_mode"},
+                {
+                    "id": "artifact_delivery",
+                    "name": "Artifact delivery",
+                    "status": "error" if delivery_error else "ok",
+                    "ms": timings.get("artifact_delivery"),
+                },
+            ],
+        }
+        if delivery_error:
+            response.update({"status": "error", **delivery_error})
+        return response
+    except Exception as exc:
+        return {
+            "status": "error",
+            "mode": "geometry",
+            "error": str(exc),
+            "timings_ms": timings,
+        }
+    finally:
+        if os.environ.get("STAGE2_KEEP_WORK") != "1":
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def _point_map_reconstruction_accuracy(
+    reconstructed: Any,
+    world_points: Any,
+    valid: Any,
+) -> dict[str, Any]:
+    """Measure how faithfully the exported arrays reproduce VGGT's point map."""
+    import numpy as np
+
+    record: dict[str, Any] = {
+        "policy": BEST_VIEW_RECONSTRUCTION_POLICY,
+        "tolerance": BEST_VIEW_RECONSTRUCTION_TOLERANCE,
+        "valid_pixel_count": int(np.count_nonzero(valid)),
+        "rms_error": None,
+        "max_abs_error": None,
+        "scene_scale": None,
+        "relative_rms_error": None,
+        "verified": False,
+    }
+    if record["valid_pixel_count"] <= 0:
+        return record
+    reference = np.asarray(world_points, dtype=np.float64)[valid]
+    difference = np.asarray(reconstructed, dtype=np.float64)[valid] - reference
+    if not (np.isfinite(reference).all() and np.isfinite(difference).all()):
+        return record
+    rms_error = float(np.sqrt(np.mean(np.sum(np.square(difference), axis=-1))))
+    spread = reference - reference.mean(axis=0)
+    scene_scale = float(np.sqrt(np.mean(np.sum(np.square(spread), axis=-1))))
+    record["rms_error"] = round(rms_error, 9)
+    record["max_abs_error"] = round(float(np.max(np.abs(difference))), 9)
+    record["scene_scale"] = round(scene_scale, 9)
+    if not (math.isfinite(scene_scale) and scene_scale > 0):
+        return record
+    relative = rms_error / scene_scale
+    if not math.isfinite(relative):
+        return record
+    record["relative_rms_error"] = round(relative, 9)
+    record["verified"] = relative <= BEST_VIEW_RECONSTRUCTION_TOLERANCE
+    return record
+
+
+def _export_best_view_geometry_inputs(
+    pred: dict[str, Any],
+    destination: Path,
+    *,
+    source_frame_indices: list[int],
+    source_frame_timestamps: list[float],
+    unproject_fn: Any,
+) -> dict[str, Any]:
+    """Write the compact scorer inputs and prove they rebuild the model points.
+
+    Depth plus cameras is roughly six times smaller than the raw world point
+    map, but it is only usable if the unpatched upstream unprojection turns it
+    back into the point map VGGT actually produced.  That round trip is checked
+    here and the run fails when it does not hold.
+    """
+    import numpy as np
+
+    depths = np.asarray(pred["depths"], dtype=np.float32)
+    if depths.ndim == 4 and depths.shape[-1] == 1:
+        depths = depths[..., 0]
+    if depths.ndim != 3 or depths.shape[0] <= 0:
+        raise RuntimeError("VGGT depth maps are not shaped (S,H,W)")
+    frame_count, height, width = (int(value) for value in depths.shape)
+
+    world_points = np.asarray(pred["world_points"], dtype=np.float32)
+    if world_points.shape != (frame_count, height, width, 3):
+        raise RuntimeError("VGGT world points do not match the exported depth maps")
+
+    extrinsics = np.asarray(pred["extrinsics"], dtype=np.float32)
+    if extrinsics.shape == (frame_count, 4, 4):
+        extrinsics = np.ascontiguousarray(extrinsics[:, :3, :])
+    if extrinsics.shape != (frame_count, 3, 4):
+        raise RuntimeError("VGGT extrinsics are not shaped (S,3,4) or (S,4,4)")
+
+    intrinsic = np.asarray(pred["intrinsic"], dtype=np.float32)
+    if intrinsic.shape == (3, 3):
+        # The upstream wrapper collapses VGGT's per-frame intrinsics to one
+        # scene intrinsic and uses that everywhere downstream. Export the same
+        # camera it uses, then verify the round trip below.
+        intrinsics = np.repeat(intrinsic[None, ...], frame_count, axis=0)
+    elif intrinsic.shape == (frame_count, 3, 3):
+        intrinsics = intrinsic
+    else:
+        raise RuntimeError("VGGT intrinsics are not shaped (3,3) or (S,3,3)")
+
+    if not (
+        np.isfinite(depths).all()
+        and np.isfinite(extrinsics).all()
+        and np.isfinite(intrinsics).all()
+    ):
+        raise RuntimeError("VGGT geometry inputs contain non-finite values")
+    if len(source_frame_indices) != frame_count or len(source_frame_timestamps) != frame_count:
+        raise RuntimeError("Source video sampled-frame evidence is not aligned.")
+
+    quantized = depths.astype(np.float16)
+    dequantized = quantized.astype(np.float32)
+    reconstructed = np.asarray(
+        unproject_fn(dequantized[..., None], extrinsics, intrinsics),
+        dtype=np.float32,
+    )
+    if reconstructed.shape != world_points.shape:
+        raise RuntimeError("reconstructed point map does not match the VGGT point map shape")
+    reconstruction = _point_map_reconstruction_accuracy(
+        reconstructed,
+        world_points,
+        dequantized > 0,
+    )
+    if not reconstruction["verified"]:
+        raise RuntimeError(
+            "exported geometry inputs do not reproduce the VGGT point map within "
+            f"{BEST_VIEW_RECONSTRUCTION_TOLERANCE:.3f} relative RMS"
+        )
+
+    temporary = destination.with_name(f".{destination.stem}.tmp.npz")
+    temporary.unlink(missing_ok=True)
+    try:
+        np.savez_compressed(
+            temporary,
+            depth=quantized,
+            intrinsics=intrinsics,
+            extrinsics=extrinsics,
+            source_frame_indices=np.asarray(source_frame_indices, dtype=np.int64),
+            source_frame_timestamps=np.asarray(source_frame_timestamps, dtype=np.float64),
+            model_frame_hw=np.asarray([height, width], dtype=np.int64),
+            schema=np.array(BEST_VIEW_GEOMETRY_INPUTS_SCHEMA.encode("ascii")),
+        )
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {
+        "artifact_name": BEST_VIEW_GEOMETRY_INPUTS_NAME,
+        "schema": BEST_VIEW_GEOMETRY_INPUTS_SCHEMA,
+        "frame_count": frame_count,
+        "model_frame_width": width,
+        "model_frame_height": height,
+        "depth_dtype": "float16",
+        "camera_dtype": "float32",
+        "size_bytes": destination.stat().st_size,
+        "reconstruction": reconstruction,
+    }
+
+
+def _encode_sampled_clip(colors: Any, destination: Path) -> dict[str, Any]:
+    """Encode the exact VGGT model frames as the clip fal will segment.
+
+    Encoding the model frames rather than the source video is what makes a
+    returned ``frame_index`` identical to the sampled frame rank and makes the
+    mask resolution identical to the point map resolution.  The frame count is
+    re-probed here so a silent encoder drop cannot break that identity.
+    """
+    import subprocess
+
+    import numpy as np
+
+    frames = np.asarray(colors)
+    if frames.ndim != 4 or frames.shape[-1] != 3 or frames.shape[0] <= 0:
+        raise RuntimeError("sampled clip requires model colors shaped (S,H,W,3)")
+    if frames.dtype != np.uint8:
+        frames = np.clip(frames, 0, 255).astype(np.uint8)
+    frame_count, height, width = (int(value) for value in frames.shape[:3])
+    if height % 2 or width % 2:
+        # yuv420p needs even dimensions, and padding would break the
+        # mask-resolution equality every later alignment check depends on.
+        raise RuntimeError("model frames must have even dimensions to encode the sampled clip")
+
+    destination.unlink(missing_ok=True)
+    try:
+        completed = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-s",
+                f"{width}x{height}",
+                "-r",
+                str(BEST_VIEW_SAMPLED_CLIP_FPS),
+                "-i",
+                "-",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                str(BEST_VIEW_SAMPLED_CLIP_CRF),
+                "-pix_fmt",
+                "yuv420p",
+                # All-intra with no reordering keeps every frame exactly
+                # seekable, which the viewer relies on for per-frame thumbnails.
+                "-g",
+                "1",
+                "-bf",
+                "0",
+                "-vsync",
+                "passthrough",
+                "-movflags",
+                "+faststart",
+                "-video_track_timescale",
+                "90000",
+                str(destination),
+            ],
+            input=np.ascontiguousarray(frames).tobytes(),
+            check=False,
+            capture_output=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        destination.unlink(missing_ok=True)
+        raise RuntimeError("sampled clip encoding failed") from exc
+    if completed.returncode != 0 or not destination.is_file() or destination.stat().st_size <= 0:
+        destination.unlink(missing_ok=True)
+        raise RuntimeError("sampled clip encoding failed")
+
+    encoded_frames = _probe_video_frame_count(destination)
+    if encoded_frames != frame_count:
+        destination.unlink(missing_ok=True)
+        raise RuntimeError(
+            "sampled clip frame count does not match the model frames "
+            f"({encoded_frames} != {frame_count}); mask frame indices would be unverifiable"
+        )
+    return {
+        "artifact_name": BEST_VIEW_SAMPLED_CLIP_NAME,
+        "source": "vggt_model_frames",
+        "frame_count": frame_count,
+        "fps": BEST_VIEW_SAMPLED_CLIP_FPS,
+        "codec": "h264",
+        "crf": BEST_VIEW_SAMPLED_CLIP_CRF,
+        "all_intra": True,
+        "width": width,
+        "height": height,
+        "size_bytes": destination.stat().st_size,
+    }
+
+
+def run_best_view_geometry(payload: dict[str, Any]) -> dict[str, Any]:
+    """Best-view leg A: VGGT geometry plus the scorer inputs and model clip."""
+    t_all = time.time()
+    if not _durable_artifact_delivery_enabled(payload):
+        return {
+            "status": "error",
+            "mode": "geometry",
+            "error_code": "artifact_delivery_unavailable",
+            "error": (
+                "Best-view geometry requires durable artifact delivery; "
+                "provide an upload ticket or configure persistent artifact storage."
+            ),
+            "timings_ms": {"total": int((time.time() - t_all) * 1000)},
+        }
+
+    work = Path(tempfile.mkdtemp(prefix="ras-best-view-geometry-"))
+    out_dir = work / "output"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timings: dict[str, int] = {}
+    try:
+        max_frames = int(payload["max_frames"])
+        if max_frames > BEST_VIEW_MAX_FRAMES:
+            raise RuntimeError(
+                f"{BEST_VIEW_GEOMETRY_ANALYSIS_TYPE} accepts at most "
+                f"{BEST_VIEW_MAX_FRAMES} frames"
+            )
+
+        t0 = time.time()
+        video_path = _materialize_standard_video(payload, work)
+        timings["download"] = int((time.time() - t0) * 1000)
+
+        t0 = time.time()
+        (
+            sampled_image_paths,
+            source_frame_indices,
+            source_frame_timestamps,
+            _source_duration_seconds,
+        ) = _prepare_standard_vggt_sample(video_path, work, max_frames)
+        timings["sample"] = int((time.time() - t0) * 1000)
+
+        _ensure_ras_installed(require_sam3=False)
+        ras_root = _ensure_ras_on_path()
+        vggt_source_revision = _verified_checkout_revision(ras_root / "vggt", VGGT_REVISION)
+        _link_models_dir(ras_root)
+
+        import gc
+        import torch
+        from vggt.models.vggt import VGGT
+        from vggt.utils.geometry import unproject_depth_map_to_point_map
+        from src.vggt_predict import vggt_predict
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("best-view geometry requires a CUDA GPU")
+        device = "cuda"
+
+        t0 = time.time()
+        frames = _load_preprocessed_sampled_images(sampled_image_paths).to(device)
+        n_frames = int(frames.shape[0])
+        if not (
+            n_frames
+            == len(source_frame_indices)
+            == len(source_frame_timestamps)
+        ):
+            raise RuntimeError("Source video sampled-frame evidence is not aligned.")
+        timings["sample"] += int((time.time() - t0) * 1000)
+
+        t0 = time.time()
+        model = VGGT.from_pretrained("./models/VGGT").to(device)
+        pred = vggt_predict(frames, model)
+        model.to("cpu")
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+        timings["vggt"] = int((time.time() - t0) * 1000)
+
+        t0 = time.time()
+        export_meta = _export_vggt_artifacts(
+            pred,
+            out_dir,
+            coordinate_system="vggt_first_camera",
+        )
+        geometry_inputs = _export_best_view_geometry_inputs(
+            pred,
+            out_dir / BEST_VIEW_GEOMETRY_INPUTS_NAME,
+            source_frame_indices=source_frame_indices,
+            source_frame_timestamps=source_frame_timestamps,
+            unproject_fn=unproject_depth_map_to_point_map,
+        )
+        timings["artifact_export"] = int((time.time() - t0) * 1000)
+
+        t0 = time.time()
+        sampled_clip = _encode_sampled_clip(
+            pred["colors"],
+            out_dir / BEST_VIEW_SAMPLED_CLIP_NAME,
+        )
+        timings["sampled_clip"] = int((time.time() - t0) * 1000)
+        if (
+            sampled_clip["frame_count"] != n_frames
+            or geometry_inputs["frame_count"] != n_frames
+            or sampled_clip["width"] != geometry_inputs["model_frame_width"]
+            or sampled_clip["height"] != geometry_inputs["model_frame_height"]
+        ):
+            raise RuntimeError(
+                "sampled clip and geometry inputs do not describe the same model frames"
+            )
+
+        t0 = time.time()
+        artifacts = _artifact_manifest(out_dir, work, payload)
+        timings["artifact_delivery"] = int((time.time() - t0) * 1000)
+        timings["total"] = int((time.time() - t_all) * 1000)
+        delivery_error = _artifact_delivery_error(payload, artifacts)
+        response = {
+            "status": "ok",
+            "mode": "geometry",
+            "implementation": "ReplicateAnyScene VGGT geometry export for best-view scoring",
+            "upstream_revision": RAS_REVISION,
+            "frames_used": n_frames,
+            "source_frame_indices": source_frame_indices,
+            "source_frame_timestamps": source_frame_timestamps,
+            "categories": payload["categories"],
+            "raw_track_count": 0,
+            "instance_count": 0,
+            "instances": [],
+            "geometry": {
+                "backend": "vggt",
+                "device": device,
+                "model_id": _vggt_model_id(),
+                "source_revision": vggt_source_revision,
+                "license_scope": _vggt_license_scope(),
+                "world_points_shape": list(pred["world_points"].shape),
+                "sam3_required": False,
+                "artifact_export": export_meta,
+            },
+            "sam": {
+                "backend": "not_run",
+                "reason": "best-view segmentation runs on fal against the sampled clip",
+            },
+            "best_view": {
+                "leg": "geometry",
+                "coordinate_system": "vggt_first_camera",
+                "model_frame_width": geometry_inputs["model_frame_width"],
+                "model_frame_height": geometry_inputs["model_frame_height"],
+                "sampled_clip": sampled_clip,
+                "geometry_inputs": geometry_inputs,
+            },
+            "artifacts": artifacts,
+            "timings_ms": timings,
+            "pipeline": [
+                {"id": "intake", "name": "Video intake", "status": "ok", "ms": timings.get("download")},
+                {"id": "sample_frames", "name": "Frame sampling", "status": "ok", "ms": timings.get("sample")},
+                {"id": "vggt", "name": "VGGT geometry", "status": "ok", "ms": timings.get("vggt")},
+                {
+                    "id": "geometry_inputs",
+                    "name": "Scorer geometry export",
+                    "status": "ok",
+                    "ms": timings.get("artifact_export"),
+                },
+                {
+                    "id": "sampled_clip",
+                    "name": "Model frame clip",
+                    "status": "ok",
+                    "ms": timings.get("sampled_clip"),
+                },
+                {"id": "sam", "name": "SAM3", "status": "skipped_fal_leg"},
                 {
                     "id": "artifact_delivery",
                     "name": "Artifact delivery",
@@ -4470,6 +4953,44 @@ def _attach_success_provenance(
             or geometry.get("execution_orchestrator") != "runpod"
         ):
             return provenance_error("VGGT-Omega")
+    if analysis_type == BEST_VIEW_GEOMETRY_ANALYSIS_TYPE:
+        # Alignment links 2 and 6: the clip fal will segment must carry exactly
+        # the model frames the scorer will index into, and both must be
+        # delivered durably before the edge is allowed to dispatch anything.
+        best_view = result.get("best_view")
+        clip = best_view.get("sampled_clip") if isinstance(best_view, dict) else None
+        inputs = best_view.get("geometry_inputs") if isinstance(best_view, dict) else None
+        reconstruction = inputs.get("reconstruction") if isinstance(inputs, dict) else None
+        artifacts = result.get("artifacts")
+        frames_used = result.get("frames_used")
+        if (
+            type(frames_used) is not int
+            or not 2 <= frames_used <= BEST_VIEW_MAX_FRAMES
+            or not isinstance(best_view, dict)
+            or best_view.get("leg") != "geometry"
+            or best_view.get("coordinate_system") != "vggt_first_camera"
+            or type(best_view.get("model_frame_width")) is not int
+            or type(best_view.get("model_frame_height")) is not int
+            or not 0 < best_view["model_frame_width"] <= BEST_VIEW_MAX_MODEL_FRAME_DIMENSION
+            or not 0 < best_view["model_frame_height"] <= BEST_VIEW_MAX_MODEL_FRAME_DIMENSION
+            or not isinstance(clip, dict)
+            or clip.get("source") != "vggt_model_frames"
+            or clip.get("frame_count") != frames_used
+            or clip.get("fps") != BEST_VIEW_SAMPLED_CLIP_FPS
+            or clip.get("width") != best_view["model_frame_width"]
+            or clip.get("height") != best_view["model_frame_height"]
+            or not isinstance(inputs, dict)
+            or inputs.get("schema") != BEST_VIEW_GEOMETRY_INPUTS_SCHEMA
+            or inputs.get("frame_count") != frames_used
+            or inputs.get("model_frame_width") != best_view["model_frame_width"]
+            or inputs.get("model_frame_height") != best_view["model_frame_height"]
+            or not isinstance(reconstruction, dict)
+            or reconstruction.get("verified") is not True
+            or not isinstance(artifacts, dict)
+            or artifacts.get("complete") is not True
+            or artifacts.get("required_files") != list(BEST_VIEW_GEOMETRY_REQUIRED_ARTIFACTS)
+        ):
+            return provenance_error("best-view geometry")
     if analysis_type == "dedup_ras_vggt_sam3":
         sam = result.get("sam")
         if not isinstance(sam, dict) or (
@@ -4701,15 +5222,24 @@ def run_stage2(payload: dict[str, Any]) -> dict[str, Any]:
         return input_error("use 1-8 categories, each at most 64 characters")
     if max_frames < 2 or max_frames > 160:
         return input_error("max_frames must be an integer from 2 to 160")
+    if (
+        analysis_type == BEST_VIEW_GEOMETRY_ANALYSIS_TYPE
+        and max_frames > BEST_VIEW_MAX_FRAMES
+    ):
+        return input_error(
+            f"analysis_type {BEST_VIEW_GEOMETRY_ANALYSIS_TYPE} accepts at most "
+            f"{BEST_VIEW_MAX_FRAMES} frames so every visible frame can be scored"
+        )
     payload = {**payload, "mode": mode, "max_frames": max_frames, "categories": categories}
     if mode == "dry_run":
         result = run_stage2_dry(payload)
     elif mode == "geometry":
-        result = (
-            run_stage2_omega_geometry(payload)
-            if analysis_type == VGGT_OMEGA_ANALYSIS_TYPE
-            else run_stage2_geometry(payload)
-        )
+        if analysis_type == VGGT_OMEGA_ANALYSIS_TYPE:
+            result = run_stage2_omega_geometry(payload)
+        elif analysis_type == BEST_VIEW_GEOMETRY_ANALYSIS_TYPE:
+            result = run_best_view_geometry(payload)
+        else:
+            result = run_stage2_geometry(payload)
     else:
         result = run_stage2_full(payload)
     return _attach_success_provenance(

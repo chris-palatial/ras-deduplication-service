@@ -3,6 +3,7 @@ import hashlib
 import importlib
 import io
 import json
+import shutil
 import subprocess
 import struct
 import sys
@@ -13,6 +14,7 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
+from typing import Any
 from unittest.mock import ANY, patch
 
 import numpy as np
@@ -3171,6 +3173,415 @@ class VggtOmegaAdapterTest(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["error_code"], "artifact_delivery_unavailable")
         materialize.assert_not_called()
+
+
+def _best_view_prediction(frames: int, height: int, width: int):
+    """Synthetic VGGT output whose depth and cameras rebuild its point map."""
+    grid_y, grid_x = np.mgrid[:height, :width]
+    depths = np.zeros((frames, height, width), dtype=np.float32)
+    colors = np.zeros((frames, height, width, 3), dtype=np.uint8)
+    for frame_id in range(frames):
+        depths[frame_id] = 1.0 + 0.25 * frame_id + 0.01 * (grid_x + grid_y)
+        colors[frame_id, ..., 0] = (grid_x * 7 + frame_id * 11) % 256
+        colors[frame_id, ..., 1] = (grid_y * 5 + frame_id * 3) % 256
+    extrinsics = np.zeros((frames, 4, 4), dtype=np.float32)
+    extrinsics[:, 0, 0] = 1.0
+    extrinsics[:, 1, 1] = 1.0
+    extrinsics[:, 2, 2] = 1.0
+    extrinsics[:, 3, 3] = 1.0
+    for frame_id in range(frames):
+        extrinsics[frame_id, 0, 3] = 0.1 * frame_id
+    intrinsic = np.array(
+        [[float(width), 0.0, width / 2.0], [0.0, float(width), height / 2.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    return {
+        "colors": colors,
+        "depths": depths,
+        "extrinsics": extrinsics,
+        "intrinsic": intrinsic,
+        "world_points": np.zeros((frames, height, width, 3), dtype=np.float32),
+    }
+
+
+def _reference_unprojection(depth_map, extrinsics_cam, intrinsics_cam):
+    """Stand-in for the pinned upstream unprojection used by the geometry leg."""
+    depth = np.asarray(depth_map, dtype=np.float32)
+    if depth.ndim == 4:
+        depth = depth[..., 0]
+    frames, height, width = depth.shape
+    grid_y, grid_x = np.mgrid[:height, :width]
+    points = np.zeros((frames, height, width, 3), dtype=np.float32)
+    for frame_id in range(frames):
+        intrinsic = np.asarray(intrinsics_cam, dtype=np.float64)[frame_id]
+        extrinsic = np.asarray(extrinsics_cam, dtype=np.float64)[frame_id]
+        z = depth[frame_id].astype(np.float64)
+        x = (grid_x - intrinsic[0, 2]) / intrinsic[0, 0] * z
+        y = (grid_y - intrinsic[1, 2]) / intrinsic[1, 1] * z
+        camera = np.stack([x, y, z], axis=-1)
+        rotation = extrinsic[:3, :3]
+        translation = extrinsic[:3, 3]
+        points[frame_id] = (camera - translation) @ rotation
+    return points
+
+
+class BestViewGeometryLegTest(unittest.TestCase):
+    def _runtime_modules(self, prediction, unprojection):
+        class FakeFrames:
+            shape = (prediction["depths"].shape[0], 3, 8, 8)
+
+            def to(self, _device):
+                return self
+
+        class FakeModel:
+            @classmethod
+            def from_pretrained(cls, _path):
+                return cls()
+
+            def to(self, _device):
+                return self
+
+        torch_module = types.ModuleType("torch")
+        torch_module.cuda = types.SimpleNamespace(
+            is_available=lambda: True,
+            empty_cache=lambda: None,
+        )
+        vggt_package = types.ModuleType("vggt")
+        vggt_package.__path__ = []
+        vggt_models_package = types.ModuleType("vggt.models")
+        vggt_models_package.__path__ = []
+        vggt_model_module = types.ModuleType("vggt.models.vggt")
+        vggt_model_module.VGGT = FakeModel
+        vggt_utils_package = types.ModuleType("vggt.utils")
+        vggt_utils_package.__path__ = []
+        vggt_geometry_module = types.ModuleType("vggt.utils.geometry")
+        vggt_geometry_module.unproject_depth_map_to_point_map = unprojection
+        src_package = types.ModuleType("src")
+        src_package.__path__ = []
+        src_predict_module = types.ModuleType("src.vggt_predict")
+        src_predict_module.vggt_predict = lambda _frames, _model: prediction
+        return FakeFrames(), {
+            "torch": torch_module,
+            "vggt": vggt_package,
+            "vggt.models": vggt_models_package,
+            "vggt.models.vggt": vggt_model_module,
+            "vggt.utils": vggt_utils_package,
+            "vggt.utils.geometry": vggt_geometry_module,
+            "src": src_package,
+            "src.vggt_predict": src_predict_module,
+        }
+
+    def _run(self, out_root, *, frames=3, height=8, width=8, unprojection=None, **payload):
+        prediction = _best_view_prediction(frames, height, width)
+        prediction["world_points"] = _reference_unprojection(
+            prediction["depths"].astype(np.float16).astype(np.float32)[..., None],
+            prediction["extrinsics"][:, :3, :],
+            np.repeat(prediction["intrinsic"][None, ...], frames, axis=0),
+        )
+        fake_frames, runtime_modules = self._runtime_modules(
+            prediction, unprojection or _reference_unprojection
+        )
+        captured: dict[str, Any] = {}
+
+        def capture_manifest(out_dir, work, manifest_payload=None):
+            captured["out_dir"] = Path(out_dir)
+            captured["files"] = sorted(item.name for item in Path(out_dir).iterdir())
+            captured["required"] = list(stage2._required_artifacts(manifest_payload))
+            for name in captured["files"]:
+                shutil.copy2(Path(out_dir) / name, Path(out_root) / name)
+            return {
+                "durable": True,
+                "complete": True,
+                "files": captured["files"],
+                "required_files": captured["required"],
+                "receipts": [],
+                "errors": [],
+            }
+
+        with patch.dict(sys.modules, runtime_modules), patch.object(
+            stage2, "_materialize_standard_video", return_value=Path("source.mp4")
+        ), patch.object(stage2, "_ensure_ras_installed"), patch.object(
+            stage2, "_ensure_ras_on_path", return_value=Path("/runtime/ReplicateAnyScene")
+        ), patch.object(
+            stage2, "_verified_checkout_revision", return_value=stage2.DEFAULT_VGGT_REVISION
+        ), patch.object(stage2, "_link_models_dir"), patch.object(
+            stage2,
+            "_prepare_standard_vggt_sample",
+            return_value=(
+                [Path(f"sampled-{index}.jpg") for index in range(frames)],
+                list(range(0, 4 * frames, 4)),
+                [round(0.5 * index, 6) for index in range(frames)],
+                float(frames),
+            ),
+        ), patch.object(
+            stage2, "_load_preprocessed_sampled_images", return_value=fake_frames
+        ), patch.object(
+            stage2, "_export_vggt_artifacts", side_effect=self._write_glb
+        ), patch.object(stage2, "_artifact_manifest", side_effect=capture_manifest):
+            result = stage2.run_best_view_geometry({
+                "analysis_type": stage2.BEST_VIEW_GEOMETRY_ANALYSIS_TYPE,
+                "mode": "geometry",
+                "categories": ["chair"],
+                "max_frames": frames,
+                "upload": {"base": "https://edge.example", "runId": "r", "token": "t"},
+                **payload,
+            })
+        return result, captured
+
+    @staticmethod
+    def _write_glb(_pred, out_dir, **_kwargs):
+        (Path(out_dir) / "point_cloud.glb").write_bytes(b"glTF-stub")
+        return {"point_cloud_glb": True}
+
+    def test_exports_geometry_inputs_and_the_model_frame_clip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, captured = self._run(Path(tmp), frames=3, height=8, width=8)
+            archive = Path(tmp) / "geometry_inputs.npz"
+            clip = Path(tmp) / "sampled_clip.mp4"
+            with np.load(archive, allow_pickle=False) as data:
+                schema = data["schema"].item()
+                depth = data["depth"]
+                intrinsics = data["intrinsics"]
+                extrinsics = data["extrinsics"]
+                model_frame_hw = data["model_frame_hw"].tolist()
+                indices = data["source_frame_indices"].tolist()
+                timestamps = data["source_frame_timestamps"].tolist()
+            probed_frames = stage2._probe_video_frame_count(clip)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["frames_used"], 3)
+        self.assertEqual(schema, b"palatial.geometry_inputs.v1")
+        self.assertEqual(depth.dtype, np.float16)
+        self.assertEqual(depth.shape, (3, 8, 8))
+        self.assertEqual(intrinsics.shape, (3, 3, 3))
+        self.assertEqual(extrinsics.shape, (3, 3, 4))
+        self.assertEqual(model_frame_hw, [8, 8])
+        self.assertEqual(indices, [0, 4, 8])
+        self.assertEqual(timestamps, [0.0, 0.5, 1.0])
+        self.assertEqual(probed_frames, 3)
+        self.assertEqual(
+            captured["required"],
+            ["geometry_inputs.npz", "sampled_clip.mp4", "point_cloud.glb"],
+        )
+        self.assertEqual(
+            captured["files"],
+            ["geometry_inputs.npz", "point_cloud.glb", "sampled_clip.mp4"],
+        )
+        self.assertEqual(result["best_view"]["sampled_clip"]["frame_count"], 3)
+        self.assertEqual(result["best_view"]["sampled_clip"]["fps"], 6)
+        self.assertEqual(result["best_view"]["sampled_clip"]["source"], "vggt_model_frames")
+        self.assertEqual(result["best_view"]["model_frame_width"], 8)
+        self.assertEqual(result["best_view"]["model_frame_height"], 8)
+        self.assertEqual(
+            result["best_view"]["geometry_inputs"]["schema"],
+            "palatial.geometry_inputs.v1",
+        )
+        self.assertIs(
+            result["best_view"]["geometry_inputs"]["reconstruction"]["verified"], True
+        )
+        self.assertEqual(result["geometry"]["sam3_required"], False)
+        json.dumps(result)
+
+    def test_fails_when_the_exported_arrays_do_not_rebuild_the_point_map(self):
+        def drifted(depth_map, extrinsics_cam, intrinsics_cam):
+            return _reference_unprojection(depth_map, extrinsics_cam, intrinsics_cam) + 5.0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _captured = self._run(Path(tmp), unprojection=drifted)
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("do not reproduce the VGGT point map", result["error"])
+
+    def test_fails_when_the_encoded_clip_loses_a_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(stage2, "_probe_video_frame_count", return_value=2):
+                result, _captured = self._run(Path(tmp), frames=3)
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("sampled clip frame count does not match", result["error"])
+
+    def test_refuses_paid_work_without_durable_artifact_delivery(self):
+        with patch.dict(stage2.os.environ, {}, clear=True), patch.object(
+            stage2, "_materialize_standard_video"
+        ) as materialize:
+            result = stage2.run_best_view_geometry({
+                "analysis_type": stage2.BEST_VIEW_GEOMETRY_ANALYSIS_TYPE,
+                "mode": "geometry",
+                "categories": ["chair"],
+                "max_frames": 8,
+            })
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error_code"], "artifact_delivery_unavailable")
+        materialize.assert_not_called()
+
+
+class BestViewSampledClipTest(unittest.TestCase):
+    def test_encodes_every_model_frame_and_reprobes_the_count(self):
+        colors = np.zeros((5, 16, 24, 3), dtype=np.uint8)
+        for frame_id in range(5):
+            colors[frame_id, :, :, frame_id % 3] = 40 * frame_id
+
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "sampled_clip.mp4"
+            metadata = stage2._encode_sampled_clip(colors, destination)
+            probed = stage2._probe_video_frame_count(destination)
+
+        self.assertEqual(metadata["frame_count"], 5)
+        self.assertEqual(metadata["width"], 24)
+        self.assertEqual(metadata["height"], 16)
+        self.assertEqual(metadata["fps"], 6)
+        self.assertIs(metadata["all_intra"], True)
+        self.assertEqual(probed, 5)
+
+    def test_refuses_odd_dimensions_instead_of_padding_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(RuntimeError) as raised:
+                stage2._encode_sampled_clip(
+                    np.zeros((2, 15, 16, 3), dtype=np.uint8),
+                    Path(tmp) / "sampled_clip.mp4",
+                )
+
+        self.assertIn("even dimensions", str(raised.exception))
+
+    def test_rejects_colors_that_are_not_a_model_frame_stack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(RuntimeError):
+                stage2._encode_sampled_clip(
+                    np.zeros((4, 4, 3), dtype=np.uint8),
+                    Path(tmp) / "sampled_clip.mp4",
+                )
+
+
+class BestViewAnalysisRegistryTest(unittest.TestCase):
+    def test_geometry_analysis_type_requires_geometry_mode(self):
+        analysis_type, error = stage2._resolve_runpod_analysis_type(
+            {"analysis_type": stage2.BEST_VIEW_GEOMETRY_ANALYSIS_TYPE}, "full"
+        )
+
+        self.assertEqual(analysis_type, stage2.BEST_VIEW_GEOMETRY_ANALYSIS_TYPE)
+        self.assertIn("requires mode geometry", error)
+
+    def test_geometry_analysis_type_is_pinned_to_the_reviewed_vggt_source(self):
+        self.assertIn(
+            stage2.BEST_VIEW_GEOMETRY_ANALYSIS_TYPE, stage2.VGGT_1B_ANALYSIS_TYPES
+        )
+        with patch.object(stage2, "VGGT_REVISION", "0" * 40):
+            _analysis_type, error = stage2._resolve_runpod_analysis_type(
+                {"analysis_type": stage2.BEST_VIEW_GEOMETRY_ANALYSIS_TYPE}, "geometry"
+            )
+
+        self.assertIn("requires VGGT source", error)
+
+    def test_geometry_mode_routes_the_best_view_runner(self):
+        with patch.object(
+            stage2, "run_best_view_geometry", return_value={"status": "ok", "mode": "geometry"}
+        ) as runner, patch.object(stage2, "run_stage2_geometry") as standard, patch.object(
+            stage2, "_attach_success_provenance", side_effect=lambda result, **_kwargs: result
+        ):
+            stage2.run_stage2({
+                "analysis_type": stage2.BEST_VIEW_GEOMETRY_ANALYSIS_TYPE,
+                "mode": "geometry",
+                "video_b64": "eA==",
+                "categories": ["chair"],
+                "max_frames": 24,
+            })
+
+        runner.assert_called_once()
+        standard.assert_not_called()
+
+    def test_geometry_leg_rejects_more_frames_than_the_scorer_cap(self):
+        with patch.object(stage2, "run_best_view_geometry") as runner:
+            result = stage2.run_stage2({
+                "analysis_type": stage2.BEST_VIEW_GEOMETRY_ANALYSIS_TYPE,
+                "mode": "geometry",
+                "video_b64": "eA==",
+                "categories": ["chair"],
+                "max_frames": 25,
+            })
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("at most 24 frames", result["error"])
+        runner.assert_not_called()
+
+    def test_best_view_artifacts_are_scoped_to_their_analysis_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "output"
+            out_dir.mkdir()
+            for name in (
+                "point_cloud.glb",
+                "geometry_inputs.npz",
+                "sampled_clip.mp4",
+                "best_view.json",
+            ):
+                (out_dir / name).write_bytes(b"x")
+
+            geometry = stage2._artifact_manifest(
+                out_dir,
+                Path(tmp),
+                {"analysis_type": stage2.BEST_VIEW_GEOMETRY_ANALYSIS_TYPE, "mode": "geometry"},
+            )
+            score = stage2._artifact_manifest(
+                out_dir,
+                Path(tmp),
+                {"analysis_type": stage2.BEST_VIEW_SCORE_ANALYSIS_TYPE, "mode": "full"},
+            )
+            unrelated = stage2._artifact_manifest(
+                out_dir, Path(tmp), {"analysis_type": "geometry_vggt_1b", "mode": "geometry"}
+            )
+
+        self.assertEqual(
+            geometry["files"], ["geometry_inputs.npz", "point_cloud.glb", "sampled_clip.mp4"]
+        )
+        self.assertEqual(score["files"], ["best_view.json", "point_cloud.glb"])
+        self.assertEqual(unrelated["files"], ["point_cloud.glb"])
+
+    def test_provenance_rejects_a_clip_that_lost_a_model_frame(self):
+        def response(frame_count):
+            return {
+                "status": "ok",
+                "mode": "geometry",
+                "frames_used": 3,
+                "best_view": {
+                    "leg": "geometry",
+                    "coordinate_system": "vggt_first_camera",
+                    "model_frame_width": 8,
+                    "model_frame_height": 8,
+                    "sampled_clip": {
+                        "source": "vggt_model_frames",
+                        "frame_count": frame_count,
+                        "fps": 6,
+                        "width": 8,
+                        "height": 8,
+                    },
+                    "geometry_inputs": {
+                        "schema": "palatial.geometry_inputs.v1",
+                        "frame_count": 3,
+                        "model_frame_width": 8,
+                        "model_frame_height": 8,
+                        "reconstruction": {"verified": True},
+                    },
+                },
+                "geometry": {
+                    "model_id": stage2.DEFAULT_VGGT_MODEL_ID,
+                    "source_revision": stage2.DEFAULT_VGGT_REVISION,
+                },
+                "artifacts": {
+                    "complete": True,
+                    "required_files": list(stage2.BEST_VIEW_GEOMETRY_REQUIRED_ARTIFACTS),
+                },
+            }
+
+        accepted = stage2._attach_success_provenance(
+            response(3), mode="geometry", analysis_type=stage2.BEST_VIEW_GEOMETRY_ANALYSIS_TYPE
+        )
+        rejected = stage2._attach_success_provenance(
+            response(2), mode="geometry", analysis_type=stage2.BEST_VIEW_GEOMETRY_ANALYSIS_TYPE
+        )
+
+        self.assertEqual(accepted["status"], "ok")
+        self.assertEqual(rejected["status"], "error")
+        self.assertIn("best-view geometry", rejected["error"])
 
 
 if __name__ == "__main__":
