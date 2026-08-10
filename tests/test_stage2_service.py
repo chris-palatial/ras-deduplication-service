@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import importlib
 import io
 import json
@@ -12,7 +13,7 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import numpy as np
 import requests
@@ -491,6 +492,120 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertEqual(plan, ([0, 1, 2, 4], [0.0, 0.1, 0.9, 2.4]))
         probe.assert_called_once()
 
+    def test_standard_vggt_sample_uses_exact_uniform_full_clip_selection(self):
+        decoded_timestamps = [index / 30 for index in range(327)]
+        expected_indices = np.linspace(0, 326, 24).astype(int).tolist()
+        expected_timestamps = [round(decoded_timestamps[index], 6) for index in expected_indices]
+        expected_paths = [Path(f"frame-{index:06d}.jpg") for index in range(1, 25)]
+
+        with patch.object(
+            stage2,
+            "_probe_bounded_decoded_stream",
+            return_value=(327, 3840, 2160),
+        ) as probe, patch.object(
+            stage2,
+            "_bounded_decoded_timeline",
+            return_value=(decoded_timestamps, 10.9),
+        ) as timeline, patch.object(
+            stage2,
+            "_extract_bounded_sampled_images",
+            return_value=expected_paths,
+        ) as extract:
+            paths, indices, timestamps, duration = stage2._prepare_standard_vggt_sample(
+                Path("source.mp4"),
+                Path("/work"),
+                24,
+            )
+
+        self.assertEqual(paths, expected_paths)
+        self.assertEqual(indices, expected_indices)
+        self.assertEqual(timestamps, expected_timestamps)
+        self.assertEqual(duration, 10.9)
+        edge_indices, _edge_timestamps = stage2._upstream_uniform_decoded_frame_plan(
+            [float(index) for index in range(31)],
+            23,
+        )
+        self.assertEqual(
+            edge_indices,
+            np.linspace(0, 30, 23).astype(int).tolist(),
+        )
+        self.assertEqual(edge_indices[11], 14)
+        probe.assert_called_once_with(
+            Path("source.mp4"),
+            max_decoded_frames=stage2.STANDARD_MAX_DECODED_FRAMES,
+            max_source_dimension=stage2.STANDARD_MAX_SOURCE_DIMENSION,
+            max_source_pixels=stage2.STANDARD_MAX_SOURCE_PIXELS,
+        )
+        timeline.assert_called_once_with(
+            Path("source.mp4"),
+            decoded_frame_count=327,
+            max_source_pixels=stage2.STANDARD_MAX_SOURCE_PIXELS,
+            max_duration_seconds=stage2.STANDARD_MAX_VIDEO_DURATION_SECONDS,
+        )
+        extract.assert_called_once_with(
+            Path("source.mp4"),
+            Path("/work"),
+            expected_indices,
+            max_frames=stage2.STANDARD_MAX_FRAMES,
+            max_source_pixels=stage2.STANDARD_MAX_SOURCE_PIXELS,
+            decode_max_long_edge=stage2.STANDARD_DECODE_MAX_LONG_EDGE,
+            max_sampled_disk_bytes=stage2.STANDARD_MAX_SAMPLED_DISK_BYTES,
+        )
+
+    def test_standard_decoded_timeline_rejects_sources_over_60_seconds(self):
+        frames = {
+            "frames": [
+                {
+                    "best_effort_timestamp_time": "0.0",
+                    "duration_time": "0.02",
+                },
+                {
+                    "best_effort_timestamp_time": "59.99",
+                    "duration_time": "0.02",
+                },
+            ]
+        }
+        with patch.object(stage2, "_ffprobe_json", return_value=frames), self.assertRaisesRegex(
+            RuntimeError,
+            "60 second limit",
+        ):
+            stage2._bounded_decoded_timeline(
+                Path("source.mp4"),
+                decoded_frame_count=2,
+                max_source_pixels=stage2.STANDARD_MAX_SOURCE_PIXELS,
+                max_duration_seconds=stage2.STANDARD_MAX_VIDEO_DURATION_SECONDS,
+            )
+
+    def test_bounded_sample_extractor_enforces_selected_jpeg_byte_cap(self):
+        def fake_ffmpeg(command, **_kwargs):
+            output_dir = Path(command[-1]).parent
+            for index in range(1, 4):
+                (output_dir / f"frame-{index:06d}.jpg").write_bytes(b"jpeg")
+            return types.SimpleNamespace(returncode=0)
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "subprocess.run",
+            side_effect=fake_ffmpeg,
+        ) as run, self.assertRaisesRegex(RuntimeError, "temporary disk limit"):
+            stage2._extract_bounded_sampled_images(
+                Path(tmp) / "source.mp4",
+                Path(tmp),
+                [0, 4, 9],
+                max_frames=stage2.STANDARD_MAX_FRAMES,
+                max_source_pixels=stage2.STANDARD_MAX_SOURCE_PIXELS,
+                decode_max_long_edge=stage2.STANDARD_DECODE_MAX_LONG_EDGE,
+                max_sampled_disk_bytes=11,
+            )
+
+        command = run.call_args.args[0]
+        video_filter = command[command.index("-vf") + 1]
+        self.assertIn("select=eq(n\\,0)+eq(n\\,4)+eq(n\\,9)", video_filter)
+        self.assertIn("scale=1036:1036", video_filter)
+        self.assertEqual(
+            command[command.index("-frames:v") + 1],
+            "3",
+        )
+
     def test_vggt_geometry_returns_canonical_timestamps_aligned_with_sampled_frames(self):
         class FakeFrames:
             shape = (3, 3, 8, 8)
@@ -519,8 +634,6 @@ class Stage2ServiceTest(unittest.TestCase):
         vggt_model_module.VGGT = FakeModel
         src_package = types.ModuleType("src")
         src_package.__path__ = []
-        src_utils_module = types.ModuleType("src.utils")
-        src_utils_module.load_video_frames = lambda _path, _max_frames: FakeFrames()
         src_predict_module = types.ModuleType("src.vggt_predict")
         src_predict_module.vggt_predict = lambda _frames, _model: {
             "world_points": np.zeros((3, 8, 8, 3), dtype=np.float32),
@@ -531,15 +644,15 @@ class Stage2ServiceTest(unittest.TestCase):
             "vggt.models": vggt_models_package,
             "vggt.models.vggt": vggt_model_module,
             "src": src_package,
-            "src.utils": src_utils_module,
             "src.vggt_predict": src_predict_module,
         }
         sampled_indices = [0, 17, 51]
-        sampled_timestamps = [0.0, 0.3333334, 1.7000006]
+        sampled_timestamps = [0.0, 0.333333, 1.700001]
+        sampled_image_paths = [Path(f"sampled-{index}.jpg") for index in range(3)]
 
         with patch.dict(sys.modules, runtime_modules), patch.object(
             stage2,
-            "_materialize_video",
+            "_materialize_standard_video",
             return_value=Path("source.mp4"),
         ), patch.object(stage2, "_ensure_ras_installed"), patch.object(
             stage2,
@@ -551,9 +664,18 @@ class Stage2ServiceTest(unittest.TestCase):
             return_value=stage2.DEFAULT_VGGT_REVISION,
         ), patch.object(stage2, "_link_models_dir"), patch.object(
             stage2,
-            "_source_frame_plan",
-            return_value=(sampled_indices, sampled_timestamps),
-        ) as source_frame_plan, patch.object(
+            "_prepare_standard_vggt_sample",
+            return_value=(
+                sampled_image_paths,
+                sampled_indices,
+                sampled_timestamps,
+                1.75,
+            ),
+        ) as prepare_sample, patch.object(
+            stage2,
+            "_load_preprocessed_sampled_images",
+            return_value=FakeFrames(),
+        ), patch.object(
             stage2,
             "_artifact_exports_enabled",
             return_value=False,
@@ -576,7 +698,7 @@ class Stage2ServiceTest(unittest.TestCase):
             len(result["source_frame_indices"]),
         )
         self.assertEqual(len(result["source_frame_timestamps"]), result["frames_used"])
-        source_frame_plan.assert_called_once_with(Path("source.mp4"), 3)
+        prepare_sample.assert_called_once_with(Path("source.mp4"), ANY, 3)
 
     def test_rejects_unknown_mode_before_model_bootstrap(self):
         result = stage2.run_stage2(
@@ -1020,6 +1142,120 @@ class Stage2ServiceTest(unittest.TestCase):
             )
 
         self.assertNotIn("do-not-leak", str(caught.exception))
+
+    def test_standard_sources_use_500_mib_cap_and_optional_sha256(self):
+        source_sha256 = hashlib.sha256(b"source").hexdigest()
+        self.assertEqual(
+            stage2.STANDARD_MAX_REMOTE_VIDEO_BYTES,
+            500 * 1024 * 1024,
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            stage2,
+            "_download_video",
+            return_value=Path(tmp) / "input.mp4",
+        ) as download:
+            result = stage2._materialize_standard_video(
+                {
+                    "video_url": "https://input.example/source.mp4",
+                    "source_sha256": source_sha256,
+                    "source_size_bytes": 500_000_000,
+                },
+                Path(tmp),
+            )
+
+        self.assertEqual(result, Path(tmp) / "input.mp4")
+        download.assert_called_once_with(
+            "https://input.example/source.mp4",
+            Path(tmp),
+            max_bytes=stage2.STANDARD_MAX_REMOTE_VIDEO_BYTES,
+            expected_size_bytes=500_000_000,
+            expected_sha256=source_sha256,
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            stage2,
+            "_download_video",
+            return_value=Path(tmp) / "input.mp4",
+        ) as download:
+            stage2._materialize_standard_video(
+                {"video_url": "https://input.example/legacy.mp4"},
+                Path(tmp),
+            )
+        download.assert_called_once_with(
+            "https://input.example/legacy.mp4",
+            Path(tmp),
+            max_bytes=stage2.STANDARD_MAX_REMOTE_VIDEO_BYTES,
+            expected_size_bytes=None,
+            expected_sha256=None,
+        )
+        with patch.object(stage2, "_download_video") as download, self.assertRaisesRegex(
+            RuntimeError,
+            "64 lowercase hexadecimal",
+        ):
+            stage2._materialize_standard_video(
+                {
+                    "video_url": "https://input.example/source.mp4",
+                    "source_sha256": "not-a-digest",
+                },
+                Path("/work"),
+            )
+        download.assert_not_called()
+        for invalid_size in (None, True, 0, stage2.STANDARD_MAX_REMOTE_VIDEO_BYTES + 1):
+            with self.subTest(source_size_bytes=invalid_size), patch.object(
+                stage2,
+                "_download_video",
+            ) as download, self.assertRaisesRegex(RuntimeError, "source_size_bytes"):
+                stage2._materialize_standard_video(
+                    {
+                        "video_url": "https://input.example/source.mp4",
+                        "source_size_bytes": invalid_size,
+                    },
+                    Path("/work"),
+                )
+            download.assert_not_called()
+
+    def test_streamed_source_sha256_is_verified_and_mismatch_is_removed(self):
+        class DownloadResponse:
+            status_code = 200
+
+            def __init__(self):
+                self.headers = {"content-length": "6"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+            def iter_content(self, chunk_size):
+                del chunk_size
+                yield b"sou"
+                yield b"rce"
+
+        expected = hashlib.sha256(b"source").hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("requests.get", return_value=DownloadResponse()):
+                path = stage2._download_video(
+                    "https://input.example/source.mp4",
+                    root / "matching",
+                    expected_sha256=expected,
+                )
+            self.assertEqual(path.read_bytes(), b"source")
+
+            mismatch_dir = root / "mismatch"
+            with patch(
+                "requests.get",
+                return_value=DownloadResponse(),
+            ), self.assertRaisesRegex(RuntimeError, "does not match source_sha256"):
+                stage2._download_video(
+                    "https://input.example/source.mp4",
+                    mismatch_dir,
+                    expected_sha256="0" * 64,
+                )
+            self.assertFalse((mismatch_dir / "input.mp4").exists())
 
     def test_dry_run_never_claims_synthetic_instances(self):
         # Invalid video is enough to prove errors stay explicit; the real video
@@ -1817,25 +2053,6 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertTrue(metadata["duration_aligned"])
         self.assertEqual(metadata["timeline_mode"], "source_frame_pts")
         self.assertAlmostEqual(float(media["format"]["duration"]), 2.4, delta=0.15)
-
-    def test_sampled_mask_timeline_preserves_nonuniform_source_pts(self):
-        probed = {
-            "frames": [
-                {"best_effort_timestamp_time": value}
-                for value in ("0.000", "0.100", "0.900", "1.200", "2.400")
-            ]
-        }
-        with patch.object(stage2, "_ffprobe_json", return_value=probed):
-            timestamps = stage2._sampled_source_frame_timestamps(
-                Path("variable-frame-rate.mp4"),
-                [0, 1, 3, 4],
-            )
-
-        self.assertEqual(timestamps, [0.0, 0.1, 1.2, 2.4])
-        self.assertNotEqual(
-            [right - left for left, right in zip(timestamps, timestamps[1:])],
-            [0.8, 0.8, 0.8],
-        )
 
     def test_vfr_mask_encoding_preserves_sparse_pts_and_container_duration(self):
         with tempfile.TemporaryDirectory() as tmp:

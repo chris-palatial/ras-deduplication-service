@@ -58,6 +58,14 @@ DEFAULT_SAM3_REVISION = "bfbed072a07a6a52c8d5fdc75a7a186251a835b1"
 SAM3_REVISION = os.environ.get("SAM3_REVISION", DEFAULT_SAM3_REVISION)
 MAX_INLINE_VIDEO_BYTES = 6 * 1024 * 1024
 MAX_REMOTE_VIDEO_BYTES = 64 * 1024 * 1024
+STANDARD_MAX_REMOTE_VIDEO_BYTES = 500 * 1024 * 1024
+STANDARD_MAX_VIDEO_DURATION_SECONDS = 60.0
+STANDARD_MAX_FRAMES = 160
+STANDARD_MAX_DECODED_FRAMES = 14_400
+STANDARD_MAX_SOURCE_DIMENSION = 8_192
+STANDARD_MAX_SOURCE_PIXELS = 16_777_216
+STANDARD_DECODE_MAX_LONG_EDGE = 1_036
+STANDARD_MAX_SAMPLED_DISK_BYTES = 256 * 1024 * 1024
 SCENE_PARSE_MAX_REMOTE_VIDEO_BYTES = 2 * 1024 * 1024 * 1024
 SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS = 60.0
 DEFAULT_VGGT_MODEL_ID = "facebook/VGGT-1B"
@@ -1064,10 +1072,21 @@ def _download_video(
     *,
     max_bytes: int | None = None,
     expected_size_bytes: int | None = None,
+    expected_sha256: str | None = None,
 ) -> Path:
     import requests
 
     max_bytes = MAX_REMOTE_VIDEO_BYTES if max_bytes is None else max_bytes
+    if expected_size_bytes is not None and (
+        type(expected_size_bytes) is not int
+        or expected_size_bytes < 1
+        or expected_size_bytes > max_bytes
+    ):
+        raise RuntimeError(
+            f"source_size_bytes must be an integer from 1 through {max_bytes}"
+        )
+    if expected_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise RuntimeError("source_sha256 must be 64 lowercase hexadecimal characters")
 
     parsed_url = urlparse(video_url)
     if (
@@ -1124,6 +1143,7 @@ def _download_video(
                     raise RuntimeError("video Content-Length does not match source_size_bytes")
 
             written = 0
+            digest = hashlib.sha256() if expected_sha256 is not None else None
             with open(dest, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1 << 20):
                     if not chunk:
@@ -1134,10 +1154,17 @@ def _download_video(
                             f"video download exceeds the {max_bytes // 1024 // 1024} MiB service limit"
                         )
                     f.write(chunk)
+                    if digest is not None:
+                        digest.update(chunk)
             if written == 0:
                 raise RuntimeError("video download returned an empty file")
             if expected_size_bytes is not None and written != expected_size_bytes:
                 raise RuntimeError("downloaded video size does not match source_size_bytes")
+            if digest is not None and not hmac.compare_digest(
+                digest.hexdigest(),
+                expected_sha256,
+            ):
+                raise RuntimeError("downloaded video SHA-256 does not match source_sha256")
     except requests.RequestException as exc:
         dest.unlink(missing_ok=True)
         # Requests exceptions may contain the complete URL, including its
@@ -1149,10 +1176,22 @@ def _download_video(
     return dest
 
 
-def _materialize_video(payload: dict[str, Any], work: Path) -> Path:
+def _materialize_video(
+    payload: dict[str, Any],
+    work: Path,
+    *,
+    max_remote_bytes: int | None = None,
+    expected_size_bytes: int | None = None,
+    expected_sha256: str | None = None,
+) -> Path:
     """Accept a bounded remote video or the legacy bounded inline payload."""
     b64 = payload.get("video_b64")
     video_url = str(payload.get("video_url") or "").strip()
+    remote_limit = (
+        MAX_REMOTE_VIDEO_BYTES
+        if max_remote_bytes is None
+        else max_remote_bytes
+    )
 
     # Prefer inline bytes. Never pass fake schemes (inline://) to requests.
     if isinstance(b64, str) and b64.strip():
@@ -1164,6 +1203,21 @@ def _materialize_video(payload: dict[str, Any], work: Path) -> Path:
             raise RuntimeError("video_b64 decoded to an empty file")
         if len(raw) > MAX_INLINE_VIDEO_BYTES:
             raise RuntimeError("inline video exceeds the 6 MiB service limit")
+        if expected_size_bytes is not None and (
+            type(expected_size_bytes) is not int
+            or expected_size_bytes < 1
+            or expected_size_bytes > remote_limit
+        ):
+            raise RuntimeError(
+                "source_size_bytes must be a positive integer within the service limit"
+            )
+        if expected_size_bytes is not None and len(raw) != expected_size_bytes:
+            raise RuntimeError("inline video size does not match source_size_bytes")
+        if expected_sha256 is not None:
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+                raise RuntimeError("source_sha256 must be 64 lowercase hexadecimal characters")
+            if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), expected_sha256):
+                raise RuntimeError("inline video SHA-256 does not match source_sha256")
         # sniff extension from media_type if provided
         mt = str(payload.get("media_type") or "video/mp4").lower()
         ext = ".webm" if "webm" in mt else ".mov" if "quicktime" in mt or "mov" in mt else ".mp4"
@@ -1178,9 +1232,51 @@ def _materialize_video(payload: dict[str, Any], work: Path) -> Path:
             "received inline video_url without video_b64 "
             "(worker may be stale, or base64 was stripped as too large). "
             "Redeploy/restart the endpoint worker, send up to 6 MiB through legacy video_b64, "
-            "or provide an HTTPS video_url up to 64 MiB."
+            f"or provide an HTTPS video_url up to {remote_limit // 1024 // 1024} MiB."
         )
-    return _download_video(video_url, work)
+    return _download_video(
+        video_url,
+        work,
+        max_bytes=remote_limit,
+        expected_size_bytes=expected_size_bytes,
+        expected_sha256=expected_sha256,
+    )
+
+
+def _optional_source_sha256(payload: dict[str, Any]) -> str | None:
+    if "source_sha256" not in payload:
+        return None
+    value = payload.get("source_sha256")
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise RuntimeError("source_sha256 must be 64 lowercase hexadecimal characters")
+    return value
+
+
+def _optional_source_size_bytes(payload: dict[str, Any]) -> int | None:
+    if "source_size_bytes" not in payload:
+        return None
+    value = payload.get("source_size_bytes")
+    if (
+        type(value) is not int
+        or value < 1
+        or value > STANDARD_MAX_REMOTE_VIDEO_BYTES
+    ):
+        raise RuntimeError(
+            "source_size_bytes must be an integer from 1 through "
+            f"{STANDARD_MAX_REMOTE_VIDEO_BYTES}"
+        )
+    return value
+
+
+def _materialize_standard_video(payload: dict[str, Any], work: Path) -> Path:
+    """Materialize a local VGGT or Full RAS source with an optional digest check."""
+    return _materialize_video(
+        payload,
+        work,
+        max_remote_bytes=STANDARD_MAX_REMOTE_VIDEO_BYTES,
+        expected_size_bytes=_optional_source_size_bytes(payload),
+        expected_sha256=_optional_source_sha256(payload),
+    )
 
 
 def _validate_scene_parse_catalog_request(
@@ -2189,7 +2285,13 @@ def _scene_parse_requested_frames(
     )
 
 
-def _probe_scene_parse_decoded_stream(path: Path) -> tuple[int, int, int]:
+def _probe_bounded_decoded_stream(
+    path: Path,
+    *,
+    max_decoded_frames: int,
+    max_source_dimension: int,
+    max_source_pixels: int,
+) -> tuple[int, int, int]:
     """Count decoded frames with bounded output and validate source dimensions."""
     import subprocess
 
@@ -2202,7 +2304,7 @@ def _probe_scene_parse_decoded_stream(path: Path) -> tuple[int, int, int]:
                 "-max_alloc",
                 str(256 * 1024 * 1024),
                 "-max_pixels",
-                str(SCENE_PARSE_MAX_SOURCE_PIXELS),
+                str(max_source_pixels),
                 "-select_streams",
                 "v:0",
                 "-show_entries",
@@ -2224,20 +2326,18 @@ def _probe_scene_parse_decoded_stream(path: Path) -> tuple[int, int, int]:
         width = int(stream.get("width") or 0)
         height = int(stream.get("height") or 0)
     except (OSError, ValueError, TypeError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
-        raise SceneParseCatalogError(
-            "source_video_invalid",
-            "Source video dimensions could not be validated within the production limits.",
+        raise RuntimeError(
+            "Source video dimensions could not be validated within the decode limits."
         ) from exc
     if (
         width < 1
         or height < 1
-        or width > SCENE_PARSE_MAX_SOURCE_DIMENSION
-        or height > SCENE_PARSE_MAX_SOURCE_DIMENSION
-        or width * height > SCENE_PARSE_MAX_SOURCE_PIXELS
+        or width > max_source_dimension
+        or height > max_source_dimension
+        or width * height > max_source_pixels
     ):
-        raise SceneParseCatalogError(
-            "source_video_invalid",
-            "Source video dimensions exceed the production decode limit.",
+        raise RuntimeError(
+            "Source video dimensions exceed the decode limit."
         )
 
     try:
@@ -2249,7 +2349,7 @@ def _probe_scene_parse_decoded_stream(path: Path) -> tuple[int, int, int]:
                 "-max_alloc",
                 str(256 * 1024 * 1024),
                 "-max_pixels",
-                str(SCENE_PARSE_MAX_SOURCE_PIXELS),
+                str(max_source_pixels),
                 "-count_frames",
                 "-select_streams",
                 "v:0",
@@ -2271,28 +2371,40 @@ def _probe_scene_parse_decoded_stream(path: Path) -> tuple[int, int, int]:
             raise ValueError("exactly one decodable video stream is required")
         decoded_frames = int(stream.get("nb_read_frames") or 0)
     except (OSError, ValueError, TypeError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
-        raise SceneParseCatalogError(
-            "source_video_invalid",
-            "Source video stream could not be decoded within the production limits.",
+        raise RuntimeError(
+            "Source video stream could not be decoded within the decode limits."
         ) from exc
-    if not 1 <= decoded_frames <= SCENE_PARSE_MAX_DECODED_FRAMES:
-        raise SceneParseCatalogError(
-            "source_video_invalid",
-            "Source video decoded-frame count exceeds the production limit.",
+    if not 1 <= decoded_frames <= max_decoded_frames:
+        raise RuntimeError(
+            "Source video decoded-frame count exceeds the decode limit."
         )
     return decoded_frames, width, height
 
 
-def _scene_parse_decoded_timeline(
+def _probe_scene_parse_decoded_stream(path: Path) -> tuple[int, int, int]:
+    try:
+        return _probe_bounded_decoded_stream(
+            path,
+            max_decoded_frames=SCENE_PARSE_MAX_DECODED_FRAMES,
+            max_source_dimension=SCENE_PARSE_MAX_SOURCE_DIMENSION,
+            max_source_pixels=SCENE_PARSE_MAX_SOURCE_PIXELS,
+        )
+    except RuntimeError as exc:
+        raise SceneParseCatalogError("source_video_invalid", str(exc)) from exc
+
+
+def _bounded_decoded_timeline(
     video_path: Path,
     *,
     decoded_frame_count: int,
+    max_source_pixels: int,
+    max_duration_seconds: float,
 ) -> tuple[list[float], float]:
     """Return the verified decoded-frame timeline and its video duration."""
     frames = _ffprobe_json(
         video_path,
         "-max_pixels",
-        str(SCENE_PARSE_MAX_SOURCE_PIXELS),
+        str(max_source_pixels),
         "-select_streams",
         "v:0",
         "-show_frames",
@@ -2301,16 +2413,14 @@ def _scene_parse_decoded_timeline(
     ) or {}
     entries = frames.get("frames") or []
     if not isinstance(entries, list) or len(entries) != decoded_frame_count:
-        raise SceneParseCatalogError(
-            "source_video_invalid",
-            "Source video decoded timeline does not match its bounded frame count.",
+        raise RuntimeError(
+            "Source video decoded timeline does not match its bounded frame count."
         )
     timestamps: list[float] = []
     for entry in entries:
         if not isinstance(entry, dict):
-            raise SceneParseCatalogError(
-                "source_video_invalid",
-                "Source video contains an invalid decoded-frame timeline.",
+            raise RuntimeError(
+                "Source video contains an invalid decoded-frame timeline."
             )
         timestamp = next(
             (
@@ -2321,9 +2431,8 @@ def _scene_parse_decoded_timeline(
             None,
         )
         if timestamp is None:
-            raise SceneParseCatalogError(
-                "source_video_invalid",
-                "Source video contains a decoded frame without a presentation timestamp.",
+            raise RuntimeError(
+                "Source video contains a decoded frame without a presentation timestamp."
             )
         timestamps.append(float(timestamp))
     origin = timestamps[0]
@@ -2332,9 +2441,8 @@ def _scene_parse_decoded_timeline(
         right <= left
         for left, right in zip(normalized_timestamps, normalized_timestamps[1:])
     ):
-        raise SceneParseCatalogError(
-            "source_video_invalid",
-            "Source video decoded-frame timestamps are not strictly increasing.",
+        raise RuntimeError(
+            "Source video decoded-frame timestamps are not strictly increasing."
         )
     final_entry = entries[-1]
     final_frame_duration = next(
@@ -2350,34 +2458,47 @@ def _scene_parse_decoded_timeline(
     if final_frame_duration is None:
         final_frame_duration = _probe_video_duration(video_path)
     if final_frame_duration is None:
-        raise SceneParseCatalogError(
-            "source_video_invalid",
-            "Source video decoded duration could not be established.",
+        raise RuntimeError(
+            "Source video decoded duration could not be established."
         )
     decoded_duration = normalized_timestamps[-1] + float(final_frame_duration)
     if (
         not math.isfinite(decoded_duration)
         or decoded_duration <= 0
-        or decoded_duration > SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS + 0.001
+        or decoded_duration > max_duration_seconds + 0.001
     ):
-        raise SceneParseCatalogError(
-            "source_video_invalid",
-            f"Source video decoded timeline exceeds the {int(SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS)} second limit.",
+        raise RuntimeError(
+            f"Source video decoded timeline exceeds the {int(max_duration_seconds)} second limit."
         )
-    decoded_duration = min(decoded_duration, SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS)
+    decoded_duration = min(decoded_duration, max_duration_seconds)
     return normalized_timestamps, decoded_duration
 
 
-def _scene_parse_uniform_frame_plan(
+def _scene_parse_decoded_timeline(
+    video_path: Path,
+    *,
+    decoded_frame_count: int,
+) -> tuple[list[float], float]:
+    try:
+        return _bounded_decoded_timeline(
+            video_path,
+            decoded_frame_count=decoded_frame_count,
+            max_source_pixels=SCENE_PARSE_MAX_SOURCE_PIXELS,
+            max_duration_seconds=SCENE_PARSE_MAX_VIDEO_DURATION_SECONDS,
+        )
+    except RuntimeError as exc:
+        raise SceneParseCatalogError("source_video_invalid", str(exc)) from exc
+
+
+def _uniform_decoded_frame_plan(
     source_frame_timestamps: list[float],
     sampled_count: int,
 ) -> tuple[list[int], list[float]]:
     """Uniformly select bounded indices from a pre-validated decoded timeline."""
     decoded_frame_count = len(source_frame_timestamps)
     if decoded_frame_count < 1 or sampled_count < 1:
-        raise SceneParseCatalogError(
-            "source_video_invalid",
-            "Source video sample plan is empty.",
+        raise RuntimeError(
+            "Source video sample plan is empty."
         )
     count = min(sampled_count, decoded_frame_count)
     if count == 1:
@@ -2390,26 +2511,57 @@ def _scene_parse_uniform_frame_plan(
     sampled_timestamps = [source_frame_timestamps[index] for index in indices]
     canonical_timestamps = _canonical_source_frame_timestamps(sampled_timestamps)
     if canonical_timestamps is None:
-        raise SceneParseCatalogError(
-            "source_video_invalid",
-            "Source video sampled-frame timeline is invalid.",
+        raise RuntimeError(
+            "Source video sampled-frame timeline is invalid."
         )
     return indices, canonical_timestamps
 
 
-def _load_scene_parse_sampled_frames(
+def _scene_parse_uniform_frame_plan(
+    source_frame_timestamps: list[float],
+    sampled_count: int,
+) -> tuple[list[int], list[float]]:
+    try:
+        return _uniform_decoded_frame_plan(source_frame_timestamps, sampled_count)
+    except RuntimeError as exc:
+        raise SceneParseCatalogError("source_video_invalid", str(exc)) from exc
+
+
+def _upstream_uniform_decoded_frame_plan(
+    source_frame_timestamps: list[float],
+    sampled_count: int,
+) -> tuple[list[int], list[float]]:
+    """Match RAS load_video_frames NumPy selection without decoding every PNG."""
+    import numpy as np
+
+    decoded_frame_count = len(source_frame_timestamps)
+    if decoded_frame_count < 1 or sampled_count < 1:
+        raise RuntimeError("Source video sample plan is empty.")
+    count = min(sampled_count, decoded_frame_count)
+    indices = np.linspace(0, decoded_frame_count - 1, count).astype(int).tolist()
+    sampled_timestamps = [source_frame_timestamps[index] for index in indices]
+    canonical_timestamps = _canonical_source_frame_timestamps(sampled_timestamps)
+    if canonical_timestamps is None:
+        raise RuntimeError("Source video sampled-frame timeline is invalid.")
+    return indices, canonical_timestamps
+
+
+def _extract_bounded_sampled_images(
     video_path: Path,
     work: Path,
     source_frame_indices: list[int],
-) -> Any:
-    """Decode only selected, scaled JPEGs instead of materializing every frame."""
+    *,
+    max_frames: int,
+    max_source_pixels: int,
+    decode_max_long_edge: int,
+    max_sampled_disk_bytes: int,
+) -> list[Path]:
+    """Decode only selected, scaled JPEGs and enforce the temporary-file budget."""
     import subprocess
-    from vggt.utils.load_fn import load_and_preprocess_images
 
-    if not source_frame_indices or len(source_frame_indices) > SCENE_PARSE_SAMPLING_MAX_FRAMES:
-        raise SceneParseCatalogError(
-            "source_video_invalid",
-            "Source video sample plan is outside the production frame limit.",
+    if not source_frame_indices or len(source_frame_indices) > max_frames:
+        raise RuntimeError(
+            "Source video sample plan is outside the frame limit."
         )
     sampled_dir = work / "sampled"
     sampled_dir.mkdir(parents=True, exist_ok=True)
@@ -2418,7 +2570,7 @@ def _load_scene_parse_sampled_frames(
     )
     video_filter = (
         f"select={select_expression},"
-        f"scale={SCENE_PARSE_DECODE_MAX_LONG_EDGE}:{SCENE_PARSE_DECODE_MAX_LONG_EDGE}:"
+        f"scale={decode_max_long_edge}:{decode_max_long_edge}:"
         "force_original_aspect_ratio=decrease"
     )
     try:
@@ -2432,7 +2584,7 @@ def _load_scene_parse_sampled_frames(
                 "-max_alloc",
                 str(256 * 1024 * 1024),
                 "-max_pixels",
-                str(SCENE_PARSE_MAX_SOURCE_PIXELS),
+                str(max_source_pixels),
                 "-i",
                 str(video_path),
                 "-map",
@@ -2453,48 +2605,99 @@ def _load_scene_parse_sampled_frames(
             timeout=180,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise SceneParseCatalogError(
-            "source_video_invalid",
-            "Source video sample decode exceeded the production limits.",
+        raise RuntimeError(
+            "Source video sample decode exceeded the bounded limits."
         ) from exc
     image_paths = sorted(sampled_dir.glob("frame-*.jpg"))
     if completed.returncode != 0 or len(image_paths) != len(source_frame_indices):
-        raise SceneParseCatalogError(
-            "source_video_invalid",
-            "Source video did not decode the complete bounded frame sample.",
+        raise RuntimeError(
+            "Source video did not decode the complete bounded frame sample."
         )
     sampled_disk_bytes = sum(path.stat().st_size for path in image_paths)
     if (
         sampled_disk_bytes < len(image_paths)
-        or sampled_disk_bytes > SCENE_PARSE_MAX_SAMPLED_DISK_BYTES
+        or sampled_disk_bytes > max_sampled_disk_bytes
     ):
-        raise SceneParseCatalogError(
-            "source_video_invalid",
-            "Source video sampled-frame output exceeds the production disk limit.",
+        raise RuntimeError(
+            "Source video sampled-frame output exceeds the temporary disk limit."
         )
+    return image_paths
+
+
+def _load_preprocessed_sampled_images(image_paths: list[Path]) -> Any:
+    from vggt.utils.load_fn import load_and_preprocess_images
+
     return load_and_preprocess_images([str(path) for path in image_paths])
 
 
-def _sampled_source_frame_timestamps(
+def _load_scene_parse_sampled_frames(
     video_path: Path,
+    work: Path,
     source_frame_indices: list[int],
-) -> list[float] | None:
-    """Resolve decoded source-frame indices to their real presentation times."""
-    plan = _source_frame_plan(video_path, max(source_frame_indices, default=-1) + 1)
-    if not plan:
-        return None
-    all_indices, all_timestamps = plan
-    if not all_timestamps or all_indices != list(range(len(all_indices))):
-        # Asking for every decoded frame above produces a direct index -> PTS map.
-        return None
-    if max(source_frame_indices, default=-1) >= len(all_timestamps):
-        return None
-    sampled = [all_timestamps[index] for index in source_frame_indices]
-    origin = sampled[0]
-    normalized = [max(0.0, timestamp - origin) for timestamp in sampled]
-    if any(right <= left for left, right in zip(normalized, normalized[1:])):
-        return None
-    return normalized
+) -> Any:
+    """Decode only selected, scaled JPEGs instead of materializing every frame."""
+    try:
+        image_paths = _extract_bounded_sampled_images(
+            video_path,
+            work,
+            source_frame_indices,
+            max_frames=SCENE_PARSE_SAMPLING_MAX_FRAMES,
+            max_source_pixels=SCENE_PARSE_MAX_SOURCE_PIXELS,
+            decode_max_long_edge=SCENE_PARSE_DECODE_MAX_LONG_EDGE,
+            max_sampled_disk_bytes=SCENE_PARSE_MAX_SAMPLED_DISK_BYTES,
+        )
+    except RuntimeError as exc:
+        raise SceneParseCatalogError("source_video_invalid", str(exc)) from exc
+    return _load_preprocessed_sampled_images(image_paths)
+
+
+def _prepare_standard_vggt_sample(
+    video_path: Path,
+    work: Path,
+    requested_max_frames: int,
+) -> tuple[list[Path], list[int], list[float], float]:
+    """Validate and extract the bounded VGGT 1B sample before model bootstrap."""
+    if not 2 <= requested_max_frames <= STANDARD_MAX_FRAMES:
+        raise RuntimeError(
+            f"max_frames must be an integer from 2 to {STANDARD_MAX_FRAMES}"
+        )
+    decoded_frame_count, _source_width, _source_height = _probe_bounded_decoded_stream(
+        video_path,
+        max_decoded_frames=STANDARD_MAX_DECODED_FRAMES,
+        max_source_dimension=STANDARD_MAX_SOURCE_DIMENSION,
+        max_source_pixels=STANDARD_MAX_SOURCE_PIXELS,
+    )
+    decoded_timestamps, duration_seconds = _bounded_decoded_timeline(
+        video_path,
+        decoded_frame_count=decoded_frame_count,
+        max_source_pixels=STANDARD_MAX_SOURCE_PIXELS,
+        max_duration_seconds=STANDARD_MAX_VIDEO_DURATION_SECONDS,
+    )
+    source_frame_indices, source_frame_timestamps = _upstream_uniform_decoded_frame_plan(
+        decoded_timestamps,
+        requested_max_frames,
+    )
+    image_paths = _extract_bounded_sampled_images(
+        video_path,
+        work,
+        source_frame_indices,
+        max_frames=STANDARD_MAX_FRAMES,
+        max_source_pixels=STANDARD_MAX_SOURCE_PIXELS,
+        decode_max_long_edge=STANDARD_DECODE_MAX_LONG_EDGE,
+        max_sampled_disk_bytes=STANDARD_MAX_SAMPLED_DISK_BYTES,
+    )
+    if not (
+        len(image_paths)
+        == len(source_frame_indices)
+        == len(source_frame_timestamps)
+    ):
+        raise RuntimeError("Source video sampled-frame evidence is not aligned.")
+    return (
+        image_paths,
+        source_frame_indices,
+        source_frame_timestamps,
+        duration_seconds,
+    )
 
 
 def _normalize_mask_video(
@@ -3228,8 +3431,18 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
     timings: dict[str, int] = {}
     try:
         t0 = time.time()
-        video_path = _materialize_video(payload, work)
+        video_path = _materialize_standard_video(payload, work)
         timings["download"] = int((time.time() - t0) * 1000)
+
+        max_frames = int(payload["max_frames"])
+        t0 = time.time()
+        (
+            sampled_image_paths,
+            source_frame_indices,
+            source_frame_timestamps,
+            _source_duration_seconds,
+        ) = _prepare_standard_vggt_sample(video_path, work, max_frames)
+        timings["sample"] = int((time.time() - t0) * 1000)
 
         _ensure_ras_installed(require_sam3=False)
         ras_root = _ensure_ras_on_path()
@@ -3239,23 +3452,22 @@ def run_stage2_geometry(payload: dict[str, Any]) -> dict[str, Any]:
         import gc
         import torch
         from vggt.models.vggt import VGGT
-        from src.utils import load_video_frames
         from src.vggt_predict import vggt_predict
 
         if not torch.cuda.is_available():
             raise RuntimeError("geometry mode requires a CUDA GPU")
         device = "cuda"
-        max_frames = int(payload["max_frames"])
 
         t0 = time.time()
-        frames = load_video_frames(str(video_path), max_frames).to(device)
+        frames = _load_preprocessed_sampled_images(sampled_image_paths).to(device)
         n_frames = int(frames.shape[0])
-        source_frame_plan = _source_frame_plan(video_path, n_frames)
-        source_frame_indices = source_frame_plan[0] if source_frame_plan else None
-        source_frame_timestamps = _canonical_source_frame_timestamps(
-            source_frame_plan[1] if source_frame_plan else None
-        )
-        timings["sample"] = int((time.time() - t0) * 1000)
+        if not (
+            n_frames
+            == len(source_frame_indices)
+            == len(source_frame_timestamps)
+        ):
+            raise RuntimeError("Source video sampled-frame evidence is not aligned.")
+        timings["sample"] += int((time.time() - t0) * 1000)
 
         t0 = time.time()
         model = VGGT.from_pretrained("./models/VGGT").to(device)
@@ -3848,8 +4060,17 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
 
     try:
         t0 = time.time()
-        video_path = _materialize_video(payload, work)
+        video_path = _materialize_standard_video(payload, work)
         timings["download"] = int((time.time() - t0) * 1000)
+
+        t0 = time.time()
+        (
+            sampled_image_paths,
+            source_frame_indices,
+            source_frame_timestamps,
+            _source_duration_seconds,
+        ) = _prepare_standard_vggt_sample(video_path, work, max_frames)
+        timings["sample"] = int((time.time() - t0) * 1000)
 
         _ensure_ras_installed()
         ras_root = _ensure_ras_on_path()
@@ -3866,7 +4087,7 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
             load_vggt_model,
             unload_model,
         )
-        from src.utils import load_video_frames, vis_instance_masks
+        from src.utils import vis_instance_masks
         from src.geometry_utils import (
             align_to_room_coordinate_system,
             align_vggt_predictions,
@@ -3879,14 +4100,15 @@ def run_stage2_full(payload: dict[str, Any]) -> dict[str, Any]:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         t0 = time.time()
-        frames = load_video_frames(str(video_path), max_frames).to(device)
+        frames = _load_preprocessed_sampled_images(sampled_image_paths).to(device)
         n_frames = int(frames.shape[0])
-        source_frame_plan = _source_frame_plan(video_path, n_frames)
-        source_frame_indices = source_frame_plan[0] if source_frame_plan else None
-        source_frame_timestamps = _canonical_source_frame_timestamps(
-            source_frame_plan[1] if source_frame_plan else None
-        )
-        timings["sample"] = int((time.time() - t0) * 1000)
+        if not (
+            n_frames
+            == len(source_frame_indices)
+            == len(source_frame_timestamps)
+        ):
+            raise RuntimeError("Source video sampled-frame evidence is not aligned.")
+        timings["sample"] += int((time.time() - t0) * 1000)
 
         t0 = time.time()
         vggt_model = load_vggt_model().to(device)
