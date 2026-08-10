@@ -19,6 +19,7 @@ import importlib
 import importlib.util
 import json
 import math
+import numbers
 import re
 import shutil
 import struct
@@ -36,6 +37,7 @@ from best_view import (
     BEST_VIEW_JSON_NAME,
     BEST_VIEW_MAX_CANDIDATE_FRAMES,
     BEST_VIEW_MAX_INSTANCES,
+    BEST_VIEW_SCALE_POLICY,
     BEST_VIEW_SCHEMA,
     build_best_view_report,
     decode_rle,
@@ -147,6 +149,7 @@ BEST_VIEW_MAX_MASK_DOCUMENTS = 8
 BEST_VIEW_MAX_OBJECTS_PER_FRAME = 64
 BEST_VIEW_MAX_TRACKS_PER_CATEGORY = 256
 BEST_VIEW_MAX_MODEL_FRAME_DIMENSION = 4_096
+BEST_VIEW_MAX_MODEL_FRAME_PIXELS = 1_048_576
 # float16 depth quantization alone perturbs the point map by roughly 0.05%.
 # Anything past 2% means the exported arrays are not a faithful stand-in for
 # the model's own world points and the scores would not be the model's scores.
@@ -4028,6 +4031,561 @@ def run_best_view_geometry(payload: dict[str, Any]) -> dict[str, Any]:
             shutil.rmtree(work, ignore_errors=True)
 
 
+def _gateway_origin(value: Any) -> tuple[str, str, int] | None:
+    """Return the comparable origin of a credential-free HTTP(S) URL."""
+    if not isinstance(value, str) or not value:
+        return None
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"https", "http"} or not parsed.hostname:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    return scheme, parsed.hostname.lower(), port or (443 if scheme == "https" else 80)
+
+
+def _validate_best_view_score_request(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Validate leg C's closed request without accepting JSON coercions.
+
+    Every provider input has to come from the same origin that minted the
+    upload ticket.  That is what binds the scored geometry and masks to the
+    artifacts this run's own edge verified, instead of to any URL a caller can
+    reach.
+    """
+    allowed = {
+        "analysis_type",
+        "mode",
+        "geometry_inputs_url",
+        "masks",
+        "expected_frames_used",
+        "expected_model_frame_width",
+        "expected_model_frame_height",
+        "categories",
+        "upload",
+    }
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        return None, (
+            f"{BEST_VIEW_SCORE_ANALYSIS_TYPE} does not accept fields: {', '.join(unknown)}"
+        )
+    if payload.get("analysis_type") != BEST_VIEW_SCORE_ANALYSIS_TYPE:
+        return None, f"analysis_type must be {BEST_VIEW_SCORE_ANALYSIS_TYPE}"
+    if str(payload.get("mode") or "").lower() != "full":
+        return None, f"analysis_type {BEST_VIEW_SCORE_ANALYSIS_TYPE} requires mode full"
+
+    upload = _upload_ticket(payload)
+    if not upload:
+        return None, (
+            f"{BEST_VIEW_SCORE_ANALYSIS_TYPE} requires a privileged artifact upload ticket"
+        )
+    origin = _gateway_origin(upload.get("base"))
+    if origin is None:
+        return None, "the upload ticket base must be a credential-free HTTP(S) origin"
+    if _gateway_origin(payload.get("geometry_inputs_url")) != origin:
+        return None, "geometry_inputs_url must be served by the artifact gateway origin"
+
+    categories = payload.get("categories")
+    if (
+        not isinstance(categories, list)
+        or not 1 <= len(categories) <= 8
+        or any(
+            not isinstance(category, str) or not 1 <= len(category) <= 64
+            for category in categories
+        )
+        or len(set(categories)) != len(categories)
+    ):
+        return None, "use 1-8 unique categories, each at most 64 characters"
+
+    raw_masks = payload.get("masks")
+    if (
+        not isinstance(raw_masks, list)
+        or not 1 <= len(raw_masks) <= BEST_VIEW_MAX_MASK_DOCUMENTS
+    ):
+        return None, (
+            f"masks must be a list of 1 to {BEST_VIEW_MAX_MASK_DOCUMENTS} entries"
+        )
+    masks: list[dict[str, str]] = []
+    for entry in raw_masks:
+        if not isinstance(entry, dict) or sorted(entry) != ["category", "url"]:
+            return None, "each masks entry must have exactly a category and a url"
+        category = entry["category"]
+        if category not in categories:
+            return None, "every masks category must be one of the requested categories"
+        if any(existing["category"] == category for existing in masks):
+            return None, "masks categories must be unique"
+        if _gateway_origin(entry["url"]) != origin:
+            return None, "mask URLs must be served by the artifact gateway origin"
+        masks.append({"category": category, "url": entry["url"]})
+
+    frames_used = payload.get("expected_frames_used")
+    if type(frames_used) is not int or not 2 <= frames_used <= BEST_VIEW_MAX_FRAMES:
+        return None, (
+            f"expected_frames_used must be an integer from 2 to {BEST_VIEW_MAX_FRAMES}"
+        )
+    width = payload.get("expected_model_frame_width")
+    height = payload.get("expected_model_frame_height")
+    for name, value in (
+        ("expected_model_frame_width", width),
+        ("expected_model_frame_height", height),
+    ):
+        if (
+            type(value) is not int
+            or not 0 < value <= BEST_VIEW_MAX_MODEL_FRAME_DIMENSION
+        ):
+            return None, (
+                f"{name} must be an integer from 1 to {BEST_VIEW_MAX_MODEL_FRAME_DIMENSION}"
+            )
+    if width * height > BEST_VIEW_MAX_MODEL_FRAME_PIXELS:
+        return None, (
+            "expected model frames exceed "
+            f"{BEST_VIEW_MAX_MODEL_FRAME_PIXELS} pixels"
+        )
+
+    return {
+        "analysis_type": BEST_VIEW_SCORE_ANALYSIS_TYPE,
+        "mode": "full",
+        "geometry_inputs_url": payload["geometry_inputs_url"],
+        "masks": masks,
+        "expected_frames_used": frames_used,
+        "expected_model_frame_width": width,
+        "expected_model_frame_height": height,
+        "categories": list(categories),
+        "upload": upload,
+    }, None
+
+
+def _download_gateway_artifact(
+    url: str,
+    destination: Path,
+    max_bytes: int,
+    *,
+    timeout_s: int = 120,
+) -> int:
+    """Stream one bounded provider input; redirects are terminal."""
+    import requests
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.unlink(missing_ok=True)
+    limit_mib = max_bytes // 1024 // 1024
+    written = 0
+    try:
+        with requests.get(
+            url,
+            stream=True,
+            timeout=timeout_s,
+            allow_redirects=False,
+        ) as response:
+            if 300 <= response.status_code < 400:
+                raise RuntimeError("best-view input URL redirects are not allowed")
+            response.raise_for_status()
+            declared_raw = response.headers.get("content-length")
+            if declared_raw is not None:
+                try:
+                    declared = int(declared_raw)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "best-view input returned an invalid Content-Length"
+                    ) from exc
+                if declared <= 0:
+                    raise RuntimeError("best-view input download returned an empty file")
+                if declared > max_bytes:
+                    raise RuntimeError(
+                        f"best-view input exceeds the {limit_mib} MiB service limit"
+                    )
+            with open(destination, "wb") as handle:
+                for chunk in response.iter_content(chunk_size=1 << 20):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > max_bytes:
+                        raise RuntimeError(
+                            f"best-view input exceeds the {limit_mib} MiB service limit"
+                        )
+                    handle.write(chunk)
+        if written == 0:
+            raise RuntimeError("best-view input download returned an empty file")
+    except requests.RequestException as exc:
+        destination.unlink(missing_ok=True)
+        # Signed input URLs are capabilities; keep the exception class only.
+        raise RuntimeError(f"best-view input download failed ({type(exc).__name__})") from exc
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    return written
+
+
+def _load_best_view_geometry_inputs(
+    path: Path,
+    *,
+    expected_frames: int,
+    expected_width: int,
+    expected_height: int,
+) -> tuple[Any, Any, Any, list[int], list[float]]:
+    """Load and revalidate leg A's export against the edge's expectations."""
+    import numpy as np
+
+    with np.load(path, allow_pickle=False) as data:
+        missing = [
+            name
+            for name in (
+                "depth",
+                "intrinsics",
+                "extrinsics",
+                "source_frame_indices",
+                "source_frame_timestamps",
+                "model_frame_hw",
+                "schema",
+            )
+            if name not in data.files
+        ]
+        if missing:
+            raise RuntimeError(
+                "geometry inputs are missing arrays: " + ", ".join(missing)
+            )
+        schema = data["schema"]
+        depth = np.asarray(data["depth"])
+        intrinsics = np.asarray(data["intrinsics"], dtype=np.float32)
+        extrinsics = np.asarray(data["extrinsics"], dtype=np.float32)
+        model_frame_hw = np.asarray(data["model_frame_hw"]).reshape(-1).tolist()
+        source_frame_indices = np.asarray(data["source_frame_indices"]).reshape(-1).tolist()
+        source_frame_timestamps = (
+            np.asarray(data["source_frame_timestamps"]).reshape(-1).tolist()
+        )
+
+    try:
+        schema_value = schema.item()
+    except (AttributeError, ValueError):
+        schema_value = None
+    if schema_value != BEST_VIEW_GEOMETRY_INPUTS_SCHEMA.encode("ascii"):
+        raise RuntimeError(
+            f"geometry inputs schema must be {BEST_VIEW_GEOMETRY_INPUTS_SCHEMA}"
+        )
+
+    if depth.ndim == 4 and depth.shape[-1] == 1:
+        depth = depth[..., 0]
+    if depth.ndim != 3:
+        raise RuntimeError("geometry inputs depth is not shaped (S,H,W)")
+    frames, height, width = (int(value) for value in depth.shape)
+    if [int(value) for value in model_frame_hw] != [height, width]:
+        raise RuntimeError("geometry inputs model_frame_hw does not match the depth maps")
+    if frames != expected_frames:
+        raise RuntimeError(
+            "geometry inputs frame count does not match expected_frames_used"
+        )
+    if (height, width) != (expected_height, expected_width):
+        raise RuntimeError(
+            "geometry inputs model frame size does not match the expected model frame"
+        )
+    if extrinsics.shape != (frames, 3, 4):
+        raise RuntimeError("geometry inputs extrinsics are not shaped (S,3,4)")
+    if intrinsics.shape != (frames, 3, 3):
+        raise RuntimeError("geometry inputs intrinsics are not shaped (S,3,3)")
+    if len(source_frame_indices) != frames or len(source_frame_timestamps) != frames:
+        raise RuntimeError("geometry inputs sampled-frame evidence is not aligned")
+
+    depth32 = depth.astype(np.float32)
+    if not (
+        np.isfinite(depth32).all()
+        and np.isfinite(extrinsics).all()
+        and np.isfinite(intrinsics).all()
+    ):
+        raise RuntimeError("geometry inputs contain non-finite values")
+    return (
+        depth32,
+        extrinsics,
+        intrinsics,
+        [int(value) for value in source_frame_indices],
+        [float(value) for value in source_frame_timestamps],
+    )
+
+
+def _best_view_mask_frames(document: Any) -> list[Any]:
+    """Accept the fal frame list either bare or wrapped in a ``frames`` object."""
+    if isinstance(document, list):
+        return document
+    if isinstance(document, dict) and isinstance(document.get("frames"), list):
+        return document["frames"]
+    raise RuntimeError(
+        "mask document must be a SAM3VideoObjectFrame list or an object with a frames list"
+    )
+
+
+def _best_view_track_id(value: Any) -> int:
+    if isinstance(value, bool):
+        raise RuntimeError("mask track_id must be an integer")
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,18}", value):
+        return int(value)
+    raise RuntimeError("mask track_id must be an integer")
+
+
+def _best_view_instances_from_masks(
+    documents: list[tuple[str, Any]],
+    *,
+    frames_used: int,
+    height: int,
+    width: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Group fal tracks into scorable instances, rejecting misaligned masks.
+
+    The first pass only measures each mask so a scene with many tracks never
+    holds every decoded mask in memory at once; the bounded winner set is
+    decoded again for scoring.
+    """
+    grouped: dict[tuple[str, int], list[tuple[int, str]]] = {}
+    largest: dict[tuple[str, int], int] = {}
+
+    for category, document in documents:
+        frames = _best_view_mask_frames(document)
+        if len(frames) > frames_used:
+            raise RuntimeError("mask document reports more frames than the sampled clip")
+        seen_frames: set[int] = set()
+        category_tracks: set[int] = set()
+        for frame in frames:
+            if not isinstance(frame, dict):
+                raise RuntimeError("mask frame entries must be objects")
+            raw_index = frame.get("frame_index")
+            if isinstance(raw_index, bool) or not isinstance(raw_index, numbers.Integral):
+                raise RuntimeError("mask frame_index must be an integer")
+            frame_index = int(raw_index)
+            if not 0 <= frame_index < frames_used:
+                raise RuntimeError(
+                    f"mask frame_index {frame_index} is outside the sampled clip"
+                )
+            if frame_index in seen_frames:
+                raise RuntimeError("mask document repeats a frame_index")
+            seen_frames.add(frame_index)
+
+            objects = frame.get("objects")
+            if objects is None:
+                objects = []
+            if not isinstance(objects, list):
+                raise RuntimeError("mask frame objects must be a list")
+            if len(objects) > BEST_VIEW_MAX_OBJECTS_PER_FRAME:
+                raise RuntimeError("mask frame reports more objects than the supported bound")
+            for entry in objects:
+                if not isinstance(entry, dict):
+                    raise RuntimeError("mask objects must be objects")
+                track_id = _best_view_track_id(entry.get("track_id"))
+                rle = entry.get("rle")
+                pixels = int(decode_rle(rle, height, width).sum())
+                if pixels <= 0:
+                    continue
+                key = (category, track_id)
+                if key not in grouped:
+                    category_tracks.add(track_id)
+                    if len(category_tracks) > BEST_VIEW_MAX_TRACKS_PER_CATEGORY:
+                        raise RuntimeError(
+                            "mask document reports more tracks than the supported bound"
+                        )
+                    grouped[key] = []
+                    largest[key] = 0
+                grouped[key].append((frame_index, rle))
+                largest[key] = max(largest[key], pixels)
+
+    ranked = sorted(grouped, key=lambda key: (-largest[key], key[0], key[1]))
+    instances: list[dict[str, Any]] = []
+    for key in ranked[:BEST_VIEW_MAX_INSTANCES]:
+        category, track_id = key
+        instances.append(
+            {
+                "category": category,
+                "track_id": track_id,
+                "max_mask_pixel_count": largest[key],
+                "track": [
+                    {
+                        "frame_id": frame_index,
+                        "mask": decode_rle(rle, height, width),
+                        "rle": rle,
+                    }
+                    for frame_index, rle in sorted(grouped[key])
+                ],
+            }
+        )
+    return instances, len(grouped)
+
+
+def run_best_view_score(payload: dict[str, Any]) -> dict[str, Any]:
+    """Best-view leg C: weights-free, CPU-only scoring of the fal tracks."""
+    t_all = time.time()
+    work = Path(tempfile.mkdtemp(prefix="ras-best-view-score-"))
+    out_dir = work / "output"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timings: dict[str, int] = {}
+    frames_used = int(payload["expected_frames_used"])
+    width = int(payload["expected_model_frame_width"])
+    height = int(payload["expected_model_frame_height"])
+    try:
+        import numpy as np
+
+        t0 = time.time()
+        archive = work / BEST_VIEW_GEOMETRY_INPUTS_NAME
+        _download_gateway_artifact(
+            payload["geometry_inputs_url"],
+            archive,
+            BEST_VIEW_MAX_GEOMETRY_INPUT_BYTES,
+        )
+        documents: list[tuple[str, Any]] = []
+        for index, entry in enumerate(payload["masks"]):
+            destination = work / f"masks-{index}.json"
+            _download_gateway_artifact(
+                entry["url"],
+                destination,
+                BEST_VIEW_MAX_MASK_DOCUMENT_BYTES,
+            )
+            try:
+                documents.append(
+                    (entry["category"], json.loads(destination.read_text("utf-8")))
+                )
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"mask document for {entry['category']} is not valid JSON"
+                ) from exc
+        timings["download"] = int((time.time() - t0) * 1000)
+
+        # Upstream code only: this leg never loads a checkpoint and never
+        # touches CUDA, so it can run on the cheapest available worker.
+        t0 = time.time()
+        _ensure_ras_installed(require_sam3=False, ensure_weights=False)
+        ras_root = _ensure_ras_on_path()
+        vggt_source_revision = _verified_checkout_revision(ras_root / "vggt", VGGT_REVISION)
+        from src.geometry_utils import compute_surface_area_from_pointmap
+        from vggt.utils.geometry import unproject_depth_map_to_point_map
+
+        timings["bootstrap"] = int((time.time() - t0) * 1000)
+
+        t0 = time.time()
+        (
+            depth,
+            extrinsics,
+            intrinsics,
+            source_frame_indices,
+            source_frame_timestamps,
+        ) = _load_best_view_geometry_inputs(
+            archive,
+            expected_frames=frames_used,
+            expected_width=width,
+            expected_height=height,
+        )
+        world_points = np.asarray(
+            unproject_depth_map_to_point_map(depth[..., None], extrinsics, intrinsics),
+            dtype=np.float32,
+        )
+        if world_points.shape != (frames_used, height, width, 3):
+            raise RuntimeError("reconstructed point map does not match the expected model frames")
+        timings["geometry"] = int((time.time() - t0) * 1000)
+
+        t0 = time.time()
+        instances, total_instances = _best_view_instances_from_masks(
+            documents,
+            frames_used=frames_used,
+            height=height,
+            width=width,
+        )
+        timings["masks"] = int((time.time() - t0) * 1000)
+
+        t0 = time.time()
+        report = build_best_view_report(
+            instances=instances,
+            world_points=world_points,
+            surface_area_fn=compute_surface_area_from_pointmap,
+            out_dir=out_dir,
+            requested_categories=payload["categories"],
+            frames_used=frames_used,
+            model_frame_width=width,
+            model_frame_height=height,
+            source_frame_indices=source_frame_indices,
+            source_frame_timestamps=source_frame_timestamps,
+            total_instances=total_instances,
+            coordinate_system="vggt_first_camera",
+        )
+        timings["score"] = int((time.time() - t0) * 1000)
+
+        t0 = time.time()
+        artifacts = _artifact_manifest(out_dir, work, payload)
+        timings["artifact_delivery"] = int((time.time() - t0) * 1000)
+        timings["total"] = int((time.time() - t_all) * 1000)
+        delivery_error = _artifact_delivery_error(payload, artifacts)
+        response = {
+            "status": "ok",
+            "mode": "full",
+            "implementation": (
+                "Best-view surface-area scoring over fal SAM 3 tracks, implementing "
+                "ReplicateAnyScene view selection (arXiv:2604.10789)"
+            ),
+            "upstream_revision": RAS_REVISION,
+            "frames_used": frames_used,
+            "source_frame_indices": source_frame_indices,
+            "source_frame_timestamps": source_frame_timestamps,
+            "categories": payload["categories"],
+            "raw_track_count": total_instances,
+            "instance_count": report["returned_instances"],
+            "instances": [],
+            "geometry": {
+                "backend": "vggt_geometry_inputs",
+                "device": "cpu",
+                "source_revision": vggt_source_revision,
+                "unprojection": "vggt.utils.geometry.unproject_depth_map_to_point_map",
+                "coordinate_system": "vggt_first_camera",
+                "world_points_shape": list(world_points.shape),
+                "sam3_required": False,
+            },
+            "sam": {
+                "backend": "fal_sam3_video_rle",
+                "reason": "masks are supplied by the edge from the fal segmentation leg",
+            },
+            "best_view": {
+                "leg": "score",
+                "schema": BEST_VIEW_SCHEMA,
+                "artifact_name": BEST_VIEW_JSON_NAME,
+                "scale_policy": report["scale_policy"],
+                "model_frame_width": width,
+                "model_frame_height": height,
+                "total_instances": report["total_instances"],
+                "returned_instances": report["returned_instances"],
+                "truncated": report["truncated"],
+                "rle_scope": report["rle_scope"],
+                "agreement_counts": report["agreement_counts"],
+                "warnings": report["warnings"],
+            },
+            "artifacts": artifacts,
+            "timings_ms": timings,
+            "pipeline": [
+                {"id": "intake", "name": "Provider input intake", "status": "ok", "ms": timings.get("download")},
+                {"id": "geometry", "name": "Point map reconstruction", "status": "ok", "ms": timings.get("geometry")},
+                {"id": "masks", "name": "Mask decoding", "status": "ok", "ms": timings.get("masks")},
+                {"id": "best_view", "name": "Candidate scoring", "status": "ok", "ms": timings.get("score")},
+                {
+                    "id": "artifact_delivery",
+                    "name": "Artifact delivery",
+                    "status": "error" if delivery_error else "ok",
+                    "ms": timings.get("artifact_delivery"),
+                },
+            ],
+        }
+        if delivery_error:
+            response.update({"status": "error", **delivery_error})
+        return response
+    except Exception as exc:
+        timings["total"] = int((time.time() - t_all) * 1000)
+        return {
+            "status": "error",
+            "mode": "full",
+            "error": str(exc),
+            "timings_ms": timings,
+        }
+    finally:
+        if os.environ.get("STAGE2_KEEP_WORK") != "1":
+            shutil.rmtree(work, ignore_errors=True)
+
+
 def run_stage2_omega_geometry(payload: dict[str, Any]) -> dict[str, Any]:
     """Run genuine VGGT-Omega geometry through Meta's reviewed public Space.
 
@@ -4991,6 +5549,29 @@ def _attach_success_provenance(
             or artifacts.get("required_files") != list(BEST_VIEW_GEOMETRY_REQUIRED_ARTIFACTS)
         ):
             return provenance_error("best-view geometry")
+    if analysis_type == BEST_VIEW_SCORE_ANALYSIS_TYPE:
+        best_view = result.get("best_view")
+        artifacts = result.get("artifacts")
+        total_instances = best_view.get("total_instances") if isinstance(best_view, dict) else None
+        returned_instances = (
+            best_view.get("returned_instances") if isinstance(best_view, dict) else None
+        )
+        if (
+            not isinstance(best_view, dict)
+            or best_view.get("leg") != "score"
+            or best_view.get("schema") != BEST_VIEW_SCHEMA
+            or best_view.get("scale_policy") != BEST_VIEW_SCALE_POLICY
+            or best_view.get("artifact_name") != BEST_VIEW_JSON_NAME
+            or type(returned_instances) is not int
+            or not 0 <= returned_instances <= BEST_VIEW_MAX_INSTANCES
+            or type(total_instances) is not int
+            or total_instances < returned_instances
+            or best_view.get("truncated") is not (total_instances > returned_instances)
+            or not isinstance(artifacts, dict)
+            or artifacts.get("complete") is not True
+            or artifacts.get("required_files") != list(BEST_VIEW_SCORE_ARTIFACT_NAMES)
+        ):
+            return provenance_error("best-view scoring")
     if analysis_type == "dedup_ras_vggt_sam3":
         sam = result.get("sam")
         if not isinstance(sam, dict) or (
@@ -5186,6 +5767,20 @@ def run_stage2(payload: dict[str, Any]) -> dict[str, Any]:
                 "invalid_scene_parse_request",
             )
         result = run_scene_parse_catalog(normalized)
+        return _attach_success_provenance(
+            result,
+            mode=mode,
+            analysis_type=analysis_type,
+        )
+
+    if analysis_type == BEST_VIEW_SCORE_ANALYSIS_TYPE:
+        normalized, score_error = _validate_best_view_score_request(payload)
+        if score_error or normalized is None:
+            return input_error(
+                score_error or f"{BEST_VIEW_SCORE_ANALYSIS_TYPE} request is invalid",
+                "invalid_best_view_score_request",
+            )
+        result = run_best_view_score(normalized)
         return _attach_success_provenance(
             result,
             mode=mode,

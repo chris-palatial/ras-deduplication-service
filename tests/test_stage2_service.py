@@ -3584,5 +3584,408 @@ class BestViewAnalysisRegistryTest(unittest.TestCase):
         self.assertIn("best-view geometry", rejected["error"])
 
 
+def _coco_counts(mask: np.ndarray) -> str:
+    flat = np.asarray(mask, dtype=bool).flatten(order="F")
+    counts: list = []
+    current = False
+    run = 0
+    for value in flat:
+        if bool(value) == current:
+            run += 1
+            continue
+        counts.append(run)
+        current = bool(value)
+        run = 1
+    counts.append(run)
+    return " ".join(str(count) for count in counts)
+
+
+def _planar_points(frames: int, height: int, width: int, spacings):
+    grid_y, grid_x = np.mgrid[:height, :width]
+    points = np.zeros((frames, height, width, 3), dtype=np.float32)
+    for frame_id in range(frames):
+        points[frame_id, ..., 0] = grid_x * spacings[frame_id]
+        points[frame_id, ..., 1] = grid_y * spacings[frame_id]
+    return points
+
+
+def _cell_surface_area(pointmap, mask, max_triangle_size=2e-4):
+    points = np.asarray(pointmap, dtype=np.float64)
+    binary = np.asarray(mask, dtype=bool)
+    cells = binary[:-1, :-1] & binary[:-1, 1:] & binary[1:, :-1] & binary[1:, 1:]
+    if not np.any(cells):
+        return 0.0
+    top_left = points[:-1, :-1][cells]
+    top_right = points[:-1, 1:][cells]
+    bottom_left = points[1:, :-1][cells]
+    bottom_right = points[1:, 1:][cells]
+    total = 0.0
+    for a, b, c in (
+        (top_left, top_right, bottom_left),
+        (bottom_right, top_right, bottom_left),
+    ):
+        areas = 0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1)
+        total += float(np.sum(areas[(areas > 0) & (areas < max_triangle_size)]))
+    return total
+
+
+class BestViewScoreRequestValidationTest(unittest.TestCase):
+    def _request(self, **overrides):
+        request = {
+            "analysis_type": stage2.BEST_VIEW_SCORE_ANALYSIS_TYPE,
+            "mode": "full",
+            "geometry_inputs_url": "https://edge.example/provider/geometry_inputs.npz",
+            "masks": [{"category": "chair", "url": "https://edge.example/provider/masks.json"}],
+            "expected_frames_used": 3,
+            "expected_model_frame_width": 8,
+            "expected_model_frame_height": 8,
+            "categories": ["chair"],
+            "upload": {"base": "https://edge.example", "runId": "r", "token": "t"},
+        }
+        request.update(overrides)
+        return {key: value for key, value in request.items() if value is not None}
+
+    def test_accepts_a_well_formed_request(self):
+        normalized, error = stage2._validate_best_view_score_request(self._request())
+
+        self.assertIsNone(error)
+        self.assertEqual(normalized["expected_frames_used"], 3)
+        self.assertEqual(normalized["masks"], [
+            {"category": "chair", "url": "https://edge.example/provider/masks.json"}
+        ])
+
+    def test_rejects_inputs_from_another_origin(self):
+        for field, value in (
+            ("geometry_inputs_url", "https://attacker.example/geometry_inputs.npz"),
+            ("geometry_inputs_url", "http://edge.example/geometry_inputs.npz"),
+            ("geometry_inputs_url", "https://edge.example:8443/geometry_inputs.npz"),
+            ("geometry_inputs_url", "https://user:pw@edge.example/geometry_inputs.npz"),
+            ("masks", [{"category": "chair", "url": "https://cdn.example/masks.json"}]),
+        ):
+            with self.subTest(field=field, value=value):
+                _normalized, error = stage2._validate_best_view_score_request(
+                    self._request(**{field: value})
+                )
+                self.assertIn("artifact gateway origin", error)
+
+    def test_rejects_requests_without_an_upload_ticket(self):
+        _normalized, error = stage2._validate_best_view_score_request(
+            self._request(upload=None)
+        )
+
+        self.assertIn("upload ticket", error)
+
+    def test_rejects_unknown_fields_and_wrong_mode(self):
+        _normalized, unknown_error = stage2._validate_best_view_score_request(
+            self._request(video_url="https://edge.example/input.mp4")
+        )
+        _normalized, mode_error = stage2._validate_best_view_score_request(
+            self._request(mode="geometry")
+        )
+
+        self.assertIn("does not accept fields: video_url", unknown_error)
+        self.assertIn("requires mode full", mode_error)
+
+    def test_rejects_out_of_range_frame_and_dimension_expectations(self):
+        cases = (
+            ({"expected_frames_used": 25}, "expected_frames_used"),
+            ({"expected_frames_used": 1}, "expected_frames_used"),
+            ({"expected_frames_used": True}, "expected_frames_used"),
+            ({"expected_model_frame_width": 0}, "expected_model_frame_width"),
+            ({"expected_model_frame_height": 8193}, "expected_model_frame_height"),
+            ({"expected_model_frame_width": 2048, "expected_model_frame_height": 2048}, "pixels"),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=overrides):
+                _normalized, error = stage2._validate_best_view_score_request(
+                    self._request(**overrides)
+                )
+                self.assertIn(expected, error)
+
+    def test_rejects_mask_categories_outside_the_request(self):
+        _normalized, error = stage2._validate_best_view_score_request(
+            self._request(masks=[{"category": "sofa", "url": "https://edge.example/m.json"}])
+        )
+
+        self.assertIn("requested categories", error)
+
+    def test_rejects_duplicate_mask_categories_and_extra_keys(self):
+        _normalized, duplicate = stage2._validate_best_view_score_request(
+            self._request(
+                masks=[
+                    {"category": "chair", "url": "https://edge.example/a.json"},
+                    {"category": "chair", "url": "https://edge.example/b.json"},
+                ]
+            )
+        )
+        _normalized, extra = stage2._validate_best_view_score_request(
+            self._request(
+                masks=[
+                    {
+                        "category": "chair",
+                        "url": "https://edge.example/a.json",
+                        "prompt": "chair",
+                    }
+                ]
+            )
+        )
+
+        self.assertIn("unique", duplicate)
+        self.assertIn("exactly a category and a url", extra)
+
+    def test_run_stage2_reports_an_invalid_score_request_without_running_it(self):
+        with patch.object(stage2, "run_best_view_score") as runner:
+            result = stage2.run_stage2(
+                self._request(geometry_inputs_url="https://attacker.example/g.npz")
+            )
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error_code"], "invalid_best_view_score_request")
+        runner.assert_not_called()
+
+
+class BestViewScoreLegTest(unittest.TestCase):
+    frames = 3
+    height = 8
+    width = 8
+
+    def _geometry_inputs(self, path, **overrides):
+        arrays = {
+            "depth": np.full((self.frames, self.height, self.width), 2.0, dtype=np.float16),
+            "intrinsics": np.tile(np.eye(3, dtype=np.float32), (self.frames, 1, 1)),
+            "extrinsics": np.tile(
+                np.eye(4, dtype=np.float32)[:3, :], (self.frames, 1, 1)
+            ),
+            "source_frame_indices": np.arange(self.frames, dtype=np.int64),
+            "source_frame_timestamps": np.arange(self.frames, dtype=np.float64) * 0.5,
+            "model_frame_hw": np.asarray([self.height, self.width], dtype=np.int64),
+            "schema": np.array(b"palatial.geometry_inputs.v1"),
+        }
+        arrays.update(overrides)
+        np.savez_compressed(path, **arrays)
+
+    def _masks(self, *, frame_indices=None, sizes=None, track_id=1):
+        frame_indices = list(range(self.frames)) if frame_indices is None else frame_indices
+        sizes = sizes or [6, 3, 3]
+        frames = []
+        for position, frame_index in enumerate(frame_indices):
+            mask = np.zeros((self.height, self.width), dtype=bool)
+            size = sizes[position]
+            mask[:size, :size] = True
+            frames.append(
+                {
+                    "frame_index": frame_index,
+                    "objects": [{"track_id": track_id, "rle": _coco_counts(mask)}],
+                }
+            )
+        return {"frames": frames}
+
+    def _run(self, *, geometry_overrides=None, mask_document=None, spacings=None, **payload):
+        spacings = spacings or [0.01, 0.1, 0.1]
+        points = _planar_points(self.frames, self.height, self.width, spacings)
+        document = self._masks() if mask_document is None else mask_document
+
+        def fake_download(url, destination, _max_bytes, timeout_s=120):
+            if url.endswith(".npz"):
+                self._geometry_inputs(destination, **(geometry_overrides or {}))
+            else:
+                Path(destination).write_text(json.dumps(document), encoding="utf-8")
+            return Path(destination).stat().st_size
+
+        geometry_module = types.ModuleType("src.geometry_utils")
+        geometry_module.compute_surface_area_from_pointmap = _cell_surface_area
+        src_package = types.ModuleType("src")
+        src_package.__path__ = []
+        vggt_package = types.ModuleType("vggt")
+        vggt_package.__path__ = []
+        vggt_utils_package = types.ModuleType("vggt.utils")
+        vggt_utils_package.__path__ = []
+        vggt_geometry_module = types.ModuleType("vggt.utils.geometry")
+        vggt_geometry_module.unproject_depth_map_to_point_map = (
+            lambda _depth, _extrinsics, _intrinsics: points
+        )
+        runtime_modules = {
+            "src": src_package,
+            "src.geometry_utils": geometry_module,
+            "vggt": vggt_package,
+            "vggt.utils": vggt_utils_package,
+            "vggt.utils.geometry": vggt_geometry_module,
+        }
+        captured: dict = {}
+
+        def capture_manifest(out_dir, _work, manifest_payload=None):
+            captured["files"] = sorted(item.name for item in Path(out_dir).iterdir())
+            captured["report"] = json.loads(
+                (Path(out_dir) / "best_view.json").read_text("utf-8")
+            )
+            return {
+                "durable": True,
+                "complete": True,
+                "files": captured["files"],
+                "required_files": list(stage2._required_artifacts(manifest_payload)),
+                "receipts": [],
+                "errors": [],
+            }
+
+        request = {
+            "analysis_type": stage2.BEST_VIEW_SCORE_ANALYSIS_TYPE,
+            "mode": "full",
+            "geometry_inputs_url": "https://edge.example/provider/geometry_inputs.npz",
+            "masks": [{"category": "chair", "url": "https://edge.example/provider/masks.json"}],
+            "expected_frames_used": self.frames,
+            "expected_model_frame_width": self.width,
+            "expected_model_frame_height": self.height,
+            "categories": ["chair"],
+            "upload": {"base": "https://edge.example", "runId": "r", "token": "t"},
+        }
+        request.update(payload)
+
+        with patch.dict(sys.modules, runtime_modules), patch.object(
+            stage2, "_download_gateway_artifact", side_effect=fake_download
+        ), patch.object(stage2, "_ensure_ras_installed") as bootstrap, patch.object(
+            stage2, "_ensure_ras_on_path", return_value=Path("/runtime/ReplicateAnyScene")
+        ), patch.object(
+            stage2, "_verified_checkout_revision", return_value=stage2.DEFAULT_VGGT_REVISION
+        ), patch.object(stage2, "_artifact_manifest", side_effect=capture_manifest):
+            result = stage2.run_best_view_score(request)
+        captured["bootstrap"] = bootstrap
+        return result, captured
+
+    def test_scores_every_visible_frame_and_never_loads_weights(self):
+        result, captured = self._run()
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["frames_used"], 3)
+        self.assertEqual(result["raw_track_count"], 1)
+        self.assertEqual(result["instance_count"], 1)
+        self.assertEqual(captured["files"], ["best_view.json"])
+        captured["bootstrap"].assert_called_once_with(
+            require_sam3=False, ensure_weights=False
+        )
+
+        report = captured["report"]
+        self.assertEqual(report["schema"], "palatial.best_view.v1")
+        self.assertEqual(report["frames_used"], 3)
+        instance = report["instances"][0]
+        self.assertEqual(instance["category"], "chair")
+        self.assertEqual(instance["track_id"], 1)
+        self.assertEqual(instance["candidate_count"], 3)
+        self.assertEqual(
+            [candidate["sampled_frame_id"] for candidate in instance["candidates"]],
+            [0, 1, 2],
+        )
+        self.assertEqual(instance["best_frame_2d"], 0)
+        self.assertEqual(instance["best_frame_3d"], 1)
+        self.assertIs(instance["agreement"], False)
+        self.assertEqual(result["best_view"]["agreement_counts"]["disagree"], 1)
+        json.dumps(result)
+
+    def test_accepts_a_bare_frame_list_document(self):
+        result, captured = self._run(mask_document=self._masks()["frames"])
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(captured["report"]["instances"][0]["candidate_count"], 3)
+
+    def test_rejects_a_frame_index_outside_the_sampled_clip(self):
+        result, _captured = self._run(
+            mask_document=self._masks(frame_indices=[0, 1, 7])
+        )
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("outside the sampled clip", result["error"])
+
+    def test_rejects_a_mask_whose_canvas_is_not_the_model_frame(self):
+        wrong = self._masks()
+        mask = np.zeros((self.height, self.width + 2), dtype=bool)
+        mask[:4, :4] = True
+        wrong["frames"][0]["objects"][0]["rle"] = _coco_counts(mask)
+
+        result, _captured = self._run(mask_document=wrong)
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("RLE", result["error"])
+
+    def test_rejects_a_repeated_frame_index(self):
+        result, _captured = self._run(mask_document=self._masks(frame_indices=[0, 1, 1]))
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("repeats a frame_index", result["error"])
+
+    def test_rejects_a_non_integer_track_id(self):
+        wrong = self._masks()
+        wrong["frames"][0]["objects"][0]["track_id"] = "chair-1"
+
+        result, _captured = self._run(mask_document=wrong)
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("track_id", result["error"])
+
+    def test_rejects_geometry_inputs_that_disagree_with_the_expected_frames(self):
+        result, _captured = self._run(
+            geometry_overrides={
+                "model_frame_hw": np.asarray([self.height, self.width], dtype=np.int64),
+                "depth": np.full((2, self.height, self.width), 2.0, dtype=np.float16),
+                "intrinsics": np.tile(np.eye(3, dtype=np.float32), (2, 1, 1)),
+                "extrinsics": np.tile(np.eye(4, dtype=np.float32)[:3, :], (2, 1, 1)),
+                "source_frame_indices": np.arange(2, dtype=np.int64),
+                "source_frame_timestamps": np.zeros(2, dtype=np.float64),
+            }
+        )
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("frame count does not match expected_frames_used", result["error"])
+
+    def test_rejects_geometry_inputs_whose_model_frame_size_disagrees(self):
+        result, _captured = self._run(
+            geometry_overrides={
+                "depth": np.full((self.frames, self.height, self.width + 2), 2.0, dtype=np.float16),
+                "model_frame_hw": np.asarray([self.height, self.width + 2], dtype=np.int64),
+            }
+        )
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("model frame size does not match", result["error"])
+
+    def test_rejects_geometry_inputs_with_a_foreign_schema(self):
+        result, _captured = self._run(
+            geometry_overrides={"schema": np.array(b"palatial.geometry_inputs.v0")}
+        )
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("schema must be", result["error"])
+
+    def test_provenance_rejects_inconsistent_instance_counts(self):
+        def response(total, returned, truncated):
+            return {
+                "status": "ok",
+                "mode": "full",
+                "best_view": {
+                    "leg": "score",
+                    "schema": "palatial.best_view.v1",
+                    "artifact_name": "best_view.json",
+                    "scale_policy": "relative_median_adjacent_spacing_v1",
+                    "total_instances": total,
+                    "returned_instances": returned,
+                    "truncated": truncated,
+                },
+                "artifacts": {"complete": True, "required_files": ["best_view.json"]},
+            }
+
+        accepted = stage2._attach_success_provenance(
+            response(40, 32, True),
+            mode="full",
+            analysis_type=stage2.BEST_VIEW_SCORE_ANALYSIS_TYPE,
+        )
+        rejected = stage2._attach_success_provenance(
+            response(40, 32, False),
+            mode="full",
+            analysis_type=stage2.BEST_VIEW_SCORE_ANALYSIS_TYPE,
+        )
+
+        self.assertEqual(accepted["status"], "ok")
+        self.assertEqual(rejected["status"], "error")
+        self.assertIn("best-view scoring", rejected["error"])
+
+
 if __name__ == "__main__":
     unittest.main()
