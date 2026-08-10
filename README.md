@@ -24,6 +24,7 @@ contracts.
 | --- | --- |
 | `stage2_service.py` | Calls RAS Stage 2; provides model-free, local VGGT, and hosted VGGT-Omega geometry modes |
 | `object_catalog.py` | Builds a bounded, versioned catalog and JPEG crop atlas from Full RAS masks |
+| `scene_parse_catalog.py` | Builds the bounded inline Scene Parse catalog and conservatively retains brief object hypotheses |
 | `point_cloud_glb.py` | Exports bounded colored VGGT points + camera frustums as glTF 2.0 GLB |
 | `artifact_upload.py` | Uses Agent Lab upload tickets to deliver files to R2 and return receipts |
 | `handler.py` | RunPod Serverless entry |
@@ -39,11 +40,80 @@ contracts.
 
 New Agent Lab requests also carry a stable `analysis_type`. This worker owns
 `validation_v1`, the internal `validation_object_catalog_transport_v1` canary,
-`geometry_vggt_1b`, `geometry_vggt_omega_1b`, and `dedup_ras_vggt_sam3`; it
+`geometry_vggt_1b`, `geometry_vggt_omega_1b`, `dedup_ras_vggt_sam3`, and
+`scene_parse_catalog_v1`; it
 rejects fal mask types because those belong to a separate backend. Typed
 results preserve the analysis id on both success and failure and verify the
 model runner's provenance instead of rewriting it. Legacy requests without
 `analysis_type` remain supported.
+
+### Scene Parse catalog profile
+
+`scene_parse_catalog_v1` is a closed, video-only production contract. It keeps
+the VGGT world points and SAM tracks inside the worker and returns only bounded
+catalog metadata; it never generates or uploads a point-cloud GLB, mask video,
+crop atlas, or other Agent Lab artifact.
+
+```json
+{
+  "analysis_type": "scene_parse_catalog_v1",
+  "mode": "full",
+  "video_url": "https://objects.example/exact-source.mp4?signature=redacted",
+  "source_sha256": "<64 lowercase hex characters>",
+  "source_size_bytes": 8421104,
+  "category_prompts": ["chair", "table"]
+}
+```
+
+`source_size_bytes` is optional; when present it must match both a declared
+Content-Length and the streamed byte count. The digest, actual byte count, and
+video duration are verified before model bootstrap. This profile accepts a
+streamed source of at most 2 GiB and 60 seconds, independently of Agent Lab's
+unchanged 64 MiB remote-video cap. Inline/base64 sources are not accepted.
+Unknown fields are rejected, including caller-controlled model, frame-count,
+room-alignment, upload, artifact, and object-catalog options. Category prompts
+are 1–32 trimmed strings of at most 64 characters and are unique after case
+folding.
+
+Frame sampling is service-owned policy
+`uniform_2fps_min24_cap96_prompt_budget768_v1`: target two uniformly spaced
+frames per second, clamp to 24–96, then reduce toward 24 as needed to keep at
+most 768 prompt-frame tracking operations. The decoder first verifies one
+bounded stream (maximum 14,400 decoded frames, 8,192 on either dimension, and
+16,777,216 pixels per frame), then materializes only the selected frames as
+scaled JPEGs. It never expands the whole video to an image sequence. The
+sampling decision and reported duration use this verified decoded-frame
+timeline rather than container metadata. The response records the budget,
+requested and actual frame counts, and exact source-frame indices and
+timestamps. Up to 128 deterministic, result-scoped
+object hypotheses are returned inline. Every object contains all non-empty
+mask evidence across the bounded sample, an exact normalized mask box, mask
+area, a track-relative view-quality score, and a best-evidence index. Object
+keys are stable for identical source bytes, ordered prompts, profile, and model
+result; they are not cross-model or cross-profile global identities.
+
+Public RAS normally removes hypotheses visible in fewer than three sampled
+frames. This profile conservatively restores short tracks that do not overlap
+an already-returned 3D object, clusters overlapping short tracks before adding
+them, labels each object `single_frame`, `limited`, or `supported`, and emits a
+warning for low-support results. Existing Agent Lab deduplication keeps the
+original RAS behavior unchanged.
+
+Production VGGT weights live under the isolated
+`STAGE2_MODELS_DIR/SceneParse` tree and are pinned to the commercially licensed
+`facebook/VGGT-1B-Commercial` repository revision reported in every response.
+The worker constructs the architecture from the pinned VGGT source and loads
+the exact safetensors checkpoint strictly, so no mutable remote config is used.
+Each worker process recomputes the checkpoint digest before caching an
+unchanged-file attestation; size or filesystem metadata changes force another
+digest check.
+The verified default segmentation backend remains pinned `facebook/sam3` in
+the canonical Python 3.11 / PyTorch 2.4 / CUDA 12.4 image. A separately built
+compatible worker may set `STAGE2_SCENE_PARSE_SAM_BACKEND=sam3.1_multiplex`,
+but the caller cannot select a model. That backend fails preflight unless its
+pinned checkpoint is mounted and the runtime meets SAM 3.1's Python 3.12,
+PyTorch 2.7, and CUDA 12.6 minimums; a worker never claims SAM 3.1 provenance
+without loading that explicit backend.
 
 ### Negotiated object catalog
 

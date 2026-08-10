@@ -49,6 +49,8 @@ class Stage2ServiceTest(unittest.TestCase):
         self.assertIn("artifact_contract.py", compile_step)
         self.assertIn("object_catalog.py", wrapper_copy)
         self.assertIn("object_catalog.py", compile_step)
+        self.assertIn("scene_parse_catalog.py", wrapper_copy)
+        self.assertIn("scene_parse_catalog.py", compile_step)
 
     def test_endpoint_response_reports_exact_code_revision(self):
         revision = "0123456789abcdef0123456789abcdef01234567"

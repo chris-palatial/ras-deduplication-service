@@ -31,7 +31,7 @@ jobs:
           python -m pip install "numpy>=1.26,<2" "opencv-python-headless>=4.10,<5" "requests>=2.31,<3"
       - name: Compile and test
         run: |
-          python -m py_compile handler.py stage2_service.py artifact_upload.py artifact_contract.py point_cloud_glb.py object_catalog.py
+          python -m py_compile handler.py stage2_service.py artifact_upload.py artifact_contract.py point_cloud_glb.py object_catalog.py scene_parse_catalog.py
           python -m unittest discover -s tests -p 'test_*.py'
       - name: Validate bootstrap shell
         run: bash -n scripts/start_serverless.sh scripts/download_weights.sh
