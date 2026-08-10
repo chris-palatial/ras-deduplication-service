@@ -35,8 +35,24 @@ contracts.
 
 - `dry_run` — download video + sample frames; typed validation also verifies
   pinned RAS/VGGT/SAM3 source bootstrap, but downloads no model weights
-- `geometry` — run real VGGT geometry; deliberately skip SAM3 and dedup
-- `full` — exact RAS Stage 2 path (stops before Stage 3 mesh generation)
+- `geometry`: run real VGGT geometry; deliberately skip SAM3 and dedup
+- `full`: exact RAS Stage 2 path (stops before Stage 3 mesh generation)
+
+Local VGGT 1B geometry and Full RAS accept signed remote sources up to a
+500 MiB worker hard limit and 60 seconds. The slightly larger binary worker
+limit intentionally accepts the Agent Lab caller limit of 500,000,000 decimal
+bytes. New callers may provide `source_size_bytes` and `source_sha256`; when
+present, both are verified against the downloaded bytes before runtime
+bootstrap or model work. Legacy callers may omit either field.
+
+Before model bootstrap, these two modes count and validate the complete decoded
+stream, enforce an 8,192-pixel edge limit, a
+16,777,216-pixel frame limit, and a 14,400 decoded-frame limit. They then use the
+caller's 2–160 frame budget to select uniformly across the full decoded timeline
+and materialize only those frames as scaled JPEGs, with a 256 MiB sampled-file limit. They no
+longer call the upstream helper that first expands every source frame to PNG.
+Validation-only and hosted VGGT-Omega retain the existing 64 MiB remote-source
+boundary; the Omega adapter itself is unchanged.
 
 New Agent Lab requests also carry a stable `analysis_type`. This worker owns
 `validation_v1`, the internal `validation_object_catalog_transport_v1` canary,
@@ -68,8 +84,8 @@ crop atlas, or other Agent Lab artifact.
 `source_size_bytes` is optional; when present it must match both a declared
 Content-Length and the streamed byte count. The digest, actual byte count, and
 video duration are verified before model bootstrap. This profile accepts a
-streamed source of at most 2 GiB and 60 seconds, independently of Agent Lab's
-unchanged 64 MiB remote-video cap. Inline/base64 sources are not accepted.
+streamed source of at most 2 GiB and 60 seconds, independently of the separate
+Agent Lab research-mode source limits. Inline/base64 sources are not accepted.
 Unknown fields are rejected, including caller-controlled model, frame-count,
 room-alignment, upload, artifact, and object-catalog options. Category prompts
 are 1–32 trimmed strings of at most 64 characters and are unique after case

@@ -458,7 +458,6 @@ class ObjectCatalogNegotiationTest(unittest.TestCase):
         models.load_vggt_model = lambda: Model()
         models.unload_model = lambda _model: None
         utils = types.ModuleType("src.utils")
-        utils.load_video_frames = lambda _path, _max_frames: Frames()
         utils.vis_instance_masks = lambda _colors, _masks, path: Path(path).write_bytes(b"mp4")
         geometry = types.ModuleType("src.geometry_utils")
         geometry.align_to_room_coordinate_system = lambda *_args: (np.eye(3), np.zeros(3))
@@ -513,8 +512,21 @@ class ObjectCatalogNegotiationTest(unittest.TestCase):
         }
         with patch.dict(sys.modules, modules), patch.object(
             stage2,
-            "_materialize_video",
+            "_materialize_standard_video",
             return_value=Path("source.mp4"),
+        ), patch.object(
+            stage2,
+            "_prepare_standard_vggt_sample",
+            return_value=(
+                [Path("frame-000001.jpg"), Path("frame-000002.jpg")],
+                [5, 9],
+                [0.0, 0.033367],
+                0.066734,
+            ),
+        ), patch.object(
+            stage2,
+            "_load_preprocessed_sampled_images",
+            return_value=Frames(),
         ), patch.object(stage2, "_ensure_ras_installed"), patch.object(
             stage2,
             "_ensure_ras_on_path",
@@ -524,10 +536,8 @@ class ObjectCatalogNegotiationTest(unittest.TestCase):
             "_verified_checkout_revision",
             side_effect=[stage2.DEFAULT_VGGT_REVISION, stage2.DEFAULT_SAM3_REVISION],
         ), patch.object(stage2, "_link_models_dir"), patch.object(
-            stage2,
-            "_source_frame_plan",
-            return_value=([5, 9], [0.0, 0.033366999999999994]),
-        ), patch.object(stage2, "_export_vggt_artifacts", return_value={}), patch.object(
+            stage2, "_export_vggt_artifacts", return_value={}
+        ), patch.object(
             stage2,
             "_normalize_mask_video",
             return_value={"codec": "h264"},
@@ -545,7 +555,7 @@ class ObjectCatalogNegotiationTest(unittest.TestCase):
         self.assertIn("object_catalog", [step["id"] for step in result["pipeline"]])
 
     def test_direct_full_runner_rejects_bad_negotiation_before_materialization(self):
-        with patch.object(stage2, "_materialize_video") as materialize:
+        with patch.object(stage2, "_materialize_standard_video") as materialize:
             result = stage2.run_stage2_full({
                 "mode": "full",
                 "object_catalog_version": 1,
