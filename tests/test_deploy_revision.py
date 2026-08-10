@@ -28,6 +28,29 @@ SOURCE_EVIDENCE = {
 }
 
 
+class _FakeClock:
+    """Monotonic clock advanced only by the sleeps of the code under test."""
+
+    def __init__(self, start: float = 1_000.0):
+        self.now = start
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _pinned_template(revision: str) -> dict:
+    return {
+        "name": "stage2",
+        "imageName": "runpod/pytorch:test",
+        "env": {"STAGE2_CODE_REV": revision, "STAGE2_MODE_DEFAULT": "geometry"},
+        "dockerEntrypoint": ["bash", "-lc"],
+        "dockerStartCmd": [deploy_revision.bootstrap_command(revision)],
+    }
+
+
 class DeployRevisionTests(unittest.TestCase):
     def test_bootstrap_clones_the_canonical_deduplication_repository(self):
         root = Path(__file__).resolve().parents[1]
@@ -70,6 +93,21 @@ class DeployRevisionTests(unittest.TestCase):
         )
         self.assertGreaterEqual(rollout_budget, max_execution + 600)
         self.assertIn("timeout-minutes: 60", workflow)
+
+    def test_release_budget_reserves_a_fleet_window_beside_the_smoke_window(self):
+        workflow = (
+            Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+        ).read_text()
+
+        rollout_budget = int(
+            workflow.split("--rollout-timeout-seconds ", 1)[1].splitlines()[0]
+        )
+        smoke_budget = int(workflow.split("--smoke-timeout-seconds ", 1)[1].splitlines()[0])
+
+        # The smoke budget is reserved out of the deployment budget, so the
+        # remainder is what the fleet actually gets to finish draining in.
+        self.assertGreater(rollout_budget, smoke_budget)
+        self.assertGreaterEqual(rollout_budget - smoke_budget, 900)
 
     def test_payload_pins_revision_and_preserves_existing_template_fields(self):
         current = {
@@ -279,6 +317,117 @@ class DeployRevisionTests(unittest.TestCase):
 
         self.assertEqual(report["version"], "8")
         self.assertEqual(read.call_count, 2)
+
+    def test_revision_pins_applied_only_accepts_a_template_pinned_to_that_commit(self):
+        pinned = deploy_revision.build_payload({"name": "stage2", "env": {}}, REVISION)
+
+        self.assertTrue(deploy_revision.revision_pins_applied(pinned, REVISION))
+        # A template pinned to another commit is a real change, so the deploy
+        # still owes an endpoint version advance.
+        self.assertFalse(deploy_revision.revision_pins_applied(pinned, NEWER_REVISION))
+        self.assertFalse(
+            deploy_revision.revision_pins_applied({"name": "stage2", "env": {}}, REVISION)
+        )
+        self.assertFalse(
+            deploy_revision.revision_pins_applied(
+                dict(pinned, dockerEntrypoint=["bash", "-c"]), REVISION
+            )
+        )
+        self.assertFalse(
+            deploy_revision.revision_pins_applied(dict(pinned, dockerStartCmd=["sleep 1"]), REVISION)
+        )
+
+    def test_endpoint_rollout_converges_when_the_template_already_carried_the_pins(self):
+        # The update was a no-op, so RunPod never issues a new endpoint version
+        # and the current one already reflects the target template.
+        snapshot = {"version": 9, "workers": [{"status": "RUNNING", "slsVersion": 9}]}
+        with patch.object(deploy_revision, "request_json", return_value=snapshot), patch.object(
+            deploy_revision.time, "sleep"
+        ) as sleep:
+            report = deploy_revision.wait_for_endpoint_rollout(
+                "endpoint-test",
+                "9",
+                "test-key",
+                deadline=time.monotonic() + 60,
+                expect_version_change=False,
+            )
+
+        self.assertEqual(report["status"], "already_converged")
+        self.assertEqual(report["observation"], "fleet_on_target_version")
+        self.assertFalse(report["version_advanced"])
+        self.assertEqual(report["polls"], 1)
+        self.assertEqual(report["active_workers"], 1)
+        self.assertEqual(report["workers_on_target_version"], 1)
+        sleep.assert_not_called()
+
+    def test_endpoint_rollout_still_requires_an_advance_when_the_template_changed(self):
+        # A fleet uniformly on the previous version is uniformly on the
+        # previous code, so a genuine deploy must not accept it.
+        snapshots = [
+            {"version": 9, "workers": [{"status": "RUNNING", "slsVersion": 9}]},
+            {"version": 9, "workers": [{"status": "RUNNING", "slsVersion": 9}]},
+            {"version": 10, "workers": [{"status": "RUNNING", "slsVersion": 10}]},
+        ]
+        with patch.object(deploy_revision, "request_json", side_effect=snapshots), patch.object(
+            deploy_revision.time, "sleep"
+        ) as sleep:
+            report = deploy_revision.wait_for_endpoint_rollout(
+                "endpoint-test",
+                "9",
+                "test-key",
+                deadline=time.monotonic() + 60,
+                expect_version_change=True,
+            )
+
+        self.assertEqual(report["status"], "converged")
+        self.assertTrue(report["version_advanced"])
+        self.assertEqual(report["version"], "10")
+        self.assertEqual(report["polls"], 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_endpoint_rollout_reports_a_draining_fleet_instead_of_failing(self):
+        clock = _FakeClock()
+        mixed = {
+            "version": 10,
+            "workers": [
+                {"status": "RUNNING", "slsVersion": 10},
+                {"status": "RUNNING", "slsVersion": 9},
+            ],
+        }
+        with patch.object(deploy_revision, "request_json", return_value=mixed), patch.object(
+            deploy_revision.time, "monotonic", clock.monotonic
+        ), patch.object(deploy_revision.time, "sleep", clock.sleep):
+            report = deploy_revision.wait_for_endpoint_rollout(
+                "endpoint-test",
+                "9",
+                "test-key",
+                deadline=clock.monotonic() + 12.0,
+            )
+
+        self.assertEqual(report["status"], "fleet_not_converged")
+        self.assertEqual(report["observation"], "mixed_worker_versions")
+        self.assertEqual(report["active_workers"], 2)
+        self.assertEqual(report["workers_on_target_version"], 1)
+        self.assertEqual(report["polls"], 3)
+        self.assertEqual(clock.now, 1_012.0)
+
+    def test_endpoint_rollout_reports_a_missing_advance_without_raising(self):
+        clock = _FakeClock()
+        stale = {"version": 9, "workers": [{"status": "RUNNING", "slsVersion": 9}]}
+        with patch.object(deploy_revision, "request_json", return_value=stale), patch.object(
+            deploy_revision.time, "monotonic", clock.monotonic
+        ), patch.object(deploy_revision.time, "sleep", clock.sleep):
+            report = deploy_revision.wait_for_endpoint_rollout(
+                "endpoint-test",
+                "9",
+                "test-key",
+                deadline=clock.monotonic() + 7.0,
+                expect_version_change=True,
+            )
+
+        self.assertEqual(report["status"], "fleet_not_converged")
+        self.assertEqual(report["observation"], "endpoint_version_not_advanced")
+        self.assertEqual(report["polls"], 2)
 
     def test_post_deploy_smoke_requires_ok_dry_run_from_requested_revision(self):
         responses = [
@@ -498,6 +647,230 @@ class DeployRevisionTests(unittest.TestCase):
         self.assertEqual(methods, ["GET", "GET"])
         self.assertEqual(report["status"], "skipped_stale_revision")
         self.assertEqual(report["current_main_revision"], NEWER_REVISION)
+
+    def test_rerun_against_an_already_pinned_template_deploys_without_an_advance(self):
+        # The exact shape of a retried deploy: the first attempt applied the
+        # template, so the retry's update changes nothing and no version bump
+        # is ever coming. This must converge on the first poll.
+        current = _pinned_template(REVISION)
+        endpoint = {"version": 9, "workers": [{"status": "RUNNING", "slsVersion": 9}]}
+
+        def runpod_request(method, url, _api_key, payload=None, *, deadline=None):
+            if "/endpoints/" in url:
+                return endpoint
+            if method == "GET":
+                return current
+            return payload
+
+        stdout = io.StringIO()
+        with patch.object(deploy_revision, "request_json", side_effect=runpod_request), patch.object(
+            deploy_revision, "github_branch_head", return_value=REVISION
+        ), patch.object(
+            deploy_revision,
+            "run_post_deploy_smoke",
+            return_value={"status": "passed", "attempts": 1, "revision": REVISION},
+        ) as smoke, patch.object(deploy_revision.time, "sleep") as sleep, patch.object(
+            sys,
+            "argv",
+            ["deploy_revision.py", "--revision", REVISION, "--template-id", "template-test"],
+        ), patch.dict(os.environ, {"RUNPOD_API_KEY": "test-key"}, clear=True), contextlib.redirect_stdout(stdout):
+            deploy_revision.main()
+
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(report["status"], "deployed")
+        self.assertTrue(report["template_already_pinned"])
+        self.assertEqual(report["rollout"]["status"], "already_converged")
+        self.assertFalse(report["rollout"]["version_advanced"])
+        self.assertEqual(report["rollout"]["polls"], 1)
+        sleep.assert_not_called()
+        smoke.assert_called_once()
+
+    def test_deployment_budget_reserves_the_whole_smoke_window(self):
+        captured = {}
+        clock = _FakeClock()
+        current = {"name": "stage2", "env": {"STAGE2_MODE_DEFAULT": "geometry"}}
+
+        def runpod_request(method, url, _api_key, payload=None, *, deadline=None):
+            if "/endpoints/" in url:
+                return {"version": 9, "workers": []}
+            if method == "GET":
+                return current
+            return payload
+
+        def rollout(_endpoint, _previous, _api_key, *, deadline, expect_version_change):
+            captured["fleet_deadline"] = deadline
+            captured["expect_version_change"] = expect_version_change
+            return {"status": "converged", "version": "10"}
+
+        def smoke(_endpoint, _revision, _api_key, *, timeout_seconds, deadline=None):
+            captured["smoke_deadline"] = deadline
+            captured["smoke_timeout_seconds"] = timeout_seconds
+            return {"status": "passed", "attempts": 1, "revision": REVISION}
+
+        stdout = io.StringIO()
+        with patch.object(deploy_revision, "request_json", side_effect=runpod_request), patch.object(
+            deploy_revision, "github_branch_head", return_value=REVISION
+        ), patch.object(
+            deploy_revision, "wait_for_endpoint_rollout", side_effect=rollout
+        ), patch.object(
+            deploy_revision, "run_post_deploy_smoke", side_effect=smoke
+        ), patch.object(
+            deploy_revision.time, "monotonic", clock.monotonic
+        ), patch.object(
+            sys,
+            "argv",
+            [
+                "deploy_revision.py",
+                "--revision",
+                REVISION,
+                "--template-id",
+                "template-test",
+                "--rollout-timeout-seconds",
+                "1200",
+                "--smoke-timeout-seconds",
+                "300",
+            ],
+        ), patch.dict(os.environ, {"RUNPOD_API_KEY": "test-key"}, clear=True), contextlib.redirect_stdout(stdout):
+            deploy_revision.main()
+
+        self.assertTrue(captured["expect_version_change"])
+        self.assertEqual(captured["fleet_deadline"], 1_000.0 + 1_200 - 300)
+        self.assertEqual(captured["smoke_deadline"], 1_000.0 + 300)
+        self.assertEqual(captured["smoke_timeout_seconds"], 300)
+        self.assertEqual(json.loads(stdout.getvalue())["status"], "deployed")
+
+    def test_deploy_rejects_a_smoke_budget_that_would_starve_the_fleet_window(self):
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "deploy_revision.py",
+                "--revision",
+                REVISION,
+                "--template-id",
+                "template-test",
+                "--rollout-timeout-seconds",
+                "600",
+                "--smoke-timeout-seconds",
+                "600",
+            ],
+        ), patch.dict(os.environ, {"RUNPOD_API_KEY": "test-key"}, clear=True):
+            with self.assertRaises(SystemExit) as raised:
+                deploy_revision.main()
+
+        self.assertIn("must exceed --smoke-timeout-seconds", str(raised.exception))
+
+    def _run_unconverged_fleet_deploy(self, smoke_patch):
+        clock = _FakeClock()
+        current = {"name": "stage2", "env": {"STAGE2_MODE_DEFAULT": "geometry"}}
+        before = [{"version": 9, "workers": [{"status": "RUNNING", "slsVersion": 9}]}]
+        mixed = {
+            "version": 10,
+            "workers": [
+                {"status": "RUNNING", "slsVersion": 10},
+                {"status": "RUNNING", "slsVersion": 9},
+            ],
+        }
+
+        def runpod_request(method, url, _api_key, payload=None, *, deadline=None):
+            if "/endpoints/" in url:
+                return before.pop() if before else mixed
+            if method == "GET":
+                return current
+            return payload
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch.object(deploy_revision, "request_json", side_effect=runpod_request), patch.object(
+            deploy_revision, "github_branch_head", return_value=REVISION
+        ), smoke_patch as smoke, patch.object(
+            deploy_revision.time, "monotonic", clock.monotonic
+        ), patch.object(deploy_revision.time, "sleep", clock.sleep), patch.object(
+            sys,
+            "argv",
+            [
+                "deploy_revision.py",
+                "--revision",
+                REVISION,
+                "--template-id",
+                "template-test",
+                "--rollout-timeout-seconds",
+                "300",
+                "--smoke-timeout-seconds",
+                "30",
+            ],
+        ), patch.dict(os.environ, {"RUNPOD_API_KEY": "test-key"}, clear=True), contextlib.redirect_stdout(
+            stdout
+        ), contextlib.redirect_stderr(stderr):
+            try:
+                deploy_revision.main()
+            except RuntimeError as error:
+                return None, stderr.getvalue(), smoke, error
+        return json.loads(stdout.getvalue()), stderr.getvalue(), smoke, None
+
+    def test_unconverged_fleet_is_reported_and_still_deploys_once_the_smoke_passes(self):
+        report, stderr, smoke, error = self._run_unconverged_fleet_deploy(
+            patch.object(
+                deploy_revision,
+                "run_post_deploy_smoke",
+                return_value={"status": "passed", "attempts": 1, "revision": REVISION},
+            )
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(report["status"], "deployed")
+        self.assertEqual(report["rollout"]["status"], "fleet_not_converged")
+        self.assertEqual(report["rollout"]["observation"], "mixed_worker_versions")
+        self.assertEqual(report["rollout"]["active_workers"], 2)
+        self.assertEqual(report["rollout"]["workers_on_target_version"], 1)
+        self.assertIn("did not finish converging", stderr)
+        # The exhausted fleet window must not eat the authoritative check: the
+        # smoke still owns the last 30 seconds of the 300 second budget.
+        self.assertEqual(smoke.call_args.kwargs["deadline"], 1_000.0 + 300)
+        self.assertEqual(smoke.call_args.kwargs["timeout_seconds"], 30)
+
+    def test_unconverged_fleet_still_fails_the_deploy_when_the_smoke_fails(self):
+        report, _stderr, smoke, error = self._run_unconverged_fleet_deploy(
+            patch.object(
+                deploy_revision,
+                "run_post_deploy_smoke",
+                side_effect=RuntimeError(
+                    "RunPod post-deploy smoke did not observe the deployed revision "
+                    "(stale_worker_revision)"
+                ),
+            )
+        )
+
+        self.assertIsNone(report)
+        self.assertIsNotNone(error)
+        self.assertIn("did not observe the deployed revision", str(error))
+        smoke.assert_called_once()
+
+    def test_stale_revision_skips_the_rollout_wait_and_the_smoke(self):
+        def runpod_request(method, url, _api_key, payload=None, *, deadline=None):
+            if method == "POST":
+                self.fail("stale revision must not mutate RunPod")
+            if "/endpoints/" in url:
+                return {"version": 3, "workers": []}
+            return _pinned_template(REVISION)
+
+        stdout = io.StringIO()
+        with patch.object(deploy_revision, "request_json", side_effect=runpod_request), patch.object(
+            deploy_revision, "github_branch_head", return_value=NEWER_REVISION
+        ), patch.object(deploy_revision, "wait_for_endpoint_rollout") as rollout, patch.object(
+            deploy_revision, "run_post_deploy_smoke"
+        ) as smoke, patch.object(
+            sys,
+            "argv",
+            ["deploy_revision.py", "--revision", REVISION, "--template-id", "template-test"],
+        ), patch.dict(os.environ, {"RUNPOD_API_KEY": "test-key"}, clear=True), contextlib.redirect_stdout(stdout):
+            deploy_revision.main()
+
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(report["status"], "skipped_stale_revision")
+        self.assertEqual(report["current_main_revision"], NEWER_REVISION)
+        rollout.assert_not_called()
+        smoke.assert_not_called()
 
     def test_start_script_rejects_unpinned_revision_before_bootstrap(self):
         script = Path(__file__).resolve().parents[1] / "scripts" / "start_serverless.sh"

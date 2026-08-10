@@ -307,19 +307,32 @@ template without printing any environment values or credentials. The complete
 test→deploy workflow is serialized per Git ref, and immediately before the
 RunPod mutation the deploy script checks the authoritative GitHub `main` head.
 An out-of-order stale workflow exits without changing the endpoint.
-After a successful template update, deployment waits for the endpoint version to
-advance and for every live worker reported by RunPod to carry that version. It
-then submits a bounded real `dry_run` to endpoint `sp2oyuum48vk0j` (override with
-`STAGE2_ENDPOINT_ID`), polls its async status, and requires the response's
-`stage2_code_revision` to equal the deployed commit. This typed validation also
-stages and verifies the pinned RAS, VGGT, and SAM3 source checkouts without downloading
-model weights or running inference, so a release cannot pass while lazy source
-bootstrap is broken. Fleet convergence has a
-2,700-second release budget (longer than the 2,100-second worker execution
-window), while dry smoke is independently capped at 900 seconds and must also
-fit inside the remaining release budget. Transient safe reads are retried, but
-template updates and paid job submissions are never replayed. CI fails without
-printing request credentials or endpoint output when verification does not pass.
+After a successful template update, deployment waits for the endpoint's live
+fleet to reach the target state instead of waiting to observe a transition.
+When the update actually changed the pins, the endpoint version must advance
+and every live worker reported by RunPod must carry that version. When the
+template already held this commit's pins, the update is a no-op, RunPod issues
+no new version, and the fleet is measured against the current one, so
+re-running a deployment converges promptly rather than waiting out a transition
+that can never happen. The emitted JSON reports `converged`,
+`already_converged`, or `fleet_not_converged` so the workflow log stays honest
+about which of those it was.
+
+Deployment then submits a bounded real `dry_run` to endpoint `sp2oyuum48vk0j`
+(override with `STAGE2_ENDPOINT_ID`), polls its async status, and requires the
+response's `stage2_code_revision` to equal the deployed commit. This typed
+validation also stages and verifies the pinned RAS, VGGT, and SAM3 source checkouts
+without downloading model weights or running inference, so a release cannot pass
+while lazy source bootstrap is broken. That smoke is the only direct observation
+of the deployed revision, so its 900-second budget is reserved out of the
+2,700-second release budget (which stays longer than the 2,100-second worker
+execution window) and the live fleet gets the remainder. A fleet that has not
+finished draining is reported and logged rather than failed: the template is
+pinned, so every worker started from then on runs the target revision, and the
+smoke still has to observe that revision serving traffic before the deployment
+succeeds. Transient safe reads are retried, but template updates and paid job
+submissions are never replayed. CI fails without printing request credentials or
+endpoint output when verification does not pass.
 
 ```json
 {
