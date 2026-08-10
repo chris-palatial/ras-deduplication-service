@@ -3696,7 +3696,7 @@ def run_scene_parse_catalog(payload: dict[str, Any]) -> dict[str, Any]:
             source_frame_indices=source_frame_indices,
             source_frame_timestamps_s=source_frame_timestamps,
         )
-        warnings = ["Catalog scope is limited to the supplied category prompts."]
+        warnings = ["Catalog scope is limited to the discovered object categories."]
         if frames_used < requested_frames:
             warnings.append(
                 "Source video contained fewer decodable frames than the sampling policy requested."

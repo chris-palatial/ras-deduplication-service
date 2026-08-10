@@ -623,6 +623,11 @@ class SceneParseCatalogRunnerTest(unittest.TestCase):
         )
         self.assertEqual(result["sampling"]["prompt_frame_budget"], 768)
         self.assertEqual(result["sampling"]["planned_prompt_frames"], 24)
+        self.assertIn(
+            "Catalog scope is limited to the discovered object categories.",
+            result["warnings"],
+        )
+        self.assertFalse(any("prompt" in warning for warning in result["warnings"]))
         self.assertEqual(
             result["provenance"]["geometry"]["model_id"],
             stage2.COMMERCIAL_VGGT_MODEL_ID,
